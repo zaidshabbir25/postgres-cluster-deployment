@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ cluster or 'No cluster' }} — cluster health</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-cluster="{{ cluster or '' }}" data-interval="{{ interval }}">
+
+<header class="bar">
+  <div class="bar-left">
+    <span class="dot" id="overall-dot" title="overall status"></span>
+    <h1 id="cluster-name">{{ cluster or 'No cluster deployed' }}</h1>
+    <span class="badge" id="overall-badge">…</span>
+  </div>
+  <div class="bar-right">
+    {% if clusters|length > 1 %}
+    <label class="picker">
+      <span class="sr">Cluster</span>
+      <select id="cluster-picker">
+        {% for name in clusters %}
+        <option value="{{ name }}" {% if name == cluster %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% endif %}
+    <span class="meta" id="freshness">—</span>
+    <button id="refresh" type="button">Refresh</button>
+  </div>
+</header>
+
+<main>
+  <p class="notice" id="notice" hidden></p>
+
+  <section class="stats" id="stats" aria-label="Cluster summary"></section>
+
+  <section>
+    <h2>Nodes</h2>
+    <div id="nodes" class="cards"></div>
+  </section>
+
+  <section>
+    <h2>Patroni scopes</h2>
+    <p class="hint">
+      Each Spock node is the leader of its own scope; a scope's replicas are the
+      standbys that can take over for that node alone.
+    </p>
+    <div id="scopes" class="cards"></div>
+  </section>
+
+  <section>
+    <h2>etcd <span class="hint-inline">— the store Patroni elects leaders through</span></h2>
+    <div id="etcd" class="panel"></div>
+  </section>
+
+  <section>
+    <h2>Hosts</h2>
+    <div class="scroll">
+      <table id="hosts-table">
+        <thead>
+          <tr>
+            <th>Host</th><th>Address</th><th>Platform</th><th>Load</th>
+            <th>Memory</th><th>Disk</th><th>etcd</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="problems-section" hidden>
+    <h2>Problems <span class="count" id="problem-count"></span></h2>
+    <ul class="problems" id="problems"></ul>
+  </section>
+</main>
+
+<footer>
+  <span id="footer-note">Polling every {{ interval }}s.</span>
+  Deployment reports are in <code>reports/index.html</code>.
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

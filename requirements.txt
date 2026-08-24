@@ -1,0 +1,9 @@
+# Runtime dependencies for pg-cluster-deployment.
+#
+# Deliberately small: everything that runs on a target host is installed there
+# by the deployment itself, so the control machine only needs SSH, YAML and a
+# web framework for the dashboard.
+
+paramiko>=3.4.0        # SSH transport for every remote command
+PyYAML>=6.0.1          # renders Patroni configuration
+Flask>=3.0.0           # the live dashboard

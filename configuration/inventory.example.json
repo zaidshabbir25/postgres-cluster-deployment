@@ -1,0 +1,57 @@
+{
+  "_comment": "Copy to configuration/inventory.json (gitignored) and fill in your machines. The inventory lists hosts only — how many nodes land on them is decided per deployment by --nodes.",
+  "_placement": "One Spock node per host. If --nodes exceeds the host count, surplus nodes share hosts on ports base_port+1, +2, ... A standby is placed on a host other than its leader's whenever one is free.",
+  "_keys": "Never commit private keys. Prefer an ssh-agent (ssh-add your key and leave key_file empty), or set PG_CLUSTER_SSH_KEY. If you must use a file, put it in keys/ — that directory is gitignored — and chmod 600 it.",
+  "_sudo": "Each username needs passwordless sudo on its host; every step runs through `sudo -n`.",
+
+  "defaults": {
+    "cluster_name": "pgedge",
+    "node_count": 2,
+    "standby_of": [],
+    "pg_major": "17",
+    "spock_major": "50",
+    "repo_channel": "release",
+    "db_name": "postgres",
+    "db_user": "postgres",
+    "db_password": "postgres",
+    "base_port": 5432,
+    "base_restapi_port": 8008,
+    "data_root": "/var/lib/pgedge",
+    "hba_cidrs": []
+  },
+
+  "hosts": [
+    {
+      "name": "node-a",
+      "host": "10.0.1.11",
+      "username": "rocky",
+      "key_file": "",
+      "description": "Rocky Linux 9, us-east-1a",
+      "enabled": true
+    },
+    {
+      "name": "node-b",
+      "host": "10.0.1.12",
+      "username": "rocky",
+      "key_file": "",
+      "description": "Rocky Linux 9, us-east-1b",
+      "enabled": true
+    },
+    {
+      "name": "node-c",
+      "host": "10.0.1.13",
+      "username": "ubuntu",
+      "key_file": "",
+      "description": "Ubuntu 24.04, us-east-1c — third etcd member",
+      "enabled": false
+    },
+    {
+      "name": "local",
+      "host": "localhost",
+      "username": "root",
+      "local": true,
+      "description": "Run everything on this machine, no SSH. Handy for a single-host test cluster.",
+      "enabled": false
+    }
+  ]
+}
