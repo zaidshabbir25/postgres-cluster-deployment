@@ -471,8 +471,4 @@ something outside the deployment is holding dpkg.
 
 ## License
 
-[The PostgreSQL License](LICENSE). Copyright (c) 2026, pgEdge, Inc.
-
-The zodan SQL in `configuration/spock/` is vendored from
-[pgEdge/pgedge-pep-test](https://github.com/pgEdge/pgedge-pep-test), where it is
-maintained.
+[The PostgreSQL License](LICENSE). 
