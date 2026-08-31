@@ -149,6 +149,7 @@ Standby placement:
 
 ```
 pg_deploy_cluster.sh      Interactive entry point — asks the four questions
+pg_cluster_ctl.sh         Operate a deployed cluster (node/spock/db/service/...)
 pg_cluster_status.sh      Cluster health in the terminal; exits non-zero if unhealthy
 pg_dashboard.sh           Starts the live web dashboard
 
@@ -165,7 +166,12 @@ aspects/                  Reusable building blocks. Each module owns one concern
   auth_setup.py             .pgpass, pg_service.conf, pg_hba — passwordless psql
   etcd_management.py        The DCS Patroni elects through
   patroni_management.py     Config rendering, startup, scope inspection
-  spock_management.py       Extensions, zodan, cross-wiring, replication checks
+  spock_management.py       Deployment-time Spock: extensions, zodan, cross-wiring
+  spock_operations.py       Day-two Spock: repsets, subscriptions, DDL, sequences
+  db_operations.py          Databases, GUCs, read-only mode, fio
+  cluster_services.py       Patroni / PostgreSQL / etcd control per node
+  app_management.py         pgbench and sample workloads for exercising a cluster
+  consistency.py            Cross-node diffing: spock, repset, schema, table data
   service_management.py     systemd, degrading gracefully where it is absent
   cluster_model.py          Host / Node / ClusterPlan — the shared data model
   inventory.py              Loads and validates the inventory and version pins
@@ -176,9 +182,14 @@ aspects/                  Reusable building blocks. Each module owns one concern
 deployment/               Orchestration: what to do, in what order
   topology.py               Inventory + node count -> concrete layout
   deploy_cluster.py         The end-to-end deployment
-  add_standby.py            Add a standby to a live cluster
+  add_node.py               Add a Spock node (multi-master peer) to a live cluster
+  remove_node.py            Remove a Spock node, detaching it in both directions
+  add_standby.py            Add a physical standby to a live cluster
+  node_access.py            cluster command / ssh / psql, package inventory
   cleanup.py                Tear a cluster down
-  cli.py                    Every action, as a flag, for CI
+  cli.py                    Lifecycle commands: deploy, plan, status, remove
+  ops_cli.py                Day-two groups: node, spock, db, service, package,
+                            app, diff — registered into the same command tree
 
 configuration/            Everything you configure
   inventory.example.json    Copy to inventory.json
@@ -352,6 +363,232 @@ python3 -m deployment.cli remove --cluster demo --purge     # also uninstall pac
 `remove` stops Patroni before touching anything, so no surviving member tries to
 fail over into a data directory that is being deleted. Hosts that cannot be
 reached are reported and left untouched rather than aborting the teardown.
+
+---
+
+## Operating a deployed cluster
+
+Deployment is `pg_deploy_cluster.sh`; everything afterwards is
+`pg_cluster_ctl.sh`. It covers the same ground as the (now deprecated)
+[pgEdge CLI](https://github.com/pgEdge/cli), reimplemented against
+native-package clusters — see [pgEdge CLI parity](#pgedge-cli-parity) for the
+command-by-command mapping.
+
+```bash
+./pg_cluster_ctl.sh --help              # the whole tree
+./pg_cluster_ctl.sh <group> --help      # one group's commands
+```
+
+Add `--cluster NAME` to target a specific cluster (the most recently deployed
+one is the default) and `--json` to any read-only command for machine output.
+
+### node — membership and access
+
+```bash
+./pg_cluster_ctl.sh node list
+./pg_cluster_ctl.sh node add --host node-d          # a new multi-master peer
+./pg_cluster_ctl.sh node remove n3 --wipe-data
+./pg_cluster_ctl.sh node command 'df -h /var' --on all
+./pg_cluster_ctl.sh node command 'SELECT count(*) FROM orders' --sql --compare
+./pg_cluster_ctl.sh node ssh n2                     # interactive shell
+./pg_cluster_ctl.sh node psql n1                    # interactive psql
+```
+
+`node add` grows the mesh: the new node bootstraps into its own Patroni scope,
+every existing node's `pg_hba` and `.pgpass` learn about it, and zodan's
+`add_node` cross-wires it to all peers. Its schema and data arrive through the
+source-to-new subscription, which zodan creates with `synchronize_structure` and
+`synchronize_data` both true — no backup infrastructure involved. That differs
+from the pgEdge CLI, which restored the new node from a pgBackRest physical
+backup: logical sync needs nothing extra but is slower on a large dataset.
+
+`node remove` detaches in both directions before deregistering — every peer
+drops its subscription *from* the node and the node drops its subscriptions *to*
+every peer. Dropping only one side leaves orphaned slots retaining WAL forever.
+It also waits for the node's outbound replication to drain first, so writes made
+on it are not lost; `--force` overrides that and says what it cost.
+
+`node command --compare` groups nodes by identical output, which turns "run this
+on six nodes" into a one-line answer when they agree and an obvious split when
+they do not.
+
+### spock — replication sets, subscriptions, DDL
+
+```bash
+./pg_cluster_ctl.sh spock sub-show-status            # across every node
+./pg_cluster_ctl.sh spock lag
+./pg_cluster_ctl.sh spock no-primary-key             # see the warning below
+./pg_cluster_ctl.sh spock replication-begin          # add all tables to a repset
+./pg_cluster_ctl.sh spock repset-add-table default public.orders
+./pg_cluster_ctl.sh spock sub-resync-table sub_n1_n2 public.orders --truncate
+./pg_cluster_ctl.sh spock replicate-ddl 'ALTER TABLE orders ADD COLUMN note text'
+./pg_cluster_ctl.sh spock sequence-convert           # to Snowflake sequences
+```
+
+> **Tables without a primary key.** Spock replicates `INSERT` for them but
+> silently drops `UPDATE` and `DELETE` — there is no stable key to identify the
+> row. This is the most common cause of a cluster that looks healthy and quietly
+> diverges. `spock no-primary-key` lists them and exits non-zero, so it works as
+> a CI gate.
+
+> **Sequences.** Plain PostgreSQL sequences hand out the same values on every
+> node, so a multi-master cluster generates colliding keys. `sequence-convert`
+> moves them to Snowflake sequences, which embed a node id.
+
+### db — databases, settings, read-only mode
+
+```bash
+./pg_cluster_ctl.sh db list
+./pg_cluster_ctl.sh db tables                       # with PK status and sizes
+./pg_cluster_ctl.sh db guc-show --pattern 'spock%'
+./pg_cluster_ctl.sh db guc-set max_connections 200
+./pg_cluster_ctl.sh db set-readonly on --all-nodes
+./pg_cluster_ctl.sh db test-io                      # fio on the data directory
+```
+
+`guc-set` goes through `patronictl edit-config` by default, because Patroni
+renders `postgresql.conf` from the DCS — an `ALTER SYSTEM` setting is reverted at
+the next reload. Going through the DCS also applies the value to every member of
+the scope, which is almost always what was meant. `--local-only` does it the
+other way and says so.
+
+Read-only mode is how you drain a node before maintenance without detaching it:
+it keeps applying incoming replication (the apply worker is not subject to the
+GUC) while refusing new local writes.
+
+### service — Patroni, PostgreSQL and etcd
+
+```bash
+./pg_cluster_ctl.sh service status
+./pg_cluster_ctl.sh service restart --node n1 --component postgres
+./pg_cluster_ctl.sh service switchover --node n1
+./pg_cluster_ctl.sh service logs --node n1 --lines 100
+./pg_cluster_ctl.sh service reinit n1s1
+```
+
+You cannot stop PostgreSQL directly on a Patroni-managed node — Patroni owns the
+postmaster and would treat it as a crash, restarting it or failing over. So
+`--component postgres` routes restarts and reloads through `patronictl`, and
+stopping postgres directly is refused with an explanation rather than attempted.
+
+### package — the CLI's `um`, over dnf and apt
+
+```bash
+./pg_cluster_ctl.sh package list                    # per host, drift flagged
+./pg_cluster_ctl.sh package upgrade
+./pg_cluster_ctl.sh package install pgedge-snowflake_17
+```
+
+`package list` exits non-zero when versions differ between hosts. A cluster
+where one node runs a different Spock build can fail in ways no single-node test
+reproduces, so that is worth catching. `upgrade` installs the packages and then
+tells you the restart is still outstanding — it does not restart anything behind
+your back.
+
+### app — workloads to exercise replication
+
+```bash
+./pg_cluster_ctl.sh app install --app pgbench --scale 10
+./pg_cluster_ctl.sh app run --node n1 --clients 8 --duration 60
+./pg_cluster_ctl.sh app counts                      # row counts per node
+./pg_cluster_ctl.sh app concurrent-index public.orders customer_id
+```
+
+Only the first node is seeded; the others receive the data through replication,
+which is a genuine end-to-end test that replication works. `pgbench_history` has
+no primary key of its own, so a primary key is added after initialisation —
+without it a pgbench run against a multi-master cluster diverges and the cause
+is very hard to see.
+
+`CREATE INDEX CONCURRENTLY` cannot run in a transaction, so Spock cannot
+replicate it; `concurrent-index` issues it on every node directly.
+
+### diff — do the nodes actually agree?
+
+```bash
+./pg_cluster_ctl.sh diff spock                      # replication metadata
+./pg_cluster_ctl.sh diff repset                     # repset membership
+./pg_cluster_ctl.sh diff schema                     # columns, indexes, constraints
+./pg_cluster_ctl.sh diff table public.orders        # the data itself
+./pg_cluster_ctl.sh diff all
+./pg_cluster_ctl.sh diff repair public.orders --source n1
+```
+
+All four exit non-zero when they find a difference, so they work directly as CI
+gates or monitoring checks.
+
+`diff table` does not stream tables to the control machine. Each node hashes its
+own rows into buckets keyed off the primary key, and only the bucket digests
+cross the network — so comparing a 100M-row table costs a few dozen integers per
+node. Buckets that disagree are then drilled into to name the individual keys:
+
+```
+Row counts:
+  n1           1200
+  n2           1201
+
+  n2 only_on_node: 9999
+  n2 different_values: 1001
+
+2 finding(s):
+  - n2: 1 of 64 buckets differ from n1 (1201 rows vs 1200)
+  - n2: rows only on n1: 0, only on n2: 1, same key but different values: 1
+```
+
+A full-table hash would be simpler but can only answer "same or not" — it cannot
+tell you which rows, which is the answer you actually need.
+
+`diff repair` resyncs a table through Spock's own `sub_resync_table`, so the copy
+goes over the existing subscription rather than a side channel. It **overwrites**
+the target nodes' copy, and asks for confirmation before doing so. In a
+multi-master cluster there is no authoritative node, so you choose the source.
+
+---
+
+## pgEdge CLI parity
+
+The [pgEdge CLI](https://github.com/pgEdge/cli) is deprecated and never
+supported native packages. This project covers its functionality against
+native-package clusters instead. Command-by-command:
+
+| pgEdge CLI | Here | Notes |
+|---|---|---|
+| `setup` | `pg_deploy_cluster.sh` | native packages or source build |
+| `cluster json-template` / `json-create` | `configuration/inventory.example.json` | hosts only; topology is per-deployment |
+| `cluster json-validate` | `cli plan`, inventory validation | validated on every load |
+| `cluster init` | `cli deploy` | |
+| `cluster remove` | `cli remove [--purge]` | |
+| `cluster list-nodes` | `node list` | |
+| `cluster add-node` | `node add` | logical sync, not pgBackRest restore |
+| `cluster remove-node` | `node remove` | drains WAL first; detaches both ways |
+| `cluster replication-begin` | `spock replication-begin` | |
+| `cluster replication-check` | `cli status`, `spock sub-show-status` | |
+| `cluster add-db` | `db create` | |
+| `cluster command` | `node command [--sql] [--compare]` | |
+| `cluster ssh` | `node ssh`, `node psql` | |
+| `cluster app-install` / `app-remove` | `app install` / `app remove` | pgbench + a built-in sample schema |
+| `cluster app-concurrent-index` | `app concurrent-index` | |
+| `db create` / `guc-set` / `guc-show` / `set-readonly` / `test-io` | `db` group | `guc-set` goes through the DCS |
+| `service start`/`stop`/`restart`/`reload`/`status`/`enable`/`disable` | `service` group | Patroni-aware |
+| `service init` / `config` | handled by `cli deploy` | Patroni owns bootstrap |
+| `spock node-*` / `repset-*` / `sub-*` | `spock` group | all 30 CLI commands covered |
+| `spock replicate-ddl` / `sequence-convert` | `spock` group | |
+| `spock health-check` / `metrics-check` | `cli status`, dashboard | host and DB metrics |
+| `um list` / `install` / `remove` / `upgrade` | `package` group | dnf / apt, with drift detection |
+| `um update` / `clean` / `download` / `verify-metadata` | n/a | artefacts of the CLI's own tarball store |
+| `ace spock-diff` | `diff spock` | |
+| `ace schema-diff` | `diff schema` | |
+| `ace repset-diff` | `diff repset` | |
+| `ace table-diff` | `diff table` | bucketed checksums |
+| `ace table-repair` | `diff repair` | via `sub_resync_table` |
+| `ace table-rerun` / `mtree` / `start` | not implemented | Merkle-tree acceleration and the ACE daemon are a separate product; install `pgedge-ace` for those |
+| `localhost cluster-create` / `cluster-destroy` | inventory `"local": true` + port packing | |
+| `upgrade-cli` | n/a | |
+
+Not covered, and deliberately: the CLI's Merkle-tree table diffing (`ace mtree`)
+and its background scheduler/API (`ace start`). Those are substantial enough to
+be their own product — pgEdge ships them as `pgedge-ace`, which can be installed
+with `package install pgedge-ace` and used alongside this tool.
 
 ---
 
