@@ -8,8 +8,13 @@ scripted and CI use:
     python3 -m deployment.cli deploy --mode packages --nodes 3 --pg-major 17 \
         --standby n1 --cluster demo
     python3 -m deployment.cli status --cluster demo
-    python3 -m deployment.cli add-standby --cluster demo --leader n2
-    python3 -m deployment.cli remove --cluster demo --purge
+    python3 -m deployment.cli node add --cluster demo
+    python3 -m deployment.cli diff all --cluster demo
+
+Lifecycle commands (deploy, plan, status, add-standby, remove, list) live here;
+the day-two groups (node, spock, db, service, package, app, diff) are defined in
+deployment/ops_cli.py and registered into the same parser, so the user sees one
+command tree.
 
 Exit codes: 0 success, 1 failure, 2 bad usage.
 """
@@ -26,7 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 from aspects import health, inventory, patroni_management, spock_management, state
 from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
-from deployment import add_standby, cleanup, deploy_cluster, topology
+from deployment import add_standby, cleanup, deploy_cluster, ops_cli, topology
 from reports import report_generator
 
 EXIT_OK = 0
@@ -546,6 +551,10 @@ def build_parser():
     listing = subparsers.add_parser("list", help="list deployed clusters")
     listing.set_defaults(func=cmd_list)
 
+    # --- day-two operations groups ------------------------------------
+    # node / spock / db / service / package / app / diff
+    ops_cli.register(subparsers, add_common)
+
     return parser
 
 
@@ -560,6 +569,9 @@ def main(argv=None):
     except topology.TopologyError as exc:
         print(f"Cannot build that topology: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_FAIL
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return EXIT_FAIL

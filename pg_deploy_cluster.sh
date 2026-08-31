@@ -79,10 +79,16 @@ Behaviour
   -h, --help                this message
 
 Other commands
+  ./pg_cluster_ctl.sh       operate a deployed cluster:
+                              node    list / add / remove / command / ssh / psql
+                              spock   repsets, subscriptions, DDL, sequences
+                              db      databases, GUCs, read-only, IO test
+                              service Patroni / PostgreSQL / etcd control
+                              package native package inventory and upgrades
+                              app     pgbench and sample workloads
+                              diff    do the nodes actually agree?
   ./pg_cluster_status.sh    health of a deployed cluster
   ./pg_dashboard.sh         live web dashboard
-  python3 -m deployment.cli add-standby --leader n1
-  python3 -m deployment.cli remove --cluster NAME
 USAGE
 }
 

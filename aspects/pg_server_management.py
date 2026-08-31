@@ -178,6 +178,41 @@ def scalar(executor, bin_dir, port, user, sql, dbname="postgres", node=None,
     return lines[0].strip() if lines else default
 
 
+def rows(executor, bin_dir, port, user, sql, dbname="postgres", node=None,
+         separator="\x1f"):
+    """Run a query and return its rows as a list of lists of strings.
+
+    Uses an ASCII unit separator rather than a printable delimiter, so column
+    values containing pipes or commas — table definitions, DSNs, SQL snippets —
+    survive the round trip intact.
+    """
+    command = (
+        f"{bin_dir}/psql -X -q -At -F {shlex.quote(separator)} "
+        f"-h 127.0.0.1 -p {port} -U {user} -d {dbname} -c {shlex.quote(sql)}"
+    )
+    code, output = executor.exec_run(command, user=user, node=node)
+    if code != 0:
+        return None
+    result = []
+    for line in output.strip().splitlines():
+        if not line.strip():
+            continue
+        result.append(line.split(separator))
+    return result
+
+
+def dict_rows(executor, bin_dir, port, user, sql, columns, dbname="postgres",
+              node=None):
+    """Same as rows(), labelled with the column names the caller selected."""
+    raw = rows(executor, bin_dir, port, user, sql, dbname=dbname, node=node)
+    if raw is None:
+        return None
+    return [
+        {name: (row[i] if i < len(row) else None) for i, name in enumerate(columns)}
+        for row in raw
+    ]
+
+
 def wait_for_ready(executor, bin_dir, port, user, timeout=180, interval=3,
                    node=None):
     """Block until the server answers queries. Returns (ok, message)."""
