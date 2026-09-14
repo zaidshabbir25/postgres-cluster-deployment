@@ -34,12 +34,24 @@ def member_name(host_name):
 def select_members(hosts):
     """Pick etcd members from the available hosts.
 
+    One member per machine: members bind fixed ports (2379/2380), so two
+    inventory entries naming the same box cannot both run one. Hosts are
+    de-duplicated by address before the choice is made.
+
     Returns (members, note) where note explains the choice for the report.
     """
-    if len(hosts) >= 3:
-        members = hosts[:3]
+    distinct, seen = [], set()
+    for host in hosts:
+        key = (host.address.strip().lower(), int(host.port or 22))
+        if key in seen:
+            continue
+        seen.add(key)
+        distinct.append(host)
+
+    if len(distinct) >= 3:
+        members = distinct[:3]
         return members, "3-member etcd cluster (tolerates one host failure)"
-    members = hosts[:1]
+    members = distinct[:1]
     return members, (
         f"single-member etcd on {members[0].name} — a single point of failure; "
         f"add a third host to get a fault-tolerant DCS"

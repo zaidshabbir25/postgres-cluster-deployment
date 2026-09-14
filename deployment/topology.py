@@ -7,7 +7,10 @@ Placement rules, in priority order:
    of them on one machine share a failure domain and buy nothing.
 2. When nodes outnumber hosts, pack the surplus onto the least-loaded hosts and
    give them distinct ports (5432, 5433, ...). This is what makes a one-VM
-   demo possible without a separate code path.
+   demo possible without a separate code path. Ports are counted per *machine*
+   (address + SSH port), not per inventory entry, so two entries that name the
+   same box — "na" and "nb" both pointing at localhost — still get 5432 and
+   5433 instead of colliding on 5432.
 3. A standby always goes on a *different* host from the node it follows, if
    there is one. A standby sharing its leader's machine cannot survive the
    failure it exists to survive — so when that is unavoidable the plan says so
@@ -31,6 +34,17 @@ def node_names(count):
 
 def standby_name(leader_name, ordinal=1):
     return f"{leader_name}s{ordinal}"
+
+
+def machine_key(host):
+    """Identify the physical machine behind a host entry.
+
+    Two inventory entries may describe the same box under different names
+    (a common shortcut for a laptop test cluster). Everything that has to be
+    unique per machine — PostgreSQL ports, Patroni REST ports, etcd members —
+    keys on this rather than on Host.name.
+    """
+    return (host.address.strip().lower(), int(host.port or 22))
 
 
 def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
@@ -58,6 +72,7 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
         )
 
     # --- assign hosts -------------------------------------------------
+    host_by_name = {host.name: host for host in hosts}
     load = {host.name: 0 for host in hosts}
     assignment = {}  # node name -> host name
 
@@ -75,15 +90,18 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
 
     standby_entries = []
     for leader in standby_of:
-        leader_host = assignment[leader]
-        candidates = [h for h in hosts if h.name != leader_host]
+        leader_host = host_by_name[assignment[leader]]
+        # "A different host" means a different machine: an entry that merely
+        # carries another name but the same address is the same failure domain.
+        candidates = [h for h in hosts
+                      if machine_key(h) != machine_key(leader_host)]
         if candidates:
             target = min(candidates, key=lambda h: load[h.name])
         else:
-            target = hosts[0]
+            target = leader_host
             warnings.append(
-                f"standby for {leader} shares host {target.name} with its leader — "
-                f"only one host is available, so losing that host loses both. "
+                f"standby for {leader} shares {target.address} with its leader — "
+                f"only one machine is available, so losing it loses both. "
                 f"This is a test topology, not an HA one."
             )
         name = standby_name(leader)
@@ -91,20 +109,33 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
         load[target.name] += 1
         standby_entries.append((name, leader))
 
-    # --- allocate ports per host --------------------------------------
+    # --- allocate ports per machine -----------------------------------
     # Ports are assigned in the order nodes were placed, so a given inventory
-    # and node count always produce the same layout.
+    # and node count always produce the same layout. The counter is per
+    # machine, so every instance sharing a box gets its own pair of ports even
+    # when the inventory lists that box several times under different names.
     ordered = names + [name for name, _ in standby_entries]
-    per_host_index = {host.name: 0 for host in hosts}
+    per_machine_index = {}
     ports = {}
     for name in ordered:
-        host_name = assignment[name]
-        offset = per_host_index[host_name]
+        key = machine_key(host_by_name[assignment[name]])
+        offset = per_machine_index.get(key, 0)
         ports[name] = (base_pg_port + offset, base_restapi_port + offset)
-        per_host_index[host_name] = offset + 1
+        per_machine_index[key] = offset + 1
+
+    aliases = {}
+    for host in hosts:
+        aliases.setdefault(machine_key(host), []).append(host.name)
+    for (address, _), shared in aliases.items():
+        if len(shared) > 1:
+            warnings.append(
+                f"inventory entries {', '.join(shared)} all point at {address}, "
+                f"so they are one machine: their nodes share it on separate "
+                f"ports and give no host-failure protection. List the box once "
+                f"and let --nodes place several nodes on it."
+            )
 
     # --- build nodes --------------------------------------------------
-    host_by_name = {host.name: host for host in hosts}
     nodes = []
 
     for name in names:
@@ -189,13 +220,14 @@ def _check_port_collisions(plan):
     """Fail early if two nodes on one host would claim the same port."""
     seen = {}
     for node in plan.nodes:
+        machine = machine_key(plan.host(node.host))
         for label, port in (("postgres", node.pg_port),
                             ("patroni REST", node.restapi_port)):
-            key = (node.host, label, port)
+            key = (machine, label, port)
             if key in seen:
                 raise TopologyError(
-                    f"port collision on {node.host}: {node.name} and {seen[key]} "
-                    f"both want {label} port {port}"
+                    f"port collision on {machine[0]}: {node.name} and "
+                    f"{seen[key]} both want {label} port {port}"
                 )
             seen[key] = node.name
 

@@ -2,10 +2,10 @@
 #
 # pg_deploy_cluster.sh — deploy an n-node PostgreSQL cluster with Patroni + Spock.
 #
-# With no arguments it asks the four questions that decide a deployment
-# (packages or source build, how many nodes, which PostgreSQL version, which
-# nodes get a standby) and then hands off to deployment/cli.py. Pass any flag
-# and it skips the prompts entirely, which is what CI should do.
+# With no arguments it asks the questions that decide a deployment (which
+# machines to use, packages or source build, how many nodes, which PostgreSQL
+# version, which nodes get a standby) and then hands off to deployment/cli.py.
+# Pass any flag and it skips the prompts entirely, which is what CI should do.
 #
 #   ./pg_deploy_cluster.sh
 #   ./pg_deploy_cluster.sh --nodes 3 --pg-major 17 --standby n1,n2
@@ -129,11 +129,13 @@ PY
 # ---------------------------------------------------------------------------
 
 check_inventory() {
+  # Non-interactive runs take the inventory as given; the prompts can build one.
   if [[ ! -f "$INVENTORY" ]]; then
     say ""
     warn "No inventory at $INVENTORY"
-    say "The deployment needs to know which machines to use. Copy the example"
-    say "and fill in your hosts:"
+    say "The deployment needs to know which machines to use. Either run this"
+    say "script with no flags and answer the host questions, or copy the"
+    say "example and fill it in yourself:"
     say ""
     say "  cp configuration/inventory.example.json configuration/inventory.json"
     say "  \$EDITOR configuration/inventory.json"
@@ -169,6 +171,79 @@ for h in hosts:
     desc = h.get("description") or ""
     print(f"  {name:<18} {h.get('host'):<20} {h.get('username','root'):<10} {desc}")
 PY
+}
+
+distinct_machine_count() {
+  # Hosts that are really the same box (same address) count once: ports, not
+  # machines, are what separate nodes sharing one address.
+  python3 - "$INVENTORY" <<'PYEOF'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    print(0); sys.exit(0)
+seen = {
+    (h.get("host") or h.get("address") or "").strip().lower()
+    for h in data.get("hosts", [])
+    if h.get("enabled") is not False
+}
+seen.discard("")
+print(len(seen))
+PYEOF
+}
+
+write_inventory() {
+  # write_inventory <host-spec>...  where each spec is
+  #   name|address|username|ssh_port|key_file|local
+  # The defaults block is carried over from the existing inventory when there
+  # is one, so answering the host questions again does not reset the rest.
+  python3 - "$INVENTORY" "$SCRIPT_DIR/configuration/inventory.example.json" "$@" <<'PYEOF'
+import json, os, shutil, sys
+
+target, example = sys.argv[1], sys.argv[2]
+
+defaults = {}
+for source in (target, example):
+    if not os.path.exists(source):
+        continue
+    try:
+        defaults = json.load(open(source)).get("defaults") or {}
+    except Exception:
+        defaults = {}
+    if defaults:
+        break
+
+hosts = []
+for spec in sys.argv[3:]:
+    name, address, username, ssh_port, key_file, local = spec.split("|")
+    entry = {
+        "name": name,
+        "host": address,
+        "username": username,
+        "enabled": True,
+    }
+    if local == "yes":
+        entry["local"] = True
+    else:
+        entry["key_file"] = key_file
+        entry["port"] = int(ssh_port or 22)
+    hosts.append(entry)
+
+if os.path.exists(target):
+    shutil.copy2(target, target + ".bak")
+
+payload = {
+    "_comment": "Written by ./pg_deploy_cluster.sh. Edit it by hand or answer "
+                "the host questions again; the previous file is kept as "
+                "inventory.json.bak.",
+    "defaults": defaults,
+    "hosts": hosts,
+}
+os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2)
+    handle.write("\n")
+PYEOF
 }
 
 # ---------------------------------------------------------------------------
@@ -240,26 +315,90 @@ while [[ $# -gt 0 ]]; do
 done
 
 ensure_venv
-check_inventory
+[[ "$INTERACTIVE" == true ]] || check_inventory
 
 # ---------------------------------------------------------------------------
 # Interactive prompts
 # ---------------------------------------------------------------------------
 
 if [[ "$INTERACTIVE" == true ]]; then
-  HOSTS="$(host_count)"
-  [[ "$HOSTS" -gt 0 ]] || die "no enabled hosts in $INVENTORY"
-
   say ""
   say "${BOLD}PostgreSQL cluster deployment — Patroni + Spock${RESET}"
   rule
-  say "Hosts available in $(basename "$INVENTORY") ($HOSTS):"
-  show_hosts
-  rule
   say ""
 
-  # --- 1. deployment method ------------------------------------------
-  say "${BOLD}1) How should PostgreSQL and Spock be installed?${RESET}"
+  # --- 1. hosts ------------------------------------------------------
+  say "${BOLD}1) Which machines should the cluster run on?${RESET}"
+  HOSTS="$( [[ -f "$INVENTORY" ]] && host_count || echo 0 )"
+  if (( HOSTS > 0 )); then
+    say "   $(basename "$INVENTORY") currently lists $HOSTS host(s):"
+    show_hosts
+    say ""
+    say "   1) Use these hosts"
+    say "   2) Enter host details now (rewrites $(basename "$INVENTORY"))"
+    say "   3) This machine only — localhost, no SSH"
+    say ""
+    HOST_CHOICE="$(ask_choice "   Choose 1, 2 or 3" "1" 1 2 3)"
+  else
+    say "   ${DIM}No inventory yet, so the hosts have to be entered here.${RESET}"
+    say ""
+    say "   2) Enter host details now"
+    say "   3) This machine only — localhost, no SSH"
+    say ""
+    HOST_CHOICE="$(ask_choice "   Choose 2 or 3" "2" 2 3)"
+  fi
+
+  if [[ "$HOST_CHOICE" == "3" ]]; then
+    write_inventory "local|localhost|$(id -un)|22||yes"
+    say "   ${GREEN}Everything will run on this machine; nodes are separated by port.${RESET}"
+  elif [[ "$HOST_CHOICE" == "2" ]]; then
+    say ""
+    say "   ${DIM}Each machine needs an address reachable over SSH and a user"
+    say "   with passwordless sudo. Enter localhost for this machine.${RESET}"
+    MACHINES="$(ask_int "   How many machines" "2" 1 32)"
+    HOST_SPECS=()
+    for ((m = 1; m <= MACHINES; m++)); do
+      say ""
+      say "   ${BOLD}Machine $m${RESET}"
+      HOST_ADDR=""
+      while [[ -z "$HOST_ADDR" ]]; do
+        HOST_ADDR="$(ask "     Hostname or IP" "")"
+        [[ -n "$HOST_ADDR" ]] || warn "An address is required."
+      done
+      HOST_IS_LOCAL=no
+      case "$HOST_ADDR" in
+        localhost|127.0.0.1|::1) HOST_IS_LOCAL=yes ;;
+      esac
+      if [[ "$HOST_IS_LOCAL" == yes ]]; then
+        HOST_USER="$(ask "     User to run as" "$(id -un)")"
+        HOST_SSH_PORT=22
+        HOST_KEY=""
+        say "     ${DIM}localhost — commands run directly, no SSH.${RESET}"
+      else
+        HOST_USER="$(ask "     SSH username" "root")"
+        HOST_SSH_PORT="$(ask_int "     SSH port" "22" 1 65535)"
+        HOST_KEY="$(ask "     SSH private key file (empty to use your ssh-agent)" "")"
+      fi
+      HOST_NAME="$(ask "     Name for this machine" "$HOST_ADDR")"
+      HOST_SPECS+=("$HOST_NAME|$HOST_ADDR|$HOST_USER|$HOST_SSH_PORT|$HOST_KEY|$HOST_IS_LOCAL")
+    done
+    write_inventory "${HOST_SPECS[@]}"
+    say ""
+    say "   ${GREEN}Saved to $INVENTORY${RESET}"
+  fi
+
+  check_inventory
+  HOSTS="$(host_count)"
+  [[ "$HOSTS" -gt 0 ]] || die "no enabled hosts in $INVENTORY"
+  MACHINE_COUNT="$(distinct_machine_count)"
+  if (( MACHINE_COUNT < HOSTS )); then
+    warn "$HOSTS host entries resolve to $MACHINE_COUNT machine(s); the nodes"
+    warn "sharing a machine get separate ports, but no host-failure protection."
+  fi
+  say ""
+
+  # --- 2. deployment method ------------------------------------------
+  say "${BOLD}2) How should PostgreSQL and Spock be installed?${RESET}"
   say "   1) Native packages  — install from the pgEdge repository (fast, recommended)"
   say "   2) Manual build     — build PostgreSQL and Spock from source (slow, ~20-40 min/host)"
   say ""
@@ -271,21 +410,22 @@ if [[ "$INTERACTIVE" == true ]]; then
   fi
   say ""
 
-  # --- 2. node count -------------------------------------------------
-  say "${BOLD}2) How many Spock nodes should the cluster have?${RESET}"
+  # --- 3. node count -------------------------------------------------
+  say "${BOLD}3) How many Spock nodes should the cluster have?${RESET}"
   say "   Every node is a multi-master peer, cross-wired to all the others."
-  if (( HOSTS == 1 )); then
-    say "   ${DIM}Only one host is in the inventory, so extra nodes share it on"
-    say "   separate ports (5432, 5433, ...) — fine for testing, not for HA.${RESET}"
+  if (( MACHINE_COUNT == 1 )); then
+    say "   ${DIM}One machine is available, so every node shares it on separate"
+    say "   ports (5432, 5433, ...) — fine for testing, not for HA.${RESET}"
   else
-    say "   ${DIM}$HOSTS hosts available: the first $HOSTS nodes each get their own machine.${RESET}"
+    say "   ${DIM}$MACHINE_COUNT machines available: the first $MACHINE_COUNT nodes each get"
+    say "   their own; any beyond that share a machine on separate ports.${RESET}"
   fi
   say ""
   NODES="$(ask_int "   Number of nodes" "2" 1 32)"
   say ""
 
-  # --- 3. PostgreSQL version -----------------------------------------
-  say "${BOLD}3) Which PostgreSQL version?${RESET}"
+  # --- 4. PostgreSQL version -----------------------------------------
+  say "${BOLD}4) Which PostgreSQL version?${RESET}"
   PG_MAJOR="$(ask_choice "   Major version (16, 17, 18 or 19)" "17" 16 17 18 19)"
   PG_VERSION=""
   if [[ "$MODE" == "source" ]]; then
@@ -300,8 +440,8 @@ if [[ "$INTERACTIVE" == true ]]; then
   fi
   say ""
 
-  # --- 4. standbys ---------------------------------------------------
-  say "${BOLD}4) Which nodes should get a Patroni standby?${RESET}"
+  # --- 5. standbys ---------------------------------------------------
+  say "${BOLD}5) Which nodes should get a Patroni standby?${RESET}"
   NODE_LIST=""
   for ((i = 1; i <= NODES; i++)); do
     NODE_LIST="${NODE_LIST}${NODE_LIST:+, }n$i"
@@ -313,8 +453,8 @@ if [[ "$INTERACTIVE" == true ]]; then
   STANDBY="$(ask "   Standby for which node(s)" "")"
   say ""
 
-  # --- 5. remaining options ------------------------------------------
-  say "${BOLD}5) Anything else${RESET} ${DIM}(press Enter to accept each default)${RESET}"
+  # --- 6. remaining options ------------------------------------------
+  say "${BOLD}6) Anything else${RESET} ${DIM}(press Enter to accept each default)${RESET}"
   CLUSTER="$(ask "   Cluster name" "pgedge")"
   SPOCK_MAJOR="$(ask_choice "   Spock major version (50 or 60)" "50" 50 60)"
   if [[ "$MODE" == "packages" ]]; then
@@ -326,6 +466,22 @@ if [[ "$INTERACTIVE" == true ]]; then
   fi
   DB_NAME="$(ask "   Database name" "postgres")"
   DB_USER="$(ask "   Database superuser" "postgres")"
+
+  # Instances sharing a machine are told apart by port, so it is worth being
+  # able to move the first one clear of an existing PostgreSQL.
+  BASE_PORT=""
+  BASE_RESTAPI_PORT=""
+  INSTANCES="$NODES"
+  if [[ -n "$STANDBY" ]]; then
+    IFS=',' read -r -a STANDBY_LIST <<<"$STANDBY"
+    INSTANCES=$(( NODES + ${#STANDBY_LIST[@]} ))
+  fi
+  if (( INSTANCES > MACHINE_COUNT )); then
+    say "   ${DIM}Several instances share a machine; each one takes the next"
+    say "   port up from these (5432, 5433, ... and 8008, 8009, ...).${RESET}"
+    BASE_PORT="$(ask_int "   First PostgreSQL port on each machine" "5432" 1024 65000)"
+    BASE_RESTAPI_PORT="$(ask_int "   First Patroni REST port on each machine" "8008" 1024 65000)"
+  fi
   CLEAN="$(ask_choice "   Wipe any previous deployment on these hosts first? (y/n)" "n" y n)"
   say ""
 
@@ -339,6 +495,8 @@ if [[ "$INTERACTIVE" == true ]]; then
   [[ -n "$PG_VERSION" ]] && PLAN_ARGS+=(--pg-version "$PG_VERSION")
   [[ -n "$STANDBY" ]]    && PLAN_ARGS+=(--standby "$STANDBY")
   [[ -n "$CHANNEL" ]]    && PLAN_ARGS+=(--channel "$CHANNEL")
+  [[ -n "$BASE_PORT" ]]  && PLAN_ARGS+=(--base-port "$BASE_PORT")
+  [[ -n "$BASE_RESTAPI_PORT" ]] && PLAN_ARGS+=(--base-restapi-port "$BASE_RESTAPI_PORT")
 
   ARGS=("${PLAN_ARGS[@]}")
   [[ -n "$SPOCK_BRANCH" ]] && ARGS+=(--spock-branch "$SPOCK_BRANCH")

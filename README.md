@@ -4,17 +4,21 @@ Deploy an **n-node PostgreSQL cluster** with [Spock](https://github.com/pgEdge/s
 multi-master replication and [Patroni](https://patroni.readthedocs.io/) high
 availability, onto machines you already have, over SSH.
 
-Answer four questions and you get a cross-wired multi-master cluster with
+Answer five questions and you get a cross-wired multi-master cluster with
 per-node failover, passwordless `psql` access everywhere, an HTML report of
 exactly what happened, and a live health dashboard.
 
 ```console
 $ ./pg_deploy_cluster.sh
-1) How should PostgreSQL and Spock be installed?
-2) How many Spock nodes should the cluster have?
-3) Which PostgreSQL version?
-4) Which nodes should get a Patroni standby?
+1) Which machines should the cluster run on?
+2) How should PostgreSQL and Spock be installed?
+3) How many Spock nodes should the cluster have?
+4) Which PostgreSQL version?
+5) Which nodes should get a Patroni standby?
 ```
+
+The first question writes `configuration/inventory.json` for you, so there is
+nothing to edit by hand before the first run.
 
 ---
 
@@ -86,14 +90,15 @@ allowing those ports between the instances.
 ```bash
 git clone <this repo> && cd postgres-cluster-deployment
 
-# 1. Describe your machines.
+# 1. Deploy. Asks for your machines, then the topology, then shows the plan
+#    and waits for confirmation.
+./pg_deploy_cluster.sh
+
+# ...or describe the machines up front and skip that question.
 cp configuration/inventory.example.json configuration/inventory.json
 $EDITOR configuration/inventory.json
 
-# 2. Deploy. Answers the four questions, shows the plan, waits for confirmation.
-./pg_deploy_cluster.sh
-
-# 3. Watch it.
+# 2. Watch it.
 ./pg_cluster_status.sh
 ./pg_dashboard.sh          # http://127.0.0.1:8080
 ```
@@ -117,6 +122,18 @@ deployment. That separation is what lets one inventory serve a 2-node and a
 
 `defaults` supplies fallbacks for anything you do not pass on the command line.
 Set `"enabled": false` to park a host without deleting it.
+
+The interactive run's first question offers to write this file: keep the hosts
+already listed, type in new ones (address, SSH user, SSH port, key file), or
+pick "this machine only" for a localhost cluster with no SSH. The previous file
+is kept as `inventory.json.bak`, and the `defaults` block is carried over.
+
+List each machine **once**. A machine carrying several instances separates them
+by port — `5432, 5433, ...` for PostgreSQL and `8008, 8009, ...` for the Patroni
+REST API — and that counting is per machine, not per inventory entry, so two
+entries pointing at the same address do not collide on 5432. When the run
+detects instances sharing a machine it also asks which ports to start from, in
+case something already owns 5432.
 
 **SSH keys.** Leave `key_file` empty and `ssh-add` your key — that is the
 default and nothing sensitive touches the repo. Otherwise set
