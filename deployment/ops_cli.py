@@ -150,8 +150,11 @@ def cmd_node_list(args):
 
 
 def cmd_node_add(args):
+    cluster = _resolve_cluster(args)
+    if cluster is None:
+        return EXIT_FAIL
     result = add_node.add(
-        cluster_name=_resolve_cluster(args),
+        cluster_name=cluster,
         host_name=args.host,
         node_name=args.name,
         source_node=args.source,

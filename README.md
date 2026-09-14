@@ -398,6 +398,32 @@ before doing any of it unless `--yes` is given.
 
 ---
 
+## Growing a running cluster
+
+```bash
+./pg_deploy_cluster.sh --add-node n3                        # next free host
+./pg_deploy_cluster.sh --add-node n3 --host node-d          # a specific host
+./pg_deploy_cluster.sh --add-node n3 --source n2            # join through n2
+```
+
+The new node is prepared (packages, Patroni, pg_hba), bootstrapped as the leader
+of its own Patroni scope, and cross-wired to every existing node in both
+directions, so it accepts writes like any other. Every existing node's `pg_hba`
+and `.pgpass` learn about it and are reloaded in place — the cluster stays up
+throughout.
+
+`--host` takes a name from the inventory, including one the cluster has never
+used: a machine that is not part of the cluster yet is prepared from scratch.
+Without it the node lands on a host that has no Spock node, or — if they all do
+— on the least loaded one, on its own port. `--source` picks the node the join
+runs through (the first Spock node by default); it must be a Spock node, not a
+standby.
+
+This is the same operation as `./pg_cluster_ctl.sh node add`, which also lets
+the name default to the next free `nN`.
+
+---
+
 ## Operating a deployed cluster
 
 Deployment is `pg_deploy_cluster.sh`; everything afterwards is

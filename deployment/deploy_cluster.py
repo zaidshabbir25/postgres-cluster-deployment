@@ -123,11 +123,9 @@ class ClusterDeployer:
         for host in self.plan.hosts:
             executor = self.executor_for_host(host.name)
             info = platform_detect.detect(executor)
-            advertise = host.address
-            if platform_detect.is_loopback(advertise):
-                # Patroni will not advertise a loopback name to its peers, so a
-                # host listed as localhost still needs a real address.
-                advertise = platform_detect.primary_address(executor)
+            # Patroni will not advertise a loopback name to its peers, so a
+            # host listed as localhost still needs a real address.
+            advertise = platform_detect.advertise_for(executor, host.address)
             bin_dir = topology.apply_platform(self.plan, host, info,
                                               advertise_address=advertise)
             detected.append(f"{host.name}={info['family']} ({info['pretty']})")

@@ -201,7 +201,12 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                        f"platform, packages and paths on {target_host.name}")
         executor = _executor_for(plan, target_host.name, executors, log)
         info = platform_detect.detect(executor)
-        topology.apply_platform(plan, target_host, info)
+        topology.apply_platform(
+            plan, target_host, info,
+            advertise_address=platform_detect.advertise_for(
+                executor, target_host.address
+            ),
+        )
         node.family = target_host.family
         node.bin_dir = target_host.bin_dir
 
@@ -252,7 +257,10 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             host_executor = _executor_for(plan, host.name, executors, log)
             if not host.bin_dir:
                 topology.apply_platform(
-                    plan, host, platform_detect.detect(host_executor)
+                    plan, host, platform_detect.detect(host_executor),
+                    advertise_address=platform_detect.advertise_for(
+                        host_executor, host.address
+                    ),
                 )
             auth_setup.configure_host(
                 host_executor, host.family, plan.nodes, plan.db_user,

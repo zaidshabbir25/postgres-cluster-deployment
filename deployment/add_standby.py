@@ -151,7 +151,12 @@ def add(cluster_name, leader_name, host_name=None, db_password=None,
         log.step_start("Prepare host", f"platform probe and paths on {target_host.name}")
         executor = _executor_for(plan, target_host.name, executors, log)
         info = platform_detect.detect(executor)
-        topology.apply_platform(plan, target_host, info)
+        topology.apply_platform(
+            plan, target_host, info,
+            advertise_address=platform_detect.advertise_for(
+                executor, target_host.address
+            ),
+        )
         node.family = target_host.family
         node.bin_dir = target_host.bin_dir
         node.pg_version = leader.pg_version

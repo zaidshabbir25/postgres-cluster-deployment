@@ -100,6 +100,11 @@ def primary_address(executor):
     return "127.0.0.1"
 
 
+def advertise_for(executor, address):
+    """The address to hand Patroni for a host listed as `address`."""
+    return primary_address(executor) if is_loopback(address) else address
+
+
 def package_manager(family):
     """Return the package-manager verbs for a family."""
     if family == "rhel":

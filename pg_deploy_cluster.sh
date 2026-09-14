@@ -78,6 +78,14 @@ Behaviour
   --dry-run                 print the planned topology and exit
   -h, --help                this message
 
+Growing a running cluster
+  --add-node NAME           add one Spock node to a deployed cluster and exit.
+                            It is prepared, bootstrapped as its own Patroni
+                            scope and cross-wired to every existing node.
+  --host NAME               host from the inventory to place it on
+                            [a host with no Spock node yet]
+  --source NODE             existing node to join through                [n1]
+
 Cleanup
   --cleanup                 scrub every host in the inventory and exit: Patroni
                             units, etcd state, data directories, cluster config
@@ -308,6 +316,9 @@ ARGS=()
 DRY_RUN=false
 CLEANUP=false
 CLEANUP_ARGS=()
+ADD_NODE=""
+NODE_ARGS=()
+CLUSTER_NAME=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -316,12 +327,19 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; ARGS+=("--dry-run"); INTERACTIVE=false; shift ;;
     --cleanup) CLEANUP=true; INTERACTIVE=false; shift ;;
     --purge|--yes) CLEANUP_ARGS+=("$1"); shift ;;
+    --add-node)
+      [[ $# -ge 2 ]] || die "--add-node needs a node name (e.g. --add-node n3)"
+      ADD_NODE="$2"; INTERACTIVE=false; shift 2 ;;
+    --host|--source)
+      [[ $# -ge 2 ]] || die "$1 needs a value"
+      NODE_ARGS+=("$1" "$2"); shift 2 ;;
     --clean|--skip-verify|--json)
       ARGS+=("$1"); INTERACTIVE=false; shift ;;
     --nodes|--standby|--cluster|--mode|--channel|--spock-branch|--etcd-version|\
     --jobs|--pg-major|--pg-version|--spock-major|--db-name|--db-user|--db-password|\
     --base-port|--base-restapi-port|--data-root|--hba-cidr|--zodan-sql)
       [[ $# -ge 2 ]] || die "$1 needs a value"
+      [[ "$1" == "--cluster" ]] && CLUSTER_NAME="$2"
       ARGS+=("$1" "$2"); INTERACTIVE=false; shift 2 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -333,6 +351,22 @@ ensure_venv
 # ---------------------------------------------------------------------------
 # Cleanup — a mode of its own, not a deployment
 # ---------------------------------------------------------------------------
+
+if [[ -n "$ADD_NODE" ]]; then
+  [[ "$ADD_NODE" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] \
+    || die "node name '$ADD_NODE' must start with a letter and contain only letters, digits or underscores"
+  [[ "$CLEANUP" == false ]] || die "--add-node and --cleanup do the opposite of each other; pick one"
+  say ""
+  say "${BOLD}Adding node $ADD_NODE to a running cluster${RESET}"
+  rule
+  say "${DIM}The node is prepared, bootstrapped as its own Patroni scope and"
+  say "cross-wired to every existing node in both directions.${RESET}"
+  say ""
+  exec python3 -m deployment.cli node add --name "$ADD_NODE" \
+    --inventory "$INVENTORY" \
+    ${CLUSTER_NAME:+--cluster "$CLUSTER_NAME"} \
+    "${NODE_ARGS[@]+"${NODE_ARGS[@]}"}"
+fi
 
 if [[ "$CLEANUP" == true ]]; then
   say ""
