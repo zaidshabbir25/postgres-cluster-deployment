@@ -78,6 +78,15 @@ Behaviour
   --dry-run                 print the planned topology and exit
   -h, --help                this message
 
+Cleanup
+  --cleanup                 scrub every host in the inventory and exit: Patroni
+                            units, etcd state, data directories, cluster config
+                            and saved state. Works after a failed deployment,
+                            when there is no cluster state to remove.
+  --purge                   with --cleanup, also uninstall the pgEdge packages
+                            and repository
+  --yes                     with --cleanup, skip the confirmation prompt
+
 Other commands
   ./pg_cluster_ctl.sh       operate a deployed cluster:
                               node    list / add / remove / command / ssh / psql
@@ -297,12 +306,16 @@ ask_int() {
 INTERACTIVE=true
 ARGS=()
 DRY_RUN=false
+CLEANUP=false
+CLEANUP_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --inventory) INVENTORY="$2"; ARGS+=("--inventory" "$2"); INTERACTIVE=false; shift 2 ;;
     --dry-run) DRY_RUN=true; ARGS+=("--dry-run"); INTERACTIVE=false; shift ;;
+    --cleanup) CLEANUP=true; INTERACTIVE=false; shift ;;
+    --purge|--yes) CLEANUP_ARGS+=("$1"); shift ;;
     --clean|--skip-verify|--json)
       ARGS+=("$1"); INTERACTIVE=false; shift ;;
     --nodes|--standby|--cluster|--mode|--channel|--spock-branch|--etcd-version|\
@@ -316,6 +329,22 @@ done
 
 ensure_venv
 [[ "$INTERACTIVE" == true ]] || check_inventory
+
+# ---------------------------------------------------------------------------
+# Cleanup — a mode of its own, not a deployment
+# ---------------------------------------------------------------------------
+
+if [[ "$CLEANUP" == true ]]; then
+  say ""
+  say "${BOLD}Host cleanup${RESET}"
+  rule
+  say "Hosts in $(basename "$INVENTORY") ($(host_count)):"
+  show_hosts
+  rule
+  say ""
+  exec python3 -m deployment.cli cleanup --inventory "$INVENTORY" \
+    "${CLEANUP_ARGS[@]+"${CLEANUP_ARGS[@]}"}"
+fi
 
 # ---------------------------------------------------------------------------
 # Interactive prompts
@@ -441,16 +470,38 @@ if [[ "$INTERACTIVE" == true ]]; then
   say ""
 
   # --- 5. standbys ---------------------------------------------------
-  say "${BOLD}5) Which nodes should get a Patroni standby?${RESET}"
+  # Standbys are off by default: they double the instance count and are only
+  # worth their cost when a node has to survive its own failure. The list is
+  # asked for only after someone says they want one.
+  say "${BOLD}5) Should any node get a Patroni standby?${RESET}"
   NODE_LIST=""
   for ((i = 1; i <= NODES; i++)); do
     NODE_LIST="${NODE_LIST}${NODE_LIST:+, }n$i"
   done
-  say "   Nodes in this cluster: $NODE_LIST"
   say "   A standby is a physical replica Patroni can promote if its node fails."
-  say "   ${DIM}Enter a comma-separated list, or leave empty for none.${RESET}"
+  say "   ${DIM}Optional — without one, a failed node stays down until you fix it,"
+  say "   and the other Spock nodes keep serving writes.${RESET}"
   say ""
-  STANDBY="$(ask "   Standby for which node(s)" "")"
+  STANDBY=""
+  WANT_STANDBY="$(ask_choice "   Add standbys? (y/n)" "n" y n)"
+  if [[ "$WANT_STANDBY" == "y" ]]; then
+    say ""
+    say "   Nodes in this cluster: $NODE_LIST"
+    say "   ${DIM}Comma-separated, or 'all' for every node.${RESET}"
+    while [[ -z "$STANDBY" ]]; do
+      STANDBY="$(ask "   Standby for which node(s)" "n1")"
+      if [[ "$STANDBY" == "all" ]]; then
+        STANDBY="$(printf '%s' "$NODE_LIST" | tr -d ' ')"
+      fi
+      for entry in ${STANDBY//,/ }; do
+        if [[ ! "$entry" =~ ^n[0-9]+$ ]] || (( ${entry#n} < 1 || ${entry#n} > NODES )); then
+          warn "Unknown node '$entry' — this cluster has $NODE_LIST."
+          STANDBY=""
+          break
+        fi
+      done
+    done
+  fi
   say ""
 
   # --- 6. remaining options ------------------------------------------

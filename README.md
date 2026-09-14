@@ -14,7 +14,7 @@ $ ./pg_deploy_cluster.sh
 2) How should PostgreSQL and Spock be installed?
 3) How many Spock nodes should the cluster have?
 4) Which PostgreSQL version?
-5) Which nodes should get a Patroni standby?
+5) Should any node get a Patroni standby?   (default: no)
 ```
 
 The first question writes `configuration/inventory.json` for you, so there is
@@ -380,6 +380,21 @@ python3 -m deployment.cli remove --cluster demo --purge     # also uninstall pac
 `remove` stops Patroni before touching anything, so no surviving member tries to
 fail over into a data directory that is being deleted. Hosts that cannot be
 reached are reported and left untouched rather than aborting the teardown.
+
+When there is no cluster state to remove — a deployment that failed halfway, or
+a state file that was deleted — clean the machines themselves instead:
+
+```bash
+./pg_deploy_cluster.sh --cleanup                 # ask first, then scrub every host
+./pg_deploy_cluster.sh --cleanup --purge --yes   # also uninstall packages, no prompt
+```
+
+`--cleanup` works from the inventory rather than from saved state: it finds the
+`patroni-*` units on each host, stops and deletes them, kills anything still
+serving out of the data root, purges etcd, and removes the data directories,
+`/etc/patroni`, the generated `.pgpass` and `pg_service.conf`, and any saved
+cluster state that described only those hosts. It asks you to type `wipe`
+before doing any of it unless `--yes` is given.
 
 ---
 

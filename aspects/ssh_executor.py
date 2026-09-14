@@ -60,6 +60,7 @@ class SSHExecutor:
         self._max_retries = max_retries
         self._client = None
         self._sudo_prefix = None
+        self._sudo_user_prefix = None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -169,7 +170,21 @@ class SSHExecutor:
             return f"bash -c {quoted}"
         if user == "root":
             return f"{self.sudo_prefix()} bash -c {quoted}"
-        return f"{self.sudo_prefix()} -u {user} bash -c {quoted}"
+        # Stepping *down* to another user always needs its own invocation:
+        # sudo_prefix() is empty in a root session, which is right for a plain
+        # privileged command but would leave a bare "-u postgres bash -c ..."
+        # for the shell to choke on.
+        return (f"{self._step_down_prefix()} -u {shlex.quote(user)} -- "
+                f"bash -c {quoted}")
+
+    def _step_down_prefix(self):
+        """`sudo -n`, or runuser where sudo is not installed."""
+        if self._sudo_user_prefix is None:
+            prefix = self.sudo_prefix()
+            if not prefix:
+                prefix = "sudo -n" if self.which("sudo") else "runuser"
+            self._sudo_user_prefix = prefix
+        return self._sudo_user_prefix
 
     def sudo_prefix(self):
         """Non-interactive sudo, or nothing when we are already root.

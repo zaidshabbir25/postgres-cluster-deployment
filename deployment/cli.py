@@ -412,6 +412,36 @@ def cmd_remove(args):
     return EXIT_OK if result["outcome"] == "succeeded" else EXIT_FAIL
 
 
+def cmd_cleanup(args):
+    """Scrub every host in the inventory, with or without a state file."""
+    hosts, defaults = inventory.load(args.inventory)
+
+    if not args.yes:
+        print(
+            f"This removes Patroni, etcd state, every data directory under "
+            f"{args.data_root or defaults.get('data_root', topology.DEFAULT_DATA_ROOT)} "
+            f"and the cluster configuration from {len(hosts)} host(s):"
+        )
+        for host in hosts:
+            print(f"  {host.name:<18} {host.address}")
+        if args.purge:
+            print("It also uninstalls the pgEdge packages and repository.")
+        if input("Type 'wipe' to confirm: ").strip() != "wipe":
+            print("Aborted — nothing was changed.")
+            return EXIT_OK
+
+    result = cleanup.wipe_hosts(
+        hosts,
+        data_root=args.data_root or defaults.get("data_root"),
+        db_user=args.db_user or defaults.get("db_user", "postgres"),
+        purge_packages=args.purge,
+    )
+    if result["unreachable"]:
+        for name, reason in result["unreachable"].items():
+            print(f"  {name}: not cleaned — {reason}", file=sys.stderr)
+    return EXIT_OK if result["outcome"] == "succeeded" else EXIT_FAIL
+
+
 def cmd_list(args):
     clusters = state.list_clusters()
     if not clusters:
@@ -546,6 +576,19 @@ def build_parser():
                         help="keep the saved cluster state file")
     remove.add_argument("--yes", action="store_true", help="skip the confirmation")
     remove.set_defaults(func=cmd_remove)
+
+    # --- cleanup ------------------------------------------------------
+    wipe = subparsers.add_parser(
+        "cleanup",
+        help="scrub every host in the inventory, without needing cluster state",
+    )
+    wipe.add_argument("--inventory", help="path to the inventory JSON")
+    wipe.add_argument("--data-root", help="data directory parent to delete")
+    wipe.add_argument("--db-user", help="database superuser whose files to remove")
+    wipe.add_argument("--purge", action="store_true",
+                      help="also uninstall the pgEdge packages and repository")
+    wipe.add_argument("--yes", action="store_true", help="skip the confirmation")
+    wipe.set_defaults(func=cmd_cleanup)
 
     # --- list ---------------------------------------------------------
     listing = subparsers.add_parser("list", help="list deployed clusters")

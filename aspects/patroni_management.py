@@ -257,10 +257,10 @@ def validate_config(executor, plan, node):
     except RuntimeError:
         return ""
 
+    # user= lets the executor build the step-down invocation itself.
     ok, output = executor.try_run(
-        f"{as_db_user(executor, plan.db_user)} "
         f"{binary} --validate-config {shlex.quote(node.config_file)} 2>&1",
-        node=node.name,
+        user=plan.db_user, node=node.name,
     )
     if ok:
         return ""
