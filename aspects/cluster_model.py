@@ -21,6 +21,9 @@ class Host:
 
     name: str
     address: str
+    # What peers should dial. Equal to address unless that is a loopback name,
+    # which Patroni rejects in connect_address.
+    advertise_address: str = ""
     username: str = "root"
     key_file: Optional[str] = None
     port: int = 22
@@ -53,6 +56,9 @@ class Node:
     scope: str                # Patroni scope; standbys share their leader's
     config_file: str
     pgpass_file: str
+    # Routable form of `address` for Patroni's connect_address, which rejects
+    # loopback names. Empty means `address` is already routable.
+    advertise_address: str = ""
     leader: Optional[str] = None   # for standbys: the Spock node they follow
     standbys: List[str] = field(default_factory=list)  # for Spock nodes
 

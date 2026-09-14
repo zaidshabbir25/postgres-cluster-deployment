@@ -242,10 +242,11 @@ def _check_port_collisions(plan):
                 )
 
 
-def apply_platform(plan, host, platform_info):
+def apply_platform(plan, host, platform_info, advertise_address=""):
     """Record a probed host's platform on the plan and its nodes."""
     host.platform = platform_info
     host.family = platform_info["family"]
+    host.advertise_address = advertise_address or host.address
 
     if plan.deploy_mode == "source":
         from aspects import source_build
@@ -256,6 +257,7 @@ def apply_platform(plan, host, platform_info):
     for node in plan.nodes_on(host.name):
         node.family = host.family
         node.bin_dir = host.bin_dir
+        node.advertise_address = host.advertise_address
     return host.bin_dir
 
 

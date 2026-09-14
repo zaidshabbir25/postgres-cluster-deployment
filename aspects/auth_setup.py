@@ -15,6 +15,7 @@ Three pieces do that:
 and the health collector both connect outward from whichever node they run on.
 """
 
+import ipaddress
 import shlex
 
 from aspects import platform_detect
@@ -60,6 +61,24 @@ def pgservice_content(nodes, db_user, db_name):
     return "\n".join(blocks)
 
 
+def hba_target(address):
+    """Render one address as a pg_hba target, or "" if it needs no rule.
+
+    An IP literal takes a mask; a host name must not have one — "localhost/32"
+    is a syntax error that stops PostgreSQL from starting, and Patroni owns
+    pg_hba.conf for the clusters it bootstraps, so the node simply never comes
+    up. Loopback is skipped because the fixed rules above already cover it.
+    """
+    address = (address or "").strip()
+    if not address or platform_detect.is_loopback(address):
+        return ""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return address  # a host name: pg_hba matches it by reverse lookup
+    return f"{address}/{32 if parsed.version == 4 else 128}"
+
+
 def pg_hba_entries(nodes, db_user, cidrs=None, method="scram-sha-256"):
     """pg_hba rules that let the cluster talk to itself.
 
@@ -74,10 +93,15 @@ def pg_hba_entries(nodes, db_user, cidrs=None, method="scram-sha-256"):
         f"host replication {db_user} 127.0.0.1/32 {method}",
         f"host replication {db_user} ::1/128 {method}",
     ]
-    addresses = sorted({node.address for node in nodes})
-    for address in addresses:
-        entries.append(f"host all all {address}/32 {method}")
-        entries.append(f"host replication {db_user} {address}/32 {method}")
+    # Both forms matter: clients connect to the listed address, while Patroni
+    # replication connects to the address the leader advertises.
+    targets = set()
+    for node in nodes:
+        targets.add(hba_target(node.address))
+        targets.add(hba_target(getattr(node, "advertise_address", "")))
+    for address in sorted(t for t in targets if t):
+        entries.append(f"host all all {address} {method}")
+        entries.append(f"host replication {db_user} {address} {method}")
     for cidr in cidrs or []:
         entries.append(f"host all all {cidr} {method}")
         entries.append(f"host replication {db_user} {cidr} {method}")

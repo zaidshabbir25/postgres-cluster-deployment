@@ -126,6 +126,9 @@ def build_config(plan, node):
     replica is a common source of drift between members.
     """
     is_leader = node.is_spock
+    # Patroni validates connect_address and refuses loopback names: a peer
+    # reading "localhost" out of the DCS would connect to itself.
+    advertise = node.advertise_address or node.address
 
     config = {
         "scope": node.scope,
@@ -133,7 +136,7 @@ def build_config(plan, node):
         "namespace": NAMESPACE,
         "restapi": {
             "listen": f"0.0.0.0:{node.restapi_port}",
-            "connect_address": f"{node.address}:{node.restapi_port}",
+            "connect_address": f"{advertise}:{node.restapi_port}",
         },
         "etcd3": etcd3_settings(plan.etcd_endpoints),
     }
@@ -176,7 +179,7 @@ def build_config(plan, node):
 
     config["postgresql"] = {
         "listen": f"0.0.0.0:{node.pg_port}",
-        "connect_address": f"{node.address}:{node.pg_port}",
+        "connect_address": f"{advertise}:{node.pg_port}",
         "data_dir": node.data_dir,
         "bin_dir": node.bin_dir,
         "pgpass": node.pgpass_file,

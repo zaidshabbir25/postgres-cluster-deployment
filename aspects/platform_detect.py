@@ -68,6 +68,38 @@ def detect(executor):
     }
 
 
+LOOPBACK_NAMES = {"localhost", "localhost.localdomain", "127.0.0.1", "::1"}
+
+
+def is_loopback(address):
+    address = (address or "").strip().lower()
+    return address in LOOPBACK_NAMES or address.startswith("127.")
+
+
+def primary_address(executor):
+    """The address other machines would use to reach this host.
+
+    Patroni refuses a loopback name in connect_address — a peer that reads
+    "localhost" from the DCS would dial itself — so a host entered as
+    localhost still needs a real address to advertise. Falls back to the
+    hostname, and finally to 127.0.0.1 for a machine that genuinely has no
+    other address.
+    """
+    probes = (
+        # The source address the kernel would pick for an outbound packet:
+        # correct on multi-homed hosts, and it needs no DNS.
+        "ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \\([0-9.]*\\).*/\\1/p' | head -n 1",
+        "hostname -I 2>/dev/null | awk '{print $1}'",
+        "hostname -f 2>/dev/null",
+    )
+    for probe in probes:
+        ok, output = executor.try_run(probe)
+        candidate = output.strip().splitlines()[0].strip() if output.strip() else ""
+        if ok and candidate and not is_loopback(candidate):
+            return candidate
+    return "127.0.0.1"
+
+
 def package_manager(family):
     """Return the package-manager verbs for a family."""
     if family == "rhel":
