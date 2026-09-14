@@ -299,6 +299,9 @@ class ClusterDeployer:
                                             run_logger=self.log)
             unit = patroni_management.write_service_unit(executor, self.plan, node)
             self.log.info(f"    {node.name}: {node.config_file} and {unit}")
+            problem = patroni_management.validate_config(executor, self.plan, node)
+            if problem:
+                self.log.warn(f"{node.name}: patroni --validate-config says:\n{problem}")
         return f"configuration written for {len(self.plan.nodes)} node(s)"
 
     def step_start_leaders(self):
@@ -311,6 +314,9 @@ class ClusterDeployer:
                 # A reused scope name inherits the old cluster's leader key and
                 # system identifier, and every new member then refuses to start.
                 patroni_management.remove_scope(executor, node, node_name=node.name)
+            conflict = patroni_management.port_conflict(executor, node)
+            if conflict:
+                self.log.warn(f"{node.name}: {conflict}")
             message = patroni_management.start(executor, self.plan, node,
                                                run_logger=self.log)
             self.log.info(f"    {node.name}: {message}")
@@ -339,6 +345,9 @@ class ClusterDeployer:
 
         for node in standbys:
             executor = self.executor_for_node(node)
+            conflict = patroni_management.port_conflict(executor, node)
+            if conflict:
+                self.log.warn(f"{node.name}: {conflict}")
             message = patroni_management.start(executor, self.plan, node,
                                                run_logger=self.log)
             self.log.info(
