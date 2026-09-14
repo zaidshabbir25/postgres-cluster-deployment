@@ -147,18 +147,46 @@ class ClusterDeployer:
 
     def step_clean(self):
         """Remove the previous deployment's state so this run starts fresh."""
+        planned = {node.name for node in self.plan.nodes}
+        leftovers = []
+
         for host in self.plan.hosts:
             executor = self.executor_for_host(host.name)
 
             for node in self.plan.nodes_on(host.name):
                 patroni_management.stop(executor, node.name)
+
+            # Instances this deployment does not know about — a standby from an
+            # earlier run, say — must go before etcd is purged. They are still
+            # running, and a surviving one re-registers as its scope's leader
+            # the moment the DCS comes back, leaving the node that should lead
+            # that scope stuck as its replica.
+            for unit in patroni_management.installed_units(executor, node=host.name):
+                name = patroni_management.unit_node_name(unit)
+                if name in planned:
+                    continue
+                patroni_management.remove_instance(
+                    executor, name, data_root=self.plan.data_root, node=host.name
+                )
+                leftovers.append(f"{name} on {host.name}")
+                self.log.warn(
+                    f"{host.name}: removed leftover Patroni instance {name} "
+                    f"from an earlier deployment"
+                )
+
             if host.is_etcd_member:
                 etcd_management.purge(executor, node=host.name)
 
             for node in self.plan.nodes_on(host.name):
                 executor.try_run(f"rm -rf {node.data_dir}", node=node.name)
                 executor.try_run(f"rm -f {node.config_file}", node=node.name)
-        return "previous Patroni instances stopped, data directories and etcd state removed"
+
+        message = ("previous Patroni instances stopped, data directories and "
+                   "etcd state removed")
+        if leftovers:
+            message += f"; removed {len(leftovers)} leftover instance(s): " \
+                       f"{', '.join(leftovers)}"
+        return message
 
     def step_prerequisites(self):
         messages = []

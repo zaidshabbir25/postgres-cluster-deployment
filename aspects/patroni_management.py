@@ -366,6 +366,50 @@ def start(executor, plan, node, run_logger=None):
     return f"patroni started directly (log {log_path})"
 
 
+def installed_units(executor, node=None):
+    """Every patroni-<node>.service unit installed on a host."""
+    _, output = executor.try_run(
+        "systemctl list-unit-files 'patroni-*.service' --no-legend 2>/dev/null "
+        "| awk '{print $1}'",
+        node=node,
+    )
+    return sorted(
+        line.strip() for line in output.splitlines()
+        if line.strip().startswith("patroni-")
+    )
+
+
+def unit_node_name(unit):
+    """'patroni-n1s1.service' -> 'n1s1'."""
+    name = unit.strip()
+    if name.endswith(".service"):
+        name = name[: -len(".service")]
+    return name[len("patroni-"):] if name.startswith("patroni-") else name
+
+
+def remove_instance(executor, node_name, data_root="", node=None):
+    """Delete one Patroni instance: unit, config, pgpass and data directory.
+
+    Used against instances no longer in the plan. A leftover instance is not
+    idle — it holds its scope's leader lock in the DCS, so a fresh node with
+    the same scope joins it as a replica and never becomes the leader the
+    deployment is waiting for.
+    """
+    unit = unit_name(node_name)
+    stop(executor, node_name)
+    executor.try_run(f"systemctl disable {shlex.quote(unit)} 2>/dev/null || true",
+                     node=node)
+    executor.try_run(f"rm -f /etc/systemd/system/{unit}.service", node=node)
+    executor.try_run(f"rm -f {config_path(node_name)}", node=node)
+    executor.try_run(f"rm -f /tmp/patroni_{node_name}.log", node=node)
+    if data_root:
+        executor.try_run(
+            f"rm -rf {shlex.quote(data_root.rstrip('/'))}/{node_name}", node=node
+        )
+    executor.try_run("systemctl daemon-reload 2>/dev/null || true", node=node)
+    return unit
+
+
 def stop(executor, node_name):
     """Stop a node's Patroni instance without triggering a failover storm."""
     service_management.stop(executor, unit_name(node_name), node=node_name)
@@ -447,9 +491,11 @@ def wait_for_role(executor, node, expected_roles, timeout=300, interval=5,
     timeout. Returns (ok, role, detail).
     """
     wanted = {role.lower() for role in expected_roles}
+    leader_wanted = bool(wanted & {"leader", "master", "primary"})
     attempts = max(1, timeout // interval)
     systemd = service_management.has_systemd(executor, node=node.name)
     last_detail = ""
+    usurped = 0
 
     for attempt in range(1, attempts + 1):
         members = list_members(executor, node, node_name=node.name)
@@ -463,6 +509,29 @@ def wait_for_role(executor, node, expected_roles, timeout=300, interval=5,
             if role in wanted and state in ("running", "streaming", "in archive recovery"):
                 return True, member.get("role"), f"state={member.get('state')}"
             last_detail = f"role={member.get('role')} state={member.get('state')}"
+
+        # A node that should lead its scope but is following someone else will
+        # not change its mind: Patroni only promotes it if the lock owner goes
+        # away. Waiting out the timeout just delays the same failure.
+        if leader_wanted and visible:
+            owner = next(
+                (m.get("name") for m in members
+                 if (m.get("role") or "").lower() in ("leader", "master", "primary")
+                 and m.get("name") != node.name),
+                None,
+            )
+            if owner:
+                usurped += 1
+                last_detail = (
+                    f"scope {node.scope} is already led by {owner}, so {node.name} "
+                    f"joined it as a replica. {owner} is not part of this "
+                    f"deployment — remove it (./pg_deploy_cluster.sh --cleanup) "
+                    f"or redeploy with --clean"
+                )
+                if usurped * interval >= 30:
+                    return False, None, last_detail
+            else:
+                usurped = 0
 
         if not visible:
             # Check liveness every third poll: often enough to fail fast,
