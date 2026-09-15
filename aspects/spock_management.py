@@ -122,20 +122,42 @@ def stage_zodan(executor, plan, node, branch, run_logger=None):
          is last.
 
     An explicit plan.zodan_sql skips straight to the bundled directory: naming
-    a script is an instruction, not a preference. Returns (remote path, origin).
+    a script is an instruction, not a preference. It is ignored for a node
+    whose Spock major differs from the cluster's, though — that name was chosen
+    for the cluster's major, and loading a Spock 5 script into a Spock 6 node
+    produces procedures that call an API the extension no longer has.
+    Returns (remote path, origin).
     """
     from aspects import source_build  # local: source_build imports nothing here
 
     executor.run(f"mkdir -p {REMOTE_ZODAN_DIR}", node=node.name)
     executor.run(f"chmod 755 {REMOTE_ZODAN_DIR}", node=node.name)
     spock_major = getattr(node, "spock_major", "") or plan.spock_major
+    # A pinned name is honoured only where it can be right. Two ways it cannot
+    # be: it was chosen for the cluster's major and this node runs the other
+    # one, or it is the bundled script of a different major — which is what an
+    # older version of this tool used to write into the saved state
+    # automatically, so it is residue rather than an instruction.
+    pinned = plan.zodan_sql or ""
+    other_majors = {
+        filename for major, filename in ZODAN_BY_SPOCK_MAJOR.items()
+        if str(major) != str(spock_major)
+    }
+    if pinned and (str(spock_major) != str(plan.spock_major)
+                   or pinned in other_majors):
+        if run_logger:
+            run_logger.warn(
+                f"{node.name}: ignoring the pinned {pinned}, which is not the "
+                f"zodan script for spock{spock_major}"
+            )
+        pinned = ""
 
     def adopt(remote):
         executor.try_run(f"chown {plan.db_user}: {shlex.quote(remote)}",
                          node=node.name)
         executor.try_run(f"chmod 644 {shlex.quote(remote)}", node=node.name)
 
-    if not plan.zodan_sql:
+    if not pinned:
         remote = f"{REMOTE_ZODAN_DIR}/zodan-{_safe_name(branch)}.sql"
         checkout = f"{source_build.BUILD_ROOT}/spock"
         on_branch, current = executor.try_run(
@@ -168,7 +190,7 @@ def stage_zodan(executor, plan, node, branch, run_logger=None):
                 f"{spock_major}"
             )
 
-    local = zodan_script(spock_major, plan.zodan_sql or None)
+    local = zodan_script(spock_major, pinned or None)
     remote = f"{REMOTE_ZODAN_DIR}/{local.name}"
     executor.put_file(local, remote, owner=plan.db_user, mode="644",
                       node=node.name)

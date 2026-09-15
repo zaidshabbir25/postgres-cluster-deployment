@@ -527,12 +527,15 @@ if [[ -n "$ADD_NODE" ]]; then
   if [[ "$NODE_ROLE" != "standby" ]]; then
     if [[ -z "$NODE_SPOCK_MAJOR" ]]; then
       say "${BOLD}4) Which Spock version should $ADD_NODE run?${RESET}"
-      say "   ${DIM}The cluster runs spock${FACT_SPOCK_MAJOR}. The two majors differ in the"
-      say "   replication API, so a mixed mesh is a migration step, not a"
-      say "   resting state.${RESET}"
+      say "   ${DIM}The cluster runs spock${FACT_SPOCK_MAJOR}, and spock.add_node refuses to join"
+      say "   a node whose Spock major.minor differs from its peers' — so this"
+      say "   has to match until the whole cluster is upgraded.${RESET}"
       say ""
       NODE_SPOCK_MAJOR="$(ask_choice "   Spock major version (50 or 60)" "$FACT_SPOCK_MAJOR" 50 60)"
       say ""
+    fi
+    if [[ "$NODE_SPOCK_MAJOR" != "$FACT_SPOCK_MAJOR" ]]; then
+      die "the cluster runs spock$FACT_SPOCK_MAJOR; spock.add_node refuses to cross-wire a spock$NODE_SPOCK_MAJOR node into it. Upgrade the cluster's Spock first, or add this node with spock$FACT_SPOCK_MAJOR"
     fi
     NODE_ARGS+=(--spock-major "$NODE_SPOCK_MAJOR")
 

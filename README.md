@@ -446,8 +446,11 @@ The zodan procedures come from the same branch as the node's Spock:
 fetched from that branch on GitHub, else the copy bundled in
 `configuration/spock` so an air-gapped host still works. A spock60 node
 therefore loads zodan from `main` and a spock50 node from `v5_STABLE`, matching
-the replication API those procedures call. A mixed-major mesh is a migration
-step, not a resting state, and the run says so. Spock lives inside a PostgreSQL prefix, so a node cannot change
+the replication API those procedures call. Spock's own `add_node` refuses to join nodes whose
+Spock major.minor differ, so a node's Spock has to match the cluster's — the
+run refuses a mismatch up front rather than letting you discover it after a
+40-minute build. Upgrade the whole cluster's Spock first if you want to move
+majors. Spock lives inside a PostgreSQL prefix, so a node cannot change
 the Spock of a prefix that running nodes are already using — give it its own
 `--pg-version`, or take the cluster's Spock.
 

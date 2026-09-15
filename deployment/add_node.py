@@ -170,23 +170,34 @@ SPOCK_MAJORS = ("50", "60")
 
 
 def check_spock(plan, requested):
-    """Resolve the Spock major for a new node. Returns (major, warnings)."""
+    """Resolve the Spock major for a new node. Returns (major, warnings).
+
+    A different major is refused here rather than discovered later: Spock's own
+    add_node procedure calls check_spock_version_compatibility first, which
+    rejects any join where the two nodes' major.minor differ —
+
+        ERROR: Spock version mismatch: new node has version 6.0.0, but source
+        version is 5.0.11. Major.minor versions must match (patch differences
+        are allowed).
+
+    Finding that out after building PostgreSQL and Spock for half an hour
+    helps nobody.
+    """
     major = str(requested or plan.spock_major)
     if major not in SPOCK_MAJORS:
         raise AddNodeError(
             f"Spock major must be one of {', '.join(SPOCK_MAJORS)}, not "
             f"{major!r}"
         )
-    notes = []
     if major != str(plan.spock_major):
-        notes.append(
-            f"this node runs spock{major} while the cluster runs "
-            f"spock{plan.spock_major}. The two majors differ in the "
-            f"replication API the zodan procedures call, and cross-wiring a "
-            f"mixed mesh is not something this tool verifies — treat it as a "
-            f"migration step, not a resting state."
+        raise AddNodeError(
+            f"this cluster runs spock{plan.spock_major}, and spock.add_node "
+            f"refuses to join a node whose Spock major.minor differs from its "
+            f"peers' — a spock{major} node cannot be cross-wired into it. "
+            f"Upgrade the whole cluster's Spock first, or add this node with "
+            f"--spock-major {plan.spock_major}."
         )
-    return major, notes
+    return major, []
 
 
 def add(cluster_name, host_name=None, node_name=None, source_node=None,
@@ -334,7 +345,9 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             # honoured a Spock choice never runs. Doing it now means touching
             # spock.so inside a prefix — which is shared by every node built
             # against it, so it is only safe while no node uses this one.
-            spock_asked_for = bool(spock_branch) or wanted_spock != str(plan.spock_major)
+            # Only a branch can differ now: check_spock has already refused a
+            # different major.
+            spock_asked_for = bool(spock_branch)
             sharers = [n.name for n in existing_nodes if n.bin_dir == node.bin_dir]
             if spock_asked_for and sharers:
                 log.step_end("failed", "Spock is shared with running nodes")
