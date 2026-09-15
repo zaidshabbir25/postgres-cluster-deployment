@@ -601,55 +601,6 @@ goes over the existing subscription rather than a side channel. It **overwrites*
 the target nodes' copy, and asks for confirmation before doing so. In a
 multi-master cluster there is no authoritative node, so you choose the source.
 
----
-
-## pgEdge CLI parity
-
-The [pgEdge CLI](https://github.com/pgEdge/cli) is deprecated and never
-supported native packages. This project covers its functionality against
-native-package clusters instead. Command-by-command:
-
-| pgEdge CLI | Here | Notes |
-|---|---|---|
-| `setup` | `pg_deploy_cluster.sh` | native packages or source build |
-| `cluster json-template` / `json-create` | `configuration/inventory.example.json` | hosts only; topology is per-deployment |
-| `cluster json-validate` | `cli plan`, inventory validation | validated on every load |
-| `cluster init` | `cli deploy` | |
-| `cluster remove` | `cli remove [--purge]` | |
-| `cluster list-nodes` | `node list` | |
-| `cluster add-node` | `node add` | logical sync, not pgBackRest restore |
-| `cluster remove-node` | `node remove` | drains WAL first; detaches both ways |
-| `cluster replication-begin` | `spock replication-begin` | |
-| `cluster replication-check` | `cli status`, `spock sub-show-status` | |
-| `cluster add-db` | `db create` | |
-| `cluster command` | `node command [--sql] [--compare]` | |
-| `cluster ssh` | `node ssh`, `node psql` | |
-| `cluster app-install` / `app-remove` | `app install` / `app remove` | pgbench + a built-in sample schema |
-| `cluster app-concurrent-index` | `app concurrent-index` | |
-| `db create` / `guc-set` / `guc-show` / `set-readonly` / `test-io` | `db` group | `guc-set` goes through the DCS |
-| `service start`/`stop`/`restart`/`reload`/`status`/`enable`/`disable` | `service` group | Patroni-aware |
-| `service init` / `config` | handled by `cli deploy` | Patroni owns bootstrap |
-| `spock node-*` / `repset-*` / `sub-*` | `spock` group | all 30 CLI commands covered |
-| `spock replicate-ddl` / `sequence-convert` | `spock` group | |
-| `spock health-check` / `metrics-check` | `cli status`, dashboard | host and DB metrics |
-| `um list` / `install` / `remove` / `upgrade` | `package` group | dnf / apt, with drift detection |
-| `um update` / `clean` / `download` / `verify-metadata` | n/a | artefacts of the CLI's own tarball store |
-| `ace spock-diff` | `diff spock` | |
-| `ace schema-diff` | `diff schema` | |
-| `ace repset-diff` | `diff repset` | |
-| `ace table-diff` | `diff table` | bucketed checksums |
-| `ace table-repair` | `diff repair` | via `sub_resync_table` |
-| `ace table-rerun` / `mtree` / `start` | not implemented | Merkle-tree acceleration and the ACE daemon are a separate product; install `pgedge-ace` for those |
-| `localhost cluster-create` / `cluster-destroy` | inventory `"local": true` + port packing | |
-| `upgrade-cli` | n/a | |
-
-Not covered, and deliberately: the CLI's Merkle-tree table diffing (`ace mtree`)
-and its background scheduler/API (`ace start`). Those are substantial enough to
-be their own product — pgEdge ships them as `pgedge-ace`, which can be installed
-with `package install pgedge-ace` and used alongside this tool.
-
----
-
 ## Dashboard
 
 ```bash
