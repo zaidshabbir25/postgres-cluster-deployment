@@ -34,6 +34,7 @@ from aspects import (
     pg_server_management,
     platform_detect,
     prereq_setup,
+    source_build,
     spock_management,
     state,
 )
@@ -136,7 +137,6 @@ def bin_dir_for(plan, host, pg_major):
     somewhere else entirely.
     """
     if plan.deploy_mode == "source":
-        from aspects import source_build
         return source_build.bin_dir(pg_major)
     return platform_detect.pg_bin_dir(host.family, pg_major)
 
@@ -291,55 +291,83 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                          f"already installed at {node.bin_dir}")
         else:
             if plan.deploy_mode == "source":
-                log.step_end("failed", "source-mode host is not prepared")
-                raise AddNodeError(
-                    f"{target_host.name} has no PostgreSQL {wanted_major} at "
-                    f"{node.bin_dir}. This cluster was built from source, and "
-                    f"nothing here builds a second major on demand — build "
-                    f"PostgreSQL {wanted_version} into {node.bin_dir} first, or "
-                    f"add the node with --pg-version {cluster_version(plan)}."
+                # A source cluster builds what it needs. The requested major is
+                # compiled into its own prefix, alongside whatever is already
+                # installed — refusing would leave the node unbuildable, since
+                # no repository supplies this cluster's servers.
+                if "." not in str(wanted_version):
+                    log.step_end("failed", "no exact version to build")
+                    raise AddNodeError(
+                        f"This cluster is built from source, so {name} needs an "
+                        f"exact PostgreSQL version to compile (e.g. "
+                        f"{wanted_major}.1), not {wanted_version!r}."
+                    )
+                log.info(f"    building PostgreSQL {wanted_version} from source "
+                         f"— this takes 20-40 minutes")
+                build = source_build.build_major(
+                    executor, target_host, plan, wanted_version, run_logger=log
                 )
-            prereq_setup.install_prerequisites(executor, node=node.name)
-            configure_repository.configure(
-                executor, target_host.family, plan.repo_channel, node=node.name
-            )
-            packages = platform_detect.server_packages(
-                target_host.family, wanted_major, plan.spock_major
-            )
-            packages += platform_detect.patroni_packages(target_host.family)
-            log.info(f"    installing {', '.join(packages)}")
-            package_management.install(
-                executor, target_host.family, packages, node=node.name
-            )
-            node.pg_version = pg_server_management.server_version(
-                executor, node.bin_dir, node=node.name
-            )
-            if node.pg_version and not pg_server_management.is_at_least(
-                node.pg_version, cluster_version(plan)
-            ):
-                log.step_end("failed",
-                             f"installed PostgreSQL {node.pg_version} is too old")
-                raise AddNodeError(
-                    f"{target_host.name} installed PostgreSQL {node.pg_version}, "
-                    f"older than the cluster's {cluster_version(plan)}. The "
-                    f"repository channel may not carry {wanted_version} for "
-                    f"this platform."
+                node.bin_dir = source_build.bin_dir(wanted_major)
+                node.pg_version = pg_server_management.server_version(
+                    executor, node.bin_dir, node=node.name
                 )
-            if not node.pg_version:
-                log.step_end("failed", "PostgreSQL not runnable after install")
-                raise AddNodeError(
-                    f"{target_host.name}: no PostgreSQL server at {node.bin_dir} "
-                    f"after installing {', '.join(packages)}"
+                if not node.pg_version:
+                    log.step_end("failed", "built PostgreSQL is not runnable")
+                    raise AddNodeError(
+                        f"{target_host.name}: no runnable server at "
+                        f"{node.bin_dir} after building {wanted_version}"
+                    )
+                if wanted_major != plan.pg_major:
+                    warnings.append(
+                        f"{name} runs a separately built PostgreSQL "
+                        f"{node.pg_version} at {build['prefix']}; the rest of "
+                        f"the cluster stays on {plan.pg_major}"
+                    )
+                log.step_end("passed",
+                             f"{info['pretty']} — PostgreSQL {node.pg_version} "
+                             f"built at {node.bin_dir}")
+            else:
+                prereq_setup.install_prerequisites(executor, node=node.name)
+                configure_repository.configure(
+                    executor, target_host.family, plan.repo_channel, node=node.name
                 )
-            if "." in str(wanted_version) and node.pg_version != wanted_version:
-                warnings.append(
-                    f"asked for PostgreSQL {wanted_version}, but the "
-                    f"{plan.repo_channel} channel carries {node.pg_version} — "
-                    f"{name} runs {node.pg_version}"
+                packages = platform_detect.server_packages(
+                    target_host.family, wanted_major, plan.spock_major
                 )
-            log.step_end("passed",
-                         f"{info['pretty']} — PostgreSQL {node.pg_version} "
-                         f"installed at {node.bin_dir}")
+                packages += platform_detect.patroni_packages(target_host.family)
+                log.info(f"    installing {', '.join(packages)}")
+                package_management.install(
+                    executor, target_host.family, packages, node=node.name
+                )
+                node.pg_version = pg_server_management.server_version(
+                    executor, node.bin_dir, node=node.name
+                )
+                if node.pg_version and not pg_server_management.is_at_least(
+                    node.pg_version, cluster_version(plan)
+                ):
+                    log.step_end("failed",
+                                 f"installed PostgreSQL {node.pg_version} is too old")
+                    raise AddNodeError(
+                        f"{target_host.name} installed PostgreSQL "
+                        f"{node.pg_version}, older than the cluster's "
+                        f"{cluster_version(plan)}. The repository channel may "
+                        f"not carry {wanted_version} for this platform."
+                    )
+                if not node.pg_version:
+                    log.step_end("failed", "PostgreSQL not runnable after install")
+                    raise AddNodeError(
+                        f"{target_host.name}: no PostgreSQL server at "
+                        f"{node.bin_dir} after installing {', '.join(packages)}"
+                    )
+                if "." in str(wanted_version) and node.pg_version != wanted_version:
+                    warnings.append(
+                        f"asked for PostgreSQL {wanted_version}, but the "
+                        f"{plan.repo_channel} channel carries {node.pg_version} — "
+                        f"{name} runs {node.pg_version}"
+                    )
+                log.step_end("passed",
+                             f"{info['pretty']} — PostgreSQL {node.pg_version} "
+                             f"installed at {node.bin_dir}")
 
         # --- 2. auth everywhere ---------------------------------------
         log.step_start("Refresh passwordless psql",

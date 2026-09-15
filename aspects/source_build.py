@@ -375,6 +375,74 @@ WantedBy=multi-user.target
     return version_output.strip()
 
 
+def register_library_path(executor, pg_major, node=None):
+    """Put one major's libraries on the loader path, without disturbing others.
+
+    A file per major: a host carrying two majors needs both lib directories
+    known to ld.so, and the single shared file the first build wrote would
+    otherwise be overwritten by the second.
+    """
+    prefix = install_dir(pg_major)
+    executor.write_file(
+        f"/etc/ld.so.conf.d/pgedge-source-pg{pg_major}.conf",
+        f"{prefix}/lib\n", owner="root", mode="644", node=node,
+    )
+    executor.try_run("ldconfig", node=node)
+    return prefix
+
+
+def build_major(executor, host, plan, pg_version, run_logger=None):
+    """Build one PostgreSQL major plus Spock, alongside anything already there.
+
+    This is what lets a source-built cluster grow a node on a newer major: the
+    same steps as a first build, minus the host-wide bits (PATH, client
+    symlinks, Patroni, etcd) which belong to the cluster's own major and are
+    already in place. Returns a details dict.
+
+    Nothing about the existing installation is touched — a different major
+    installs to its own prefix.
+    """
+    if not pg_version or "." not in str(pg_version):
+        raise ValueError(
+            f"A source build needs a full PostgreSQL version (e.g. 18.6), got "
+            f"{pg_version!r}."
+        )
+
+    spec = plan.source_build or {}
+    spock_branch = spec.get("spock_branch", "main")
+    jobs = spec.get("jobs")
+    pg_major = pg_version.split(".")[0]
+    details = {"host": host.name, "pg_version": pg_version}
+
+    def say(message):
+        if run_logger:
+            run_logger.info(f"    {host.name}: {message}")
+
+    _, message = install_build_dependencies(executor, host.family, node=host.name)
+    say(message)
+    ensure_postgres_user(executor, plan.db_user, host.family, node=host.name)
+
+    source_dir = fetch_postgres_source(executor, pg_version, node=host.name)
+    spock_dir, revision = fetch_spock_source(executor, spock_branch, node=host.name)
+    details["spock_revision"] = revision
+
+    count, names = apply_spock_patches(executor, source_dir, spock_dir, pg_major,
+                                       node=host.name)
+    details["patches"] = names
+    say(f"applied {count} Spock patch(es) for pg{pg_major}")
+
+    prefix = build_postgresql(executor, source_dir, pg_major, node=host.name,
+                              jobs=jobs)
+    details["prefix"] = prefix
+    say(f"PostgreSQL {pg_version} installed to {prefix}")
+
+    details["spock_module"] = build_spock(executor, spock_dir, pg_major,
+                                          node=host.name, jobs=jobs)
+    register_library_path(executor, pg_major, node=host.name)
+    make_reachable(executor, prefix, node=host.name)
+    return details
+
+
 def build_host(executor, host, plan, run_logger=None):
     """Run the whole source build on one host. Returns a details dict."""
     family = host.family
