@@ -31,6 +31,21 @@ ETCD_RELEASE_URL = (
 DEFAULT_ETCD_VERSION = "3.5.17"
 
 
+def make_reachable(executor, path, node=None):
+    """Let the database user read and run what root just installed.
+
+    Everything here is installed by root, and a hardened image with a 0077
+    umask leaves /opt/pgedge unreadable to anyone else. Patroni and PostgreSQL
+    both run as the database user, so they would fail at exec with
+    "bad interpreter: Permission denied" or no error at all — a+rX adds read
+    everywhere and execute only where it already applies (directories and
+    executables), so nothing becomes runnable that was not runnable by root.
+    """
+    executor.try_run(f"chmod a+rx {shlex.quote(INSTALL_ROOT)}", node=node)
+    executor.try_run(f"chmod -R a+rX {shlex.quote(path)}", node=node)
+    return path
+
+
 def install_dir(pg_major):
     return f"{INSTALL_ROOT}/pg{pg_major}"
 
@@ -157,6 +172,7 @@ def build_postgresql(executor, source_dir, pg_major, node=None, jobs=None):
         f"cd {shlex.quote(source_dir)}/contrib && make {jobs_flag} && make install",
         node=node, message="build and install contrib", timeout=3600,
     )
+    make_reachable(executor, prefix, node=node)
     return prefix
 
 
@@ -185,6 +201,7 @@ def build_spock(executor, spock_dir, pg_major, node=None, jobs=None):
             f"spock.so is missing under {prefix}/lib after make install — "
             f"the build produced no loadable module"
         )
+    make_reachable(executor, prefix, node=node)
     return f"{prefix}/lib/spock.so"
 
 
@@ -235,6 +252,9 @@ def install_patroni_from_pip(executor, family, node=None):
         executor.run(
             f"ln -sf {PATRONI_VENV}/bin/{binary} /usr/local/bin/{binary}", node=node
         )
+    # Patroni runs as the database user, so the venv — interpreter included —
+    # has to be reachable by it, not just by root.
+    make_reachable(executor, PATRONI_VENV, node=node)
 
     _, version = executor.try_run(f"{PATRONI_VENV}/bin/patroni --version", node=node)
     return version.strip() or "patroni installed"

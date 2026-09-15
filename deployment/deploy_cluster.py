@@ -347,6 +347,14 @@ class ClusterDeployer:
             problem = patroni_management.validate_config(executor, self.plan, node)
             if problem:
                 self.log.warn(f"{node.name}: patroni --validate-config says:\n{problem}")
+            # Not advisory: Patroni and PostgreSQL run as this user, so a
+            # binary it cannot execute means the node can never start.
+            blockers = patroni_management.check_binaries(executor, self.plan, node)
+            if blockers:
+                raise RuntimeError(
+                    f"{node.name}: the {self.plan.db_user} user cannot run the "
+                    f"binaries Patroni needs\n" + "\n".join(blockers)
+                )
         return f"configuration written for {len(self.plan.nodes)} node(s)"
 
     def step_start_leaders(self):

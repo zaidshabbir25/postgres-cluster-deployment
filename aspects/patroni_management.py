@@ -244,6 +244,38 @@ def write_config(executor, plan, node, run_logger=None):
     return node.config_file
 
 
+def check_binaries(executor, plan, node):
+    """Can the database user actually run Patroni and PostgreSQL?
+
+    Both run as that user, never as root. When the install tree is unreadable
+    to it — a source build under a hardened umask, say — the unit starts, the
+    exec fails, systemd restarts it, and nothing ever reaches the DCS. Asking
+    directly costs one command and names the file. Returns a list of problems.
+    """
+    problems = []
+    checks = [("patroni", None)]
+    if node.bin_dir:
+        checks.append(("postgres", f"{node.bin_dir}/postgres"))
+
+    for label, path in checks:
+        if path is None:
+            try:
+                path = patroni_binary(executor, node=node.name)
+            except RuntimeError as exc:
+                problems.append(str(exc))
+                continue
+        ok, output = executor.try_run(
+            f"{shlex.quote(path)} --version", user=plan.db_user, node=node.name
+        )
+        if not ok:
+            detail = (output or "").strip().splitlines()
+            problems.append(
+                f"{plan.db_user} cannot run {path}"
+                + (f": {detail[-1].strip()}" if detail else "")
+            )
+    return problems
+
+
 def validate_config(executor, plan, node):
     """Run `patroni --validate-config` on a written config.
 
@@ -364,6 +396,20 @@ def start(executor, plan, node, run_logger=None):
         node=node.name,
     )
     return f"patroni started directly (log {log_path})"
+
+
+def restart_count(executor, node_name, node=None):
+    """How many times systemd has restarted this node's Patroni unit."""
+    _, output = executor.try_run(
+        f"systemctl show -p NRestarts --value {shlex.quote(unit_name(node_name))} "
+        f"2>/dev/null",
+        node=node or node_name,
+    )
+    text = (output or "").strip().splitlines()
+    try:
+        return int(text[-1]) if text else 0
+    except ValueError:
+        return 0
 
 
 def installed_units(executor, node=None):
@@ -496,6 +542,10 @@ def wait_for_role(executor, node, expected_roles, timeout=300, interval=5,
     systemd = service_management.has_systemd(executor, node=node.name)
     last_detail = ""
     usurped = 0
+    # "activating" looks alive, and a unit that exits and is restarted every
+    # RestartSec spends much of its time in exactly that state. The restart
+    # counter is what tells the two apart.
+    restarts_at_start = restart_count(executor, node.name) if systemd else 0
 
     for attempt in range(1, attempts + 1):
         members = list_members(executor, node, node_name=node.name)
@@ -542,6 +592,14 @@ def wait_for_role(executor, node, expected_roles, timeout=300, interval=5,
                     return False, None, (
                         f"patroni is not running on {node.host} — {service_detail}"
                     )
+                if systemd:
+                    restarts = restart_count(executor, node.name) - restarts_at_start
+                    if restarts >= 3:
+                        return False, None, (
+                            f"{unit_name(node.name)} has restarted {restarts} times "
+                            f"without registering — it is failing at startup. "
+                            f"Check: journalctl -u {unit_name(node.name)} -n 50"
+                        )
                 rest = rest_health(executor, node, node_name=node.name)
                 if rest:
                     last_detail = (
