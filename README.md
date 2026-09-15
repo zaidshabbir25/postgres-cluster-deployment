@@ -432,6 +432,13 @@ adding a node onto an existing machine running an older server fails before it
 touches anything. A standby is not asked: a physical replica is a byte-for-byte
 copy and runs its leader's version, so `--pg-version` is rejected there.
 
+Binaries are found per major (`/usr/pgsql-18/bin`, or `/opt/pgedge/pg18/bin` for
+a source build), so asking for a newer major on a host that already runs the
+cluster's installs that major alongside the existing one rather than reusing it.
+Source-mode clusters are the exception: nothing here builds a second major on
+demand, so build it into that path first or add the node at the cluster's
+version.
+
 Every existing node's `pg_hba` and `.pgpass` learn about the newcomer and are
 reloaded in place — the cluster stays up throughout.
 
