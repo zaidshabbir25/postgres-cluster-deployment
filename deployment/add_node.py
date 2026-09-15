@@ -232,9 +232,15 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         for note in spock_notes:
             warnings.append(note)
             log.warn(note)
-        wanted_branch = spock_branch or (plan.source_build or {}).get(
-            "spock_branch", "main"
-        )
+        # The cluster's recorded branch belongs to the cluster's Spock major;
+        # a node on the other major needs that major's branch instead.
+        if spock_branch:
+            wanted_branch = spock_branch
+        elif wanted_spock == str(plan.spock_major):
+            wanted_branch = ((plan.source_build or {}).get("spock_branch")
+                             or source_build.default_spock_branch(wanted_spock))
+        else:
+            wanted_branch = source_build.default_spock_branch(wanted_spock)
         if spock_branch and plan.deploy_mode != "source":
             note = (
                 f"--spock-branch {spock_branch} only applies to a source build; "
@@ -526,7 +532,11 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             node=node.name,
         )
         spock_management.create_extensions(executor, plan, node, run_logger=log)
-        script = spock_management.load_zodan(executor, plan, node, run_logger=log)
+        # The branch this node's Spock came from, so zodan matches the
+        # extension rather than just its major.
+        script = spock_management.load_zodan(executor, plan, node,
+                                             run_logger=log,
+                                             branch=wanted_branch)
         version = spock_management.spock_version(executor, plan, node)
         log.step_end("passed", f"spock {version or 'unknown'}, {script} loaded")
 

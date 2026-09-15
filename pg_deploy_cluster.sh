@@ -51,7 +51,8 @@ Deployment method
   --mode packages|source    native pgEdge packages, or build from source   [packages]
   --channel release|staging|daily
                             pgEdge repository channel (packages mode)      [release]
-  --spock-branch BRANCH     Spock git branch (source mode)                 [main]
+  --spock-branch BRANCH     Spock git branch (source mode)
+                            [v5_STABLE for spock50, main for spock60]
   --etcd-version V          etcd release to install (source mode)          [3.5.17]
   --jobs N                  make -j value (source mode)
 
@@ -91,7 +92,7 @@ Growing a running cluster
                             its leader.                    [the cluster's]
   --spock-major 50|60       Spock major for the new node   [the cluster's]
   --spock-branch BRANCH     Spock git branch or tag to build, for a source-built
-                            cluster                        [the cluster's]
+                            cluster  [the cluster's, or that major's default]
   --host NAME               host from the inventory to place it on
                             [a host with no Spock node yet]
   --source NODE             existing node to join through                [n1]
@@ -296,6 +297,20 @@ print("|".join([
     str(plan.spock_major),
     (plan.source_build or {}).get("spock_branch", "main"),
 ]))
+PYEOF
+}
+
+default_spock_branch() {
+  # The branch a Spock major is developed on, straight from source_build so the
+  # prompt and the build cannot drift apart.
+  python3 - "$1" <<'PYEOF'
+import sys
+try:
+    from aspects.source_build import default_spock_branch
+except Exception:
+    print("main")
+else:
+    print(default_spock_branch(sys.argv[1]))
 PYEOF
 }
 
@@ -527,7 +542,14 @@ if [[ -n "$ADD_NODE" ]]; then
         say "   ${DIM}This cluster is built from source, so Spock is compiled from a"
         say "   git branch or tag of github.com/pgEdge/spock.${RESET}"
         say ""
-        NODE_SPOCK_BRANCH="$(ask "   Spock branch or tag" "${FACT_BRANCH:-main}")"
+        # The cluster's branch is the right default only while the major
+        # matches; otherwise take that major's own branch.
+        if [[ "$NODE_SPOCK_MAJOR" == "$FACT_SPOCK_MAJOR" && -n "$FACT_BRANCH" ]]; then
+          BRANCH_DEFAULT="$FACT_BRANCH"
+        else
+          BRANCH_DEFAULT="$(default_spock_branch "$NODE_SPOCK_MAJOR")"
+        fi
+        NODE_SPOCK_BRANCH="$(ask "   Spock branch or tag" "$BRANCH_DEFAULT")"
         say ""
       fi
       NODE_ARGS+=(--spock-branch "$NODE_SPOCK_BRANCH")
@@ -726,7 +748,7 @@ if [[ "$INTERACTIVE" == true ]]; then
     SPOCK_BRANCH=""
   else
     CHANNEL=""
-    SPOCK_BRANCH="$(ask "   Spock git branch to build" "main")"
+    SPOCK_BRANCH="$(ask "   Spock git branch to build" "$(default_spock_branch "$SPOCK_MAJOR")")"
   fi
   DB_NAME="$(ask "   Database name" "postgres")"
   DB_USER="$(ask "   Database superuser" "postgres")"

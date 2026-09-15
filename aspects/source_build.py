@@ -30,6 +30,17 @@ ETCD_RELEASE_URL = (
 
 DEFAULT_ETCD_VERSION = "3.5.17"
 
+# Which Spock branch a major is developed on. Spock 5 has a stable branch of
+# its own; 6 is still what main carries. Building spock50 from main would
+# compile Spock 6 sources against a cluster expecting Spock 5.
+SPOCK_BRANCH_BY_MAJOR = {"50": "v5_STABLE", "60": "main"}
+FALLBACK_SPOCK_BRANCH = "main"
+
+
+def default_spock_branch(spock_major):
+    """The branch to build a given Spock major from."""
+    return SPOCK_BRANCH_BY_MAJOR.get(str(spock_major), FALLBACK_SPOCK_BRANCH)
+
 
 def make_reachable(executor, path, node=None):
     """Let the database user read and run what root just installed.
@@ -410,7 +421,8 @@ def build_major(executor, host, plan, pg_version, spock_branch=None,
         )
 
     spec = plan.source_build or {}
-    spock_branch = spock_branch or spec.get("spock_branch", "main")
+    spock_branch = (spock_branch or spec.get("spock_branch")
+                    or default_spock_branch(plan.spock_major))
     jobs = spec.get("jobs")
     pg_major = pg_version.split(".")[0]
     details = {"host": host.name, "pg_version": pg_version,
@@ -473,7 +485,8 @@ def build_host(executor, host, plan, run_logger=None):
 
     spec = plan.source_build or {}
     pg_version = spec.get("pg_version") or plan.pg_version
-    spock_branch = spec.get("spock_branch", "main")
+    spock_branch = (spec.get("spock_branch")
+                    or default_spock_branch(plan.spock_major))
     etcd_version = spec.get("etcd_version", DEFAULT_ETCD_VERSION)
     jobs = spec.get("jobs")
 

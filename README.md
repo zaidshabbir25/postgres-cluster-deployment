@@ -437,11 +437,17 @@ a source build), so asking for a newer major on a host that already runs the
 cluster's installs that major alongside the existing one rather than reusing it.
 **Which Spock?** It defaults to the cluster's major, and a source-built cluster
 also asks which branch or tag of [spock](https://github.com/pgEdge/spock) to
-compile — useful for trying a fix or a release candidate on one node. A node
-added with a different Spock major loads the matching zodan script rather than
-the cluster's, since the two majors differ in the replication API those
-procedures call; that mesh is a migration step, not a resting state, and the
-run says so. Spock lives inside a PostgreSQL prefix, so a node cannot change
+compile — defaulting to the branch that major is developed on (`v5_STABLE` for
+spock50, `main` for spock60), or to the branch the cluster itself was built from
+when the major is unchanged — useful for trying a fix or a release candidate on one node.
+
+The zodan procedures come from the same branch as the node's Spock:
+`samples/Z0DAN/zodan.sql` out of the source checkout when there is one, else
+fetched from that branch on GitHub, else the copy bundled in
+`configuration/spock` so an air-gapped host still works. A spock60 node
+therefore loads zodan from `main` and a spock50 node from `v5_STABLE`, matching
+the replication API those procedures call. A mixed-major mesh is a migration
+step, not a resting state, and the run says so. Spock lives inside a PostgreSQL prefix, so a node cannot change
 the Spock of a prefix that running nodes are already using — give it its own
 `--pg-version`, or take the cluster's Spock.
 
