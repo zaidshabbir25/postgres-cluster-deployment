@@ -260,6 +260,25 @@ def register_paths(executor, pg_major, node=None):
     return prefix
 
 
+def system_python(executor, node=None):
+    """An interpreter every user on the host can reach.
+
+    Never plain `python3`: a local deployment inherits this tool's own
+    virtualenv, and a venv built from that one points its interpreter back
+    into the checkout — a directory the database user cannot traverse.
+    """
+    for candidate in ("/usr/bin/python3", "/usr/local/bin/python3", "/bin/python3"):
+        if executor.exists(candidate):
+            return candidate
+    found = executor.which("python3")
+    if not found:
+        raise RuntimeError(
+            f"{executor.host}: no python3 on the host — Patroni needs one to "
+            f"install into"
+        )
+    return found
+
+
 def install_patroni_from_pip(executor, family, node=None):
     """Install Patroni into its own venv.
 
@@ -271,7 +290,21 @@ def install_patroni_from_pip(executor, family, node=None):
     package_management.install(executor, family, [venv_package], node=node,
                                allow_missing=True)
 
-    executor.run(f"python3 -m venv {PATRONI_VENV}", node=node,
+    python = system_python(executor, node=node)
+
+    # A venv records the interpreter it was built from, as a symlink in its own
+    # bin. One built from a python living somewhere the database user cannot
+    # reach is unusable no matter what its own permissions say, so it is
+    # replaced rather than reused.
+    _, linked = executor.try_run(
+        f"readlink {PATRONI_VENV}/bin/python3 2>/dev/null", node=node
+    )
+    linked = (linked or "").strip().splitlines()
+    linked = linked[-1].strip() if linked else ""
+    if linked and not linked.startswith(("/usr/", "/bin/", "/opt/pgedge/")):
+        executor.try_run(f"rm -rf {PATRONI_VENV}", node=node)
+
+    executor.run(f"{shlex.quote(python)} -m venv {PATRONI_VENV}", node=node,
                  message="create patroni venv")
     executor.run(
         f"{PATRONI_VENV}/bin/pip install --upgrade pip wheel",
