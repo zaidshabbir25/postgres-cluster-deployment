@@ -35,15 +35,48 @@ def make_reachable(executor, path, node=None):
     """Let the database user read and run what root just installed.
 
     Everything here is installed by root, and a hardened image with a 0077
-    umask leaves /opt/pgedge unreadable to anyone else. Patroni and PostgreSQL
-    both run as the database user, so they would fail at exec with
-    "bad interpreter: Permission denied" or no error at all — a+rX adds read
-    everywhere and execute only where it already applies (directories and
-    executables), so nothing becomes runnable that was not runnable by root.
+    umask leaves /opt/pgedge and anything created under it unreadable to anyone
+    else. Patroni and PostgreSQL both run as the database user, so they fail at
+    exec with "bad interpreter: Permission denied".
+
+    Three passes, because one is not enough:
+      * every directory from INSTALL_ROOT down needs +x to be traversable —
+        `chmod -R a+rX` covers the tree but not the ancestors above it;
+      * `-R` skips symlinks, so a venv interpreter that is a link to a file
+        inside the tree would keep its mode;
+      * these run with `run`, not `try_run`: a chmod that fails silently here
+        is the difference between a working deployment and one that dies six
+        steps later.
     """
-    executor.try_run(f"chmod a+rx {shlex.quote(INSTALL_ROOT)}", node=node)
-    executor.try_run(f"chmod -R a+rX {shlex.quote(path)}", node=node)
+    quoted = shlex.quote(path)
+    executor.run(f"chmod a+rx {shlex.quote(INSTALL_ROOT)}", node=node,
+                 message=f"make {INSTALL_ROOT} traversable")
+    executor.run(f"chmod -R a+rX {quoted}", node=node,
+                 message=f"make {path} readable")
+    # Directories explicitly: a+rX only adds x to a directory, but an empty
+    # tree walked by find is cheap insurance against a stray 0700.
+    executor.run(f"find {quoted} -type d -exec chmod a+rx {{}} +", node=node,
+                 message=f"make {path} directories traversable")
     return path
+
+
+def make_venv_reachable(executor, venv, node=None):
+    """make_reachable, plus the interpreter the venv's scripts point at.
+
+    A venv's bin/python3 is usually a symlink, and `chmod -R` does not follow
+    symlinks. When the target lives inside the install tree it needs the same
+    treatment as the rest; when it is the system interpreter it is already
+    world-executable and is left alone.
+    """
+    make_reachable(executor, venv, node=node)
+    _, target = executor.try_run(
+        f"readlink -f {shlex.quote(venv)}/bin/python3 2>/dev/null", node=node
+    )
+    target = (target or "").strip().splitlines()
+    target = target[-1].strip() if target else ""
+    if target.startswith(INSTALL_ROOT):
+        executor.try_run(f"chmod a+rx {shlex.quote(target)}", node=node)
+    return venv
 
 
 def install_dir(pg_major):
@@ -254,7 +287,7 @@ def install_patroni_from_pip(executor, family, node=None):
         )
     # Patroni runs as the database user, so the venv — interpreter included —
     # has to be reachable by it, not just by root.
-    make_reachable(executor, PATRONI_VENV, node=node)
+    make_venv_reachable(executor, PATRONI_VENV, node=node)
 
     _, version = executor.try_run(f"{PATRONI_VENV}/bin/patroni --version", node=node)
     return version.strip() or "patroni installed"
