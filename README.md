@@ -432,6 +432,17 @@ adding a node onto an existing machine running an older server fails before it
 touches anything. A standby is not asked: a physical replica is a byte-for-byte
 copy and runs its leader's version, so `--pg-version` is rejected there.
 
+Binaries are found per major (`/usr/pgsql-18/bin`, or `/opt/pgedge/pg18/bin` for
+a source build), so asking for a newer major on a host that already runs the
+cluster's installs that major alongside the existing one rather than reusing it.
+A source-built cluster compiles the major it needs: PostgreSQL and Spock are
+built into `/opt/pgedge/pg<major>` alongside the existing installation, which
+takes 20-40 minutes and leaves the other nodes untouched. That path needs an
+exact version to fetch a tarball for, so `--pg-version 18` is refused where
+`--pg-version 18.6` works. The cluster's own `PATH`, client symlinks, Patroni
+and etcd stay pointed at its original major; only the new node uses the new
+one, through its own `bin_dir`.
+
 Every existing node's `pg_hba` and `.pgpass` learn about the newcomer and are
 reloaded in place — the cluster stays up throughout.
 

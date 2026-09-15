@@ -35,15 +35,48 @@ def make_reachable(executor, path, node=None):
     """Let the database user read and run what root just installed.
 
     Everything here is installed by root, and a hardened image with a 0077
-    umask leaves /opt/pgedge unreadable to anyone else. Patroni and PostgreSQL
-    both run as the database user, so they would fail at exec with
-    "bad interpreter: Permission denied" or no error at all — a+rX adds read
-    everywhere and execute only where it already applies (directories and
-    executables), so nothing becomes runnable that was not runnable by root.
+    umask leaves /opt/pgedge and anything created under it unreadable to anyone
+    else. Patroni and PostgreSQL both run as the database user, so they fail at
+    exec with "bad interpreter: Permission denied".
+
+    Three passes, because one is not enough:
+      * every directory from INSTALL_ROOT down needs +x to be traversable —
+        `chmod -R a+rX` covers the tree but not the ancestors above it;
+      * `-R` skips symlinks, so a venv interpreter that is a link to a file
+        inside the tree would keep its mode;
+      * these run with `run`, not `try_run`: a chmod that fails silently here
+        is the difference between a working deployment and one that dies six
+        steps later.
     """
-    executor.try_run(f"chmod a+rx {shlex.quote(INSTALL_ROOT)}", node=node)
-    executor.try_run(f"chmod -R a+rX {shlex.quote(path)}", node=node)
+    quoted = shlex.quote(path)
+    executor.run(f"chmod a+rx {shlex.quote(INSTALL_ROOT)}", node=node,
+                 message=f"make {INSTALL_ROOT} traversable")
+    executor.run(f"chmod -R a+rX {quoted}", node=node,
+                 message=f"make {path} readable")
+    # Directories explicitly: a+rX only adds x to a directory, but an empty
+    # tree walked by find is cheap insurance against a stray 0700.
+    executor.run(f"find {quoted} -type d -exec chmod a+rx {{}} +", node=node,
+                 message=f"make {path} directories traversable")
     return path
+
+
+def make_venv_reachable(executor, venv, node=None):
+    """make_reachable, plus the interpreter the venv's scripts point at.
+
+    A venv's bin/python3 is usually a symlink, and `chmod -R` does not follow
+    symlinks. When the target lives inside the install tree it needs the same
+    treatment as the rest; when it is the system interpreter it is already
+    world-executable and is left alone.
+    """
+    make_reachable(executor, venv, node=node)
+    _, target = executor.try_run(
+        f"readlink -f {shlex.quote(venv)}/bin/python3 2>/dev/null", node=node
+    )
+    target = (target or "").strip().splitlines()
+    target = target[-1].strip() if target else ""
+    if target.startswith(INSTALL_ROOT):
+        executor.try_run(f"chmod a+rx {shlex.quote(target)}", node=node)
+    return venv
 
 
 def install_dir(pg_major):
@@ -227,6 +260,25 @@ def register_paths(executor, pg_major, node=None):
     return prefix
 
 
+def system_python(executor, node=None):
+    """An interpreter every user on the host can reach.
+
+    Never plain `python3`: a local deployment inherits this tool's own
+    virtualenv, and a venv built from that one points its interpreter back
+    into the checkout — a directory the database user cannot traverse.
+    """
+    for candidate in ("/usr/bin/python3", "/usr/local/bin/python3", "/bin/python3"):
+        if executor.exists(candidate):
+            return candidate
+    found = executor.which("python3")
+    if not found:
+        raise RuntimeError(
+            f"{executor.host}: no python3 on the host — Patroni needs one to "
+            f"install into"
+        )
+    return found
+
+
 def install_patroni_from_pip(executor, family, node=None):
     """Install Patroni into its own venv.
 
@@ -238,7 +290,21 @@ def install_patroni_from_pip(executor, family, node=None):
     package_management.install(executor, family, [venv_package], node=node,
                                allow_missing=True)
 
-    executor.run(f"python3 -m venv {PATRONI_VENV}", node=node,
+    python = system_python(executor, node=node)
+
+    # A venv records the interpreter it was built from, as a symlink in its own
+    # bin. One built from a python living somewhere the database user cannot
+    # reach is unusable no matter what its own permissions say, so it is
+    # replaced rather than reused.
+    _, linked = executor.try_run(
+        f"readlink {PATRONI_VENV}/bin/python3 2>/dev/null", node=node
+    )
+    linked = (linked or "").strip().splitlines()
+    linked = linked[-1].strip() if linked else ""
+    if linked and not linked.startswith(("/usr/", "/bin/", "/opt/pgedge/")):
+        executor.try_run(f"rm -rf {PATRONI_VENV}", node=node)
+
+    executor.run(f"{shlex.quote(python)} -m venv {PATRONI_VENV}", node=node,
                  message="create patroni venv")
     executor.run(
         f"{PATRONI_VENV}/bin/pip install --upgrade pip wheel",
@@ -254,7 +320,7 @@ def install_patroni_from_pip(executor, family, node=None):
         )
     # Patroni runs as the database user, so the venv — interpreter included —
     # has to be reachable by it, not just by root.
-    make_reachable(executor, PATRONI_VENV, node=node)
+    make_venv_reachable(executor, PATRONI_VENV, node=node)
 
     _, version = executor.try_run(f"{PATRONI_VENV}/bin/patroni --version", node=node)
     return version.strip() or "patroni installed"
@@ -307,6 +373,74 @@ WantedBy=multi-user.target
 
     _, version_output = executor.try_run("etcd --version | head -1", node=node)
     return version_output.strip()
+
+
+def register_library_path(executor, pg_major, node=None):
+    """Put one major's libraries on the loader path, without disturbing others.
+
+    A file per major: a host carrying two majors needs both lib directories
+    known to ld.so, and the single shared file the first build wrote would
+    otherwise be overwritten by the second.
+    """
+    prefix = install_dir(pg_major)
+    executor.write_file(
+        f"/etc/ld.so.conf.d/pgedge-source-pg{pg_major}.conf",
+        f"{prefix}/lib\n", owner="root", mode="644", node=node,
+    )
+    executor.try_run("ldconfig", node=node)
+    return prefix
+
+
+def build_major(executor, host, plan, pg_version, run_logger=None):
+    """Build one PostgreSQL major plus Spock, alongside anything already there.
+
+    This is what lets a source-built cluster grow a node on a newer major: the
+    same steps as a first build, minus the host-wide bits (PATH, client
+    symlinks, Patroni, etcd) which belong to the cluster's own major and are
+    already in place. Returns a details dict.
+
+    Nothing about the existing installation is touched — a different major
+    installs to its own prefix.
+    """
+    if not pg_version or "." not in str(pg_version):
+        raise ValueError(
+            f"A source build needs a full PostgreSQL version (e.g. 18.6), got "
+            f"{pg_version!r}."
+        )
+
+    spec = plan.source_build or {}
+    spock_branch = spec.get("spock_branch", "main")
+    jobs = spec.get("jobs")
+    pg_major = pg_version.split(".")[0]
+    details = {"host": host.name, "pg_version": pg_version}
+
+    def say(message):
+        if run_logger:
+            run_logger.info(f"    {host.name}: {message}")
+
+    _, message = install_build_dependencies(executor, host.family, node=host.name)
+    say(message)
+    ensure_postgres_user(executor, plan.db_user, host.family, node=host.name)
+
+    source_dir = fetch_postgres_source(executor, pg_version, node=host.name)
+    spock_dir, revision = fetch_spock_source(executor, spock_branch, node=host.name)
+    details["spock_revision"] = revision
+
+    count, names = apply_spock_patches(executor, source_dir, spock_dir, pg_major,
+                                       node=host.name)
+    details["patches"] = names
+    say(f"applied {count} Spock patch(es) for pg{pg_major}")
+
+    prefix = build_postgresql(executor, source_dir, pg_major, node=host.name,
+                              jobs=jobs)
+    details["prefix"] = prefix
+    say(f"PostgreSQL {pg_version} installed to {prefix}")
+
+    details["spock_module"] = build_spock(executor, spock_dir, pg_major,
+                                          node=host.name, jobs=jobs)
+    register_library_path(executor, pg_major, node=host.name)
+    make_reachable(executor, prefix, node=host.name)
+    return details
 
 
 def build_host(executor, host, plan, run_logger=None):

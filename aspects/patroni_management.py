@@ -273,7 +273,41 @@ def check_binaries(executor, plan, node):
                 f"{plan.db_user} cannot run {path}"
                 + (f": {detail[-1].strip()}" if detail else "")
             )
+            trace = permission_trace(executor, path, node=node.name)
+            if trace:
+                problems.append(trace)
     return problems
+
+
+def permission_trace(executor, path, node=None):
+    """Show why an exec was refused: the mode of every path component.
+
+    "Permission denied" names the file, but the cause is usually a directory
+    above it, the interpreter named in a shebang, or SELinux — none of which
+    the error mentions. This walks the whole chain so the offending component
+    is visible rather than guessed at. It uses only ls and awk: namei is not
+    installed everywhere, and a diagnostic that itself fails is no use.
+    """
+    walk = (
+        'walk() { echo "$1" | awk -F/ \'{p=""; for(i=2;i<=NF;i++){p=p"/"$i; print p}}\' '
+        '| while read -r c; do ls -ld "$c" 2>/dev/null; done; }; '
+    )
+    script = (
+        walk +
+        'p=' + shlex.quote(path) + '; walk "$p"; '
+        'sh=$(head -1 "$p" 2>/dev/null | sed -n \'s|^#!*[ ]*\\([^ ]*\\).*|\\1|p\'); '
+        'if [ -n "$sh" ] && [ "$sh" != "$p" ]; then '
+        '  echo "interpreter: $sh"; walk "$sh"; '
+        '  r=$(readlink -f "$sh" 2>/dev/null); '
+        '  if [ -n "$r" ] && [ "$r" != "$sh" ]; then echo "resolves to: $r"; walk "$r"; fi; '
+        'fi; '
+        'command -v getenforce >/dev/null 2>&1 && echo "selinux: $(getenforce)"'
+    )
+    _, output = executor.try_run(script, node=node)
+    lines = [line.rstrip() for line in (output or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return "  " + "\n  ".join(lines[:30])
 
 
 def validate_config(executor, plan, node):

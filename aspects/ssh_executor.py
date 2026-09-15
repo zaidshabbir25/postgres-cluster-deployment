@@ -362,13 +362,38 @@ class LocalExecutor(SSHExecutor):
     def close(self):
         return None
 
+    @staticmethod
+    def host_environment():
+        """The environment a command on the host should see.
+
+        This process runs inside the deployment tool's own virtualenv, and a
+        local command inherits it: `python3` resolves to venv/bin/python3, so
+        anything the deployment builds with it is wired back to a directory
+        under /root that the postgres user cannot even traverse. An SSH session
+        never sees any of this, and neither should a local one.
+        """
+        import os as _os
+
+        env = dict(_os.environ)
+        venv = env.pop("VIRTUAL_ENV", None)
+        for variable in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"):
+            env.pop(variable, None)
+        if venv:
+            venv_bin = _os.path.join(venv, "bin")
+            env["PATH"] = ":".join(
+                part for part in env.get("PATH", "").split(":")
+                if part and _os.path.normpath(part) != _os.path.normpath(venv_bin)
+            )
+        return env
+
     def exec_run(self, command, user="root", timeout=DEFAULT_TIMEOUT, node=None):
         import subprocess
 
         full = self._wrap(command, user).strip()
         started = time.time()
         proc = subprocess.run(
-            full, shell=True, capture_output=True, text=True, timeout=timeout
+            full, shell=True, capture_output=True, text=True, timeout=timeout,
+            env=self.host_environment(),
         )
         output = proc.stdout + proc.stderr
         self._record(node, full, proc.returncode, output, time.time() - started)
@@ -381,7 +406,7 @@ class LocalExecutor(SSHExecutor):
         self.run(f"mkdir -p {shlex.quote(parent)}", node=node)
         cmd = f"{self.sudo_prefix()} tee {shlex.quote(remote_path)} > /dev/null".strip()
         proc = subprocess.run(cmd, shell=True, input=content, text=True,
-                              capture_output=True)
+                              capture_output=True, env=self.host_environment())
         if proc.returncode != 0:
             raise IOError(f"failed writing {remote_path}: {proc.stderr}")
         if owner:
