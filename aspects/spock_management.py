@@ -97,8 +97,14 @@ def spock_version(executor, plan, node):
 
 
 def load_zodan(executor, plan, node, run_logger=None):
-    """Upload and install zodan's procedures on a node."""
-    local = zodan_script(plan.spock_major, plan.zodan_sql or None)
+    """Upload and install zodan's procedures on a node.
+
+    The script follows the Spock running on *this* node: the procedures call
+    Spock's own API, which changed between 50 and 60, so a node added with a
+    different Spock major needs the matching script rather than the cluster's.
+    """
+    spock_major = getattr(node, "spock_major", "") or plan.spock_major
+    local = zodan_script(spock_major, plan.zodan_sql or None)
     remote = f"{REMOTE_ZODAN_DIR}/{local.name}"
 
     executor.run(f"mkdir -p {REMOTE_ZODAN_DIR}", node=node.name)

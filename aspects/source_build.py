@@ -391,7 +391,8 @@ def register_library_path(executor, pg_major, node=None):
     return prefix
 
 
-def build_major(executor, host, plan, pg_version, run_logger=None):
+def build_major(executor, host, plan, pg_version, spock_branch=None,
+                run_logger=None):
     """Build one PostgreSQL major plus Spock, alongside anything already there.
 
     This is what lets a source-built cluster grow a node on a newer major: the
@@ -409,10 +410,11 @@ def build_major(executor, host, plan, pg_version, run_logger=None):
         )
 
     spec = plan.source_build or {}
-    spock_branch = spec.get("spock_branch", "main")
+    spock_branch = spock_branch or spec.get("spock_branch", "main")
     jobs = spec.get("jobs")
     pg_major = pg_version.split(".")[0]
-    details = {"host": host.name, "pg_version": pg_version}
+    details = {"host": host.name, "pg_version": pg_version,
+               "spock_branch": spock_branch}
 
     def say(message):
         if run_logger:
@@ -429,7 +431,8 @@ def build_major(executor, host, plan, pg_version, run_logger=None):
     count, names = apply_spock_patches(executor, source_dir, spock_dir, pg_major,
                                        node=host.name)
     details["patches"] = names
-    say(f"applied {count} Spock patch(es) for pg{pg_major}")
+    say(f"applied {count} Spock patch(es) for pg{pg_major} "
+        f"from branch {spock_branch}")
 
     prefix = build_postgresql(executor, source_dir, pg_major, node=host.name,
                               jobs=jobs)
@@ -441,6 +444,26 @@ def build_major(executor, host, plan, pg_version, run_logger=None):
     register_library_path(executor, pg_major, node=host.name)
     make_reachable(executor, prefix, node=host.name)
     return details
+
+
+def rebuild_spock(executor, host, plan, pg_major, spock_branch,
+                  run_logger=None):
+    """Build Spock from a branch against a PostgreSQL that is already there.
+
+    Only safe when no running node uses that prefix: spock.so is per prefix,
+    so replacing it changes the Spock under every node sharing it. The caller
+    is responsible for that check.
+    """
+    spec = plan.source_build or {}
+    spock_dir, revision = fetch_spock_source(executor, spock_branch, node=host.name)
+    module = build_spock(executor, spock_dir, pg_major, node=host.name,
+                         jobs=spec.get("jobs"))
+    make_reachable(executor, install_dir(pg_major), node=host.name)
+    if run_logger:
+        run_logger.info(f"    {host.name}: Spock rebuilt from {spock_branch} "
+                        f"({revision[:12]}) for pg{pg_major}")
+    return {"spock_branch": spock_branch, "spock_revision": revision,
+            "spock_module": module}
 
 
 def build_host(executor, host, plan, run_logger=None):

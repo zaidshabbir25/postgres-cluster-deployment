@@ -167,9 +167,10 @@ def cmd_node_add(args):
             return EXIT_USAGE
         # A physical replica is a byte-for-byte copy, so its version is the
         # leader's — there is nothing to choose.
-        if args.pg_version:
-            print("--pg-version does not apply to a standby: a physical "
-                  "replica runs the same version as its leader",
+        if args.pg_version or args.spock_major or args.spock_branch:
+            print("--pg-version, --spock-major and --spock-branch do not apply "
+                  "to a standby: a physical replica is a byte-for-byte copy of "
+                  "its leader and runs exactly what the leader runs",
                   file=sys.stderr)
             return EXIT_USAGE
         result = add_standby.add(
@@ -194,6 +195,8 @@ def cmd_node_add(args):
             db_password=args.db_password,
             skip_verify=args.skip_verify,
             pg_version=args.pg_version,
+            spock_major=args.spock_major,
+            spock_branch=args.spock_branch,
         )
         kind = "add-node"
 
@@ -958,6 +961,11 @@ def _register_node(subparsers, add_common):
     adding.add_argument("--pg-version", default="",
                         help="PostgreSQL version for the new node; must be the "
                              "cluster's version or newer [the cluster's]")
+    adding.add_argument("--spock-major", default="", choices=("", "50", "60"),
+                        help="Spock major for the new node [the cluster's]")
+    adding.add_argument("--spock-branch", default="",
+                        help="Spock git branch to build, for a source-built "
+                             "cluster [the cluster's]")
     adding.add_argument("--skip-verify", action="store_true")
     adding.set_defaults(func=cmd_node_add)
 
