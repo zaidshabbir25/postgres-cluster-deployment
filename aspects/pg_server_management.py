@@ -114,6 +114,34 @@ def spock_guc_parameters(pg_version):
 # ---------------------------------------------------------------------------
 
 
+def version_key(version):
+    """Sortable key for a PostgreSQL version string.
+
+    Handles '17', '17.11' and pre-releases ('18beta1', '18rc2'), which sort
+    below the release they lead up to: 18beta1 < 18rc1 < 18.0.
+    """
+    text = str(version or "").strip()
+    match = re.match(r"^(\d+)(?:\.(\d+))?(?:(beta|rc)(\d+))?", text)
+    if not match:
+        return (0, 0, 0, 0)
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    stage = {"beta": -2, "rc": -1}.get(match.group(3) or "", 0)
+    stage_number = int(match.group(4) or 0)
+    return (major, stage, stage_number, minor) if stage else (major, 0, 0, minor)
+
+
+def is_at_least(candidate, minimum):
+    """Is `candidate` the same PostgreSQL version as `minimum`, or newer?"""
+    return version_key(candidate) >= version_key(minimum)
+
+
+def major_of(version):
+    """'17.11' -> '17'."""
+    match = re.match(r"^(\d+)", str(version or "").strip())
+    return match.group(1) if match else ""
+
+
 def server_version(executor, bin_dir, node=None):
     """Read the installed server's full version, e.g. '17.11'."""
     ok, output = executor.try_run(f"{bin_dir}/postgres --version", node=node)

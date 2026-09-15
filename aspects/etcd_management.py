@@ -58,14 +58,26 @@ def select_members(hosts):
     )
 
 
+def member_address(host):
+    """The address this member advertises to its peers and clients.
+
+    etcd compares `initial-cluster` against each member's
+    `initial-advertise-peer-urls` and refuses to start unless they match, so
+    every URL in this module has to come from here — never from host.address,
+    which may be the loopback name the inventory happened to use. A peer
+    reading "localhost" out of the cluster map would dial itself anyway.
+    """
+    return host.advertise_address or host.address
+
+
 def endpoints(members):
     """Client URLs every Patroni instance will be pointed at."""
-    return [f"http://{host.address}:{CLIENT_PORT}" for host in members]
+    return [f"http://{member_address(host)}:{CLIENT_PORT}" for host in members]
 
 
 def initial_cluster(members):
     return ",".join(
-        f"{member_name(host.name)}=http://{host.address}:{PEER_PORT}"
+        f"{member_name(host.name)}=http://{member_address(host)}:{PEER_PORT}"
         for host in members
     )
 
@@ -78,8 +90,8 @@ def _yaml_config(host, members, token):
         f"data-dir: \"{DATA_ROOT}/{name}.etcd\"\n"
         f"listen-peer-urls: \"http://0.0.0.0:{PEER_PORT}\"\n"
         f"listen-client-urls: \"http://0.0.0.0:{CLIENT_PORT}\"\n"
-        f"initial-advertise-peer-urls: \"http://{host.address}:{PEER_PORT}\"\n"
-        f"advertise-client-urls: \"http://{host.address}:{CLIENT_PORT}\"\n"
+        f"initial-advertise-peer-urls: \"http://{member_address(host)}:{PEER_PORT}\"\n"
+        f"advertise-client-urls: \"http://{member_address(host)}:{CLIENT_PORT}\"\n"
         f"initial-cluster: \"{initial_cluster(members)}\"\n"
         f"initial-cluster-token: \"{token}\"\n"
         f"initial-cluster-state: \"new\"\n"
@@ -95,8 +107,8 @@ def _env_config(host, members, token):
         f"ETCD_DATA_DIR=\"{DATA_ROOT}/{name}.etcd\"\n"
         f"ETCD_LISTEN_PEER_URLS=\"http://0.0.0.0:{PEER_PORT}\"\n"
         f"ETCD_LISTEN_CLIENT_URLS=\"http://0.0.0.0:{CLIENT_PORT}\"\n"
-        f"ETCD_INITIAL_ADVERTISE_PEER_URLS=\"http://{host.address}:{PEER_PORT}\"\n"
-        f"ETCD_ADVERTISE_CLIENT_URLS=\"http://{host.address}:{CLIENT_PORT}\"\n"
+        f"ETCD_INITIAL_ADVERTISE_PEER_URLS=\"http://{member_address(host)}:{PEER_PORT}\"\n"
+        f"ETCD_ADVERTISE_CLIENT_URLS=\"http://{member_address(host)}:{CLIENT_PORT}\"\n"
         f"ETCD_INITIAL_CLUSTER=\"{initial_cluster(members)}\"\n"
         f"ETCD_INITIAL_CLUSTER_TOKEN=\"{token}\"\n"
         f"ETCD_INITIAL_CLUSTER_STATE=\"new\"\n"
@@ -131,11 +143,26 @@ def configure(executor, host, members, cluster_name, node=None, config_format=No
     path = config_path_for(config_format)
 
     executor.run(f"mkdir -p {DATA_ROOT}/{name}.etcd", node=node)
-    executor.run(f"chmod 700 {DATA_ROOT}", node=node)
+    executor.run(f"chmod 700 {DATA_ROOT} {DATA_ROOT}/{name}.etcd", node=node)
     # The packaged unit runs etcd as the etcd user where that account exists.
     executor.try_run(f"chown -R etcd:etcd {DATA_ROOT} 2>/dev/null || true", node=node)
     executor.write_file(path, content, owner="root", mode="644", node=node)
     return path
+
+
+def failure_reason(journal_text):
+    """Pull the cause out of etcd's JSON log, if it says one.
+
+    etcd logs one line of JSON per event and exits; the useful part is the
+    "error" field of the last fatal record, not the systemd exit code.
+    """
+    for line in reversed((journal_text or "").splitlines()):
+        if '"level":"fatal"' not in line and '"level":"error"' not in line:
+            continue
+        match = re.search(r'"error":"(.*?)"(?:,|\})', line)
+        if match:
+            return match.group(1).replace('\\"', '"')
+    return ""
 
 
 def start(executor, host, members, node=None, timeout=90):
@@ -146,8 +173,11 @@ def start(executor, host, members, node=None, timeout=90):
         ok, output = service_management.start(executor, UNIT, node=node)
         if not ok:
             detail = service_management.journal(executor, UNIT, node=node)
+            reason = failure_reason(detail)
             raise RuntimeError(
-                f"{host.name}: systemctl could not start etcd\n{output.strip()}\n{detail}"
+                f"{host.name}: etcd did not start"
+                + (f" — {reason}" if reason else "")
+                + f"\n{output.strip()}\n{detail}"
             )
     else:
         _start_without_systemd(executor, host, members, name, node=node)
@@ -170,8 +200,8 @@ def _start_without_systemd(executor, host, members, name, node=None):
         f"--data-dir {DATA_ROOT}/{name}.etcd "
         f"--listen-peer-urls http://0.0.0.0:{PEER_PORT} "
         f"--listen-client-urls http://0.0.0.0:{CLIENT_PORT} "
-        f"--initial-advertise-peer-urls http://{host.address}:{PEER_PORT} "
-        f"--advertise-client-urls http://{host.address}:{CLIENT_PORT} "
+        f"--initial-advertise-peer-urls http://{member_address(host)}:{PEER_PORT} "
+        f"--advertise-client-urls http://{member_address(host)}:{CLIENT_PORT} "
         f"--initial-cluster {shlex.quote(initial_cluster(members))} "
         f"--initial-cluster-state new "
         f"> /tmp/etcd.log 2>&1 </dev/null &"
@@ -181,7 +211,7 @@ def _start_without_systemd(executor, host, members, name, node=None):
 
 def wait_healthy(executor, host, timeout=90, interval=3, node=None):
     """Poll etcdctl until the local endpoint reports healthy."""
-    endpoint = f"http://{host.address}:{CLIENT_PORT}"
+    endpoint = f"http://{member_address(host)}:{CLIENT_PORT}"
     attempts = max(1, timeout // interval)
     last = ""
     for _ in range(attempts):

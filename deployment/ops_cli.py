@@ -29,7 +29,7 @@ from aspects import (
     state,
 )
 from aspects.logging_setup import RunLogger, new_run_id
-from deployment import add_node, node_access, remove_node
+from deployment import add_node, add_standby, node_access, remove_node
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
@@ -153,17 +153,52 @@ def cmd_node_add(args):
     cluster = _resolve_cluster(args)
     if cluster is None:
         return EXIT_FAIL
-    result = add_node.add(
-        cluster_name=cluster,
-        host_name=args.host,
-        node_name=args.name,
-        source_node=args.source,
-        inventory_path=args.inventory,
-        db_password=args.db_password,
-        skip_verify=args.skip_verify,
-    )
+
+    role = (getattr(args, "role", None) or "leader").lower()
+    if role not in ("leader", "standby"):
+        print(f"--role must be 'leader' or 'standby', not {role!r}",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    if role == "standby":
+        if not args.leader:
+            print("--role standby needs --leader NODE: the Spock node the "
+                  "standby follows", file=sys.stderr)
+            return EXIT_USAGE
+        # A physical replica is a byte-for-byte copy, so its version is the
+        # leader's — there is nothing to choose.
+        if args.pg_version:
+            print("--pg-version does not apply to a standby: a physical "
+                  "replica runs the same version as its leader",
+                  file=sys.stderr)
+            return EXIT_USAGE
+        result = add_standby.add(
+            cluster_name=cluster,
+            leader_name=args.leader,
+            host_name=args.host,
+            db_password=args.db_password,
+        )
+        kind = "add-standby"
+    else:
+        if args.leader:
+            print("--leader only applies with --role standby; a Spock node "
+                  "leads its own scope. Use --source to choose the node the "
+                  "join runs through.", file=sys.stderr)
+            return EXIT_USAGE
+        result = add_node.add(
+            cluster_name=cluster,
+            host_name=args.host,
+            node_name=args.name,
+            source_node=args.source,
+            inventory_path=args.inventory,
+            db_password=args.db_password,
+            skip_verify=args.skip_verify,
+            pg_version=args.pg_version,
+        )
+        kind = "add-node"
+
     if result["outcome"] == "succeeded":
-        _write_report(result, "add-node")
+        _write_report(result, kind)
         return EXIT_OK
     print(f"\nFailed: {result.get('failure')}", file=sys.stderr)
     print(f"Logs  : {result.get('log_dir')}", file=sys.stderr)
@@ -914,6 +949,15 @@ def _register_node(subparsers, add_common):
                                       "with no Spock node yet")
     adding.add_argument("--name", help="node name; default: the next free nN")
     adding.add_argument("--source", help="node to join through; default: n1")
+    adding.add_argument("--role", default="leader", choices=("leader", "standby"),
+                        help="leader: a Spock node leading its own scope; "
+                             "standby: a Patroni replica of an existing node "
+                             "[leader]")
+    adding.add_argument("--leader", help="with --role standby, the Spock node "
+                                        "the standby follows")
+    adding.add_argument("--pg-version", default="",
+                        help="PostgreSQL version for the new node; must be the "
+                             "cluster's version or newer [the cluster's]")
     adding.add_argument("--skip-verify", action="store_true")
     adding.set_defaults(func=cmd_node_add)
 

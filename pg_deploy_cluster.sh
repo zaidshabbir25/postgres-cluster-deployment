@@ -79,9 +79,16 @@ Behaviour
   -h, --help                this message
 
 Growing a running cluster
-  --add-node NAME           add one Spock node to a deployed cluster and exit.
-                            It is prepared, bootstrapped as its own Patroni
-                            scope and cross-wired to every existing node.
+  --add-node NAME           add one node to a deployed cluster and exit. Asks
+                            for its role and PostgreSQL version unless the
+                            flags below supply them.
+  --role leader|standby     leader: a Spock node, cross-wired to every peer and
+                            leading a scope of its own. standby: a physical
+                            replica of one existing node.              [leader]
+  --leader NODE             with --role standby, the node it follows
+  --pg-version X.Y          PostgreSQL for the new node; must match the cluster
+                            or be newer. Not valid for a standby, which copies
+                            its leader.                    [the cluster's]
   --host NAME               host from the inventory to place it on
                             [a host with no Spock node yet]
   --source NODE             existing node to join through                [n1]
@@ -263,6 +270,46 @@ with open(target, "w", encoding="utf-8") as handle:
 PYEOF
 }
 
+cluster_facts() {
+  # cluster_facts [name] -> "<cluster>|<pg version>|<spock nodes>|<all nodes>"
+  # Empty when nothing is deployed yet.
+  python3 - "${1:-}" <<'PYEOF'
+import sys
+from aspects import state
+try:
+    name = sys.argv[1] or state.latest_cluster()
+    if not name:
+        raise SystemExit(0)
+    plan, _ = state.load(name)
+except Exception:
+    raise SystemExit(0)
+print("|".join([
+    name,
+    plan.pg_version or plan.pg_major,
+    ",".join(n.name for n in plan.spock_nodes),
+    ",".join(n.name for n in plan.nodes),
+]))
+PYEOF
+}
+
+version_at_least() {
+  # version_at_least <candidate> <minimum>
+  #   0 = candidate is the same or newer
+  #   1 = candidate is older
+  #   2 = could not compare here — say nothing and let the deployment decide,
+  #       which is the only place the rule has to hold
+  # Shares pg_server_management's comparison so the prompt and the deployment
+  # agree on what counts as newer.
+  python3 - "$1" "$2" <<'PYEOF'
+import sys
+try:
+    from aspects.pg_server_management import is_at_least
+except Exception:
+    sys.exit(2)
+sys.exit(0 if is_at_least(sys.argv[1], sys.argv[2]) else 1)
+PYEOF
+}
+
 # ---------------------------------------------------------------------------
 # Prompt helpers
 # ---------------------------------------------------------------------------
@@ -318,6 +365,9 @@ CLEANUP=false
 CLEANUP_ARGS=()
 ADD_NODE=""
 NODE_ARGS=()
+NODE_ROLE=""
+NODE_LEADER=""
+NODE_PG_VERSION=""
 CLUSTER_NAME=""
 
 while [[ $# -gt 0 ]]; do
@@ -330,8 +380,10 @@ while [[ $# -gt 0 ]]; do
     --add-node)
       [[ $# -ge 2 ]] || die "--add-node needs a node name (e.g. --add-node n3)"
       ADD_NODE="$2"; INTERACTIVE=false; shift 2 ;;
-    --host|--source)
+    --host|--source|--role|--leader)
       [[ $# -ge 2 ]] || die "$1 needs a value"
+      [[ "$1" == "--role" ]]   && NODE_ROLE="$2"
+      [[ "$1" == "--leader" ]] && NODE_LEADER="$2"
       NODE_ARGS+=("$1" "$2"); shift 2 ;;
     --clean|--skip-verify|--json)
       ARGS+=("$1"); INTERACTIVE=false; shift ;;
@@ -340,6 +392,7 @@ while [[ $# -gt 0 ]]; do
     --base-port|--base-restapi-port|--data-root|--hba-cidr|--zodan-sql)
       [[ $# -ge 2 ]] || die "$1 needs a value"
       [[ "$1" == "--cluster" ]] && CLUSTER_NAME="$2"
+      [[ "$1" == "--pg-version" ]] && NODE_PG_VERSION="$2"
       ARGS+=("$1" "$2"); INTERACTIVE=false; shift 2 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -356,11 +409,93 @@ if [[ -n "$ADD_NODE" ]]; then
   [[ "$ADD_NODE" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] \
     || die "node name '$ADD_NODE' must start with a letter and contain only letters, digits or underscores"
   [[ "$CLEANUP" == false ]] || die "--add-node and --cleanup do the opposite of each other; pick one"
+  FACTS="$(cluster_facts "$CLUSTER_NAME")"
+  [[ -n "$FACTS" ]] || die "no deployed cluster found — deploy one before adding a node"
+  IFS='|' read -r FACT_CLUSTER FACT_PG FACT_SPOCK FACT_ALL <<<"$FACTS"
+
   say ""
-  say "${BOLD}Adding node $ADD_NODE to a running cluster${RESET}"
+  say "${BOLD}Adding node $ADD_NODE to cluster '$FACT_CLUSTER'${RESET}"
   rule
-  say "${DIM}The node is prepared, bootstrapped as its own Patroni scope and"
-  say "cross-wired to every existing node in both directions.${RESET}"
+  say "   PostgreSQL : $FACT_PG"
+  say "   Spock nodes: ${FACT_SPOCK:-none}"
+  say "   All nodes  : ${FACT_ALL:-none}"
+  rule
+  say ""
+
+  # --- role ----------------------------------------------------------
+  if [[ -z "$NODE_ROLE" ]]; then
+    say "${BOLD}1) What should $ADD_NODE be?${RESET}"
+    say "   1) Spock node  — a multi-master peer, cross-wired to every other node,"
+    say "                    leading a Patroni scope of its own"
+    say "   2) Standby     — a physical replica of one existing node, which Patroni"
+    say "                    can promote if that node fails"
+    say ""
+    if [[ "$(ask_choice "   Choose 1 or 2" "1" 1 2)" == "2" ]]; then
+      NODE_ROLE="standby"
+    else
+      NODE_ROLE="leader"
+    fi
+    NODE_ARGS+=(--role "$NODE_ROLE")
+    say ""
+  fi
+
+  # --- the leader a standby follows -----------------------------------
+  if [[ "$NODE_ROLE" == "standby" && -z "$NODE_LEADER" ]]; then
+    [[ -n "$FACT_SPOCK" ]] || die "this cluster has no Spock node for a standby to follow"
+    say "${BOLD}2) Which node should $ADD_NODE stand by for?${RESET}"
+    say "   Spock nodes: $FACT_SPOCK"
+    say "   ${DIM}A standby is a copy of one node only; it can never be promoted"
+    say "   into a different node's data.${RESET}"
+    say ""
+    DEFAULT_LEADER="${FACT_SPOCK%%,*}"
+    # Bounded, so a closed stdin ends the run instead of spinning on the default.
+    for _ in 1 2 3 4 5; do
+      NODE_LEADER="$(ask "   Leader node" "$DEFAULT_LEADER")"
+      [[ ",$FACT_SPOCK," == *",$NODE_LEADER,"* ]] && break
+      warn "'$NODE_LEADER' is not a Spock node in this cluster ($FACT_SPOCK)."
+      NODE_LEADER=""
+    done
+    [[ -n "$NODE_LEADER" ]] || die "no leader chosen for the standby"
+    NODE_ARGS+=(--leader "$NODE_LEADER")
+    say ""
+  fi
+
+  # --- PostgreSQL version ---------------------------------------------
+  # A standby is a byte-for-byte copy of its leader, so its version is not a
+  # choice; only a Spock node gets asked.
+  if [[ "$NODE_ROLE" != "standby" ]]; then
+    if [[ -z "$NODE_PG_VERSION" ]]; then
+      say "${BOLD}3) Which PostgreSQL version should $ADD_NODE run?${RESET}"
+      say "   ${DIM}The cluster runs $FACT_PG. A new node may match it or be newer —"
+      say "   an older one cannot replay what its peers produce.${RESET}"
+      say ""
+      for _ in 1 2 3 4 5; do
+        NODE_PG_VERSION="$(ask "   PostgreSQL version" "$FACT_PG")"
+        if [[ ! "$NODE_PG_VERSION" =~ ^[0-9]+(\.[0-9]+|beta[0-9]+|rc[0-9]+)?$ ]]; then
+          warn "Enter a version like $FACT_PG."
+          NODE_PG_VERSION=""
+          continue
+        fi
+        version_at_least "$NODE_PG_VERSION" "$FACT_PG" && break
+        [[ $? -eq 2 ]] && break   # comparison unavailable; the deployment checks it
+        warn "PostgreSQL $NODE_PG_VERSION is older than the cluster's $FACT_PG — enter $FACT_PG or newer."
+        NODE_PG_VERSION=""
+      done
+      [[ -n "$NODE_PG_VERSION" ]] || die "no usable PostgreSQL version given"
+      say ""
+    else
+      version_at_least "$NODE_PG_VERSION" "$FACT_PG" || [[ $? -eq 2 ]] \
+        || die "PostgreSQL $NODE_PG_VERSION is older than the cluster's $FACT_PG; a new node must match it or be newer"
+    fi
+    # Appended here, not at the prompt: --pg-version may also have arrived as a
+    # flag, which the deploy parser captured.
+    NODE_ARGS+=(--pg-version "$NODE_PG_VERSION")
+  elif [[ -n "$NODE_PG_VERSION" ]]; then
+    die "--pg-version does not apply to a standby: it runs the same version as its leader"
+  fi
+
+  say "${DIM}The node is prepared, then bootstrapped and joined to the cluster."
+  say "Existing nodes stay up throughout.${RESET}"
   say ""
   exec python3 -m deployment.cli node add --name "$ADD_NODE" \
     --inventory "$INVENTORY" \

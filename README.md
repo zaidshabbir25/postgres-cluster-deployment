@@ -401,16 +401,39 @@ before doing any of it unless `--yes` is given.
 ## Growing a running cluster
 
 ```bash
-./pg_deploy_cluster.sh --add-node n3                        # next free host
-./pg_deploy_cluster.sh --add-node n3 --host node-d          # a specific host
-./pg_deploy_cluster.sh --add-node n3 --source n2            # join through n2
+./pg_deploy_cluster.sh --add-node n3                        # asks role and version
+./pg_deploy_cluster.sh --add-node n3 --role leader --pg-version 17.11
+./pg_deploy_cluster.sh --add-node n1s1 --role standby --leader n1
+./pg_deploy_cluster.sh --add-node n3 --host node-d --source n2
 ```
 
-The new node is prepared (packages, Patroni, pg_hba), bootstrapped as the leader
-of its own Patroni scope, and cross-wired to every existing node in both
-directions, so it accepts writes like any other. Every existing node's `pg_hba`
-and `.pgpass` learn about it and are reloaded in place — the cluster stays up
-throughout.
+It asks two questions, unless the flags answer them:
+
+**What should the node be?** A *Spock node* (`--role leader`) is a multi-master
+peer: prepared, bootstrapped as the leader of its own Patroni scope, and
+cross-wired to every existing node in both directions, so it accepts writes like
+any other. A *standby* (`--role standby --leader n1`) is a physical replica of
+one existing node, which Patroni can promote if that node fails; it never
+replicates a different node's data, so the leader it follows must be a Spock
+node.
+
+**Which PostgreSQL version?** It defaults to the cluster's. A newer version is
+allowed — Spock replicates logically, so a newer node can read an older peer's
+stream — but an *older* one is refused, at the prompt and again before any
+package is installed:
+
+```
+PostgreSQL 17.4 is older than the cluster's 17.11. A new node must run the
+same version or newer — pass --pg-version 17.11 or later.
+```
+
+The same check runs against whatever is already installed on the target host, so
+adding a node onto an existing machine running an older server fails before it
+touches anything. A standby is not asked: a physical replica is a byte-for-byte
+copy and runs its leader's version, so `--pg-version` is rejected there.
+
+Every existing node's `pg_hba` and `.pgpass` learn about the newcomer and are
+reloaded in place — the cluster stays up throughout.
 
 `--host` takes a name from the inventory, including one the cluster has never
 used: a machine that is not part of the cluster yet is prepared from scratch.

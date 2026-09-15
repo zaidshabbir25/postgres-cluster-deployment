@@ -105,8 +105,14 @@ class ClusterDeployer:
             self.log.step_end("passed", message or "")
             return True
         except Exception as exc:
-            summary = str(exc).strip().splitlines()[0] if str(exc).strip() else repr(exc)
+            lines = [l for l in str(exc).strip().splitlines() if l.strip()]
+            summary = lines[0] if lines else repr(exc)
             self.log.step_end("failed", summary)
+            # The rest of the message is usually the service's own log, which
+            # is the part that says why. Showing its tail here saves a trip to
+            # the log file for the common failures.
+            for line in lines[1:][-12:]:
+                self.log.info(f"      {line}")
             self.log.debug(traceback.format_exc())
             if required:
                 raise DeploymentFailed(f"{name}: {summary}") from exc
@@ -134,6 +140,10 @@ class ClusterDeployer:
             if advertise != host.address:
                 self.log.info(f"    {host.name}: advertising {advertise} to "
                               f"Patroni peers (listed as {host.address})")
+
+        # etcd's client URLs are built from the advertise addresses, which only
+        # exist once the hosts have been probed.
+        self.plan.etcd_endpoints = etcd_management.endpoints(self.plan.etcd_hosts)
 
         families = {host.family for host in self.plan.hosts}
         if len(families) > 1:

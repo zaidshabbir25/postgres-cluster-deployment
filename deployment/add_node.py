@@ -128,9 +128,34 @@ def next_ports(plan, host_name):
     return pg_port, api_port
 
 
+def cluster_version(plan):
+    """The PostgreSQL version a new node has to match or beat."""
+    return plan.pg_version or plan.pg_major
+
+
+def check_version(plan, requested):
+    """Reject a new node older than the cluster it is joining.
+
+    Spock replicates logically, so a newer node reading an older node's stream
+    is fine — the other direction is not: an older server cannot replay what a
+    newer one produces, and its catalogs may lack what the newer peers expect.
+    Returns the version to install, or raises.
+    """
+    minimum = cluster_version(plan)
+    if not requested:
+        return minimum
+    if not pg_server_management.is_at_least(requested, minimum):
+        raise AddNodeError(
+            f"PostgreSQL {requested} is older than the cluster's {minimum}. "
+            f"A new node must run the same version or newer — pass "
+            f"--pg-version {minimum} or later."
+        )
+    return requested
+
+
 def add(cluster_name, host_name=None, node_name=None, source_node=None,
         inventory_path=None, db_password=None, run_logger=None,
-        skip_verify=False):
+        skip_verify=False, pg_version=""):
     """Add one Spock node. Returns a result dict; never raises."""
     plan, metadata = state.load(cluster_name, db_password=db_password)
     plan.db_password = state.resolve_password(plan, explicit=db_password)
@@ -163,6 +188,17 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         if name in {n.name for n in plan.nodes}:
             raise AddNodeError(f"node {name!r} already exists in this cluster")
 
+        # Checked before a single package is installed: an older version is a
+        # dead end, and finding that out after a 20-minute prepare is no help.
+        wanted_version = check_version(plan, pg_version)
+        wanted_major = pg_server_management.major_of(wanted_version) or plan.pg_major
+        if wanted_major != plan.pg_major:
+            warnings.append(
+                f"{name} will run PostgreSQL {wanted_major} while the rest of "
+                f"the cluster runs {plan.pg_major}; Spock replicates logically "
+                f"across majors, but keep the mixed state short-lived"
+            )
+
         if host_is_new:
             plan.hosts.append(target_host)
 
@@ -184,6 +220,8 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
 
         log.banner(f"Adding Spock node {name} to cluster '{cluster_name}'")
         log.info(f"    host      : {target_host.name} ({target_host.address})")
+        log.info(f"    postgres  : {wanted_version} "
+                 f"(cluster runs {cluster_version(plan)})")
         log.info(f"    postgres  : {node.address}:{node.pg_port}")
         log.info(f"    patroni   : {node.address}:{node.restapi_port}")
         log.info(f"    scope     : {node.scope}")
@@ -214,6 +252,16 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             executor, node.bin_dir, node=node.name
         )
         if installed_version:
+            if not pg_server_management.is_at_least(installed_version,
+                                                    cluster_version(plan)):
+                log.step_end("failed",
+                             f"PostgreSQL {installed_version} is too old")
+                raise AddNodeError(
+                    f"{target_host.name} already has PostgreSQL "
+                    f"{installed_version}, older than the cluster's "
+                    f"{cluster_version(plan)}. Upgrade that host, or add the "
+                    f"node on a machine running {cluster_version(plan)} or newer."
+                )
             node.pg_version = installed_version
             log.step_end("passed",
                          f"{info['pretty']} — PostgreSQL {installed_version} "
@@ -231,16 +279,30 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                 executor, target_host.family, plan.repo_channel, node=node.name
             )
             packages = platform_detect.server_packages(
-                target_host.family, plan.pg_major, plan.spock_major
+                target_host.family, wanted_major, plan.spock_major
             )
             packages += platform_detect.patroni_packages(target_host.family)
             log.info(f"    installing {', '.join(packages)}")
             package_management.install(
                 executor, target_host.family, packages, node=node.name
             )
+            # bin_dir is per major, so a node on a different major needs its own.
+            node.bin_dir = platform_detect.pg_bin_dir(target_host.family,
+                                                      wanted_major)
             node.pg_version = pg_server_management.server_version(
                 executor, node.bin_dir, node=node.name
             )
+            if node.pg_version and not pg_server_management.is_at_least(
+                node.pg_version, cluster_version(plan)
+            ):
+                log.step_end("failed",
+                             f"installed PostgreSQL {node.pg_version} is too old")
+                raise AddNodeError(
+                    f"{target_host.name} installed PostgreSQL {node.pg_version}, "
+                    f"older than the cluster's {cluster_version(plan)}. The "
+                    f"repository channel may not carry {wanted_version} for "
+                    f"this platform."
+                )
             if not node.pg_version:
                 log.step_end("failed", "PostgreSQL not runnable after install")
                 raise AddNodeError(
