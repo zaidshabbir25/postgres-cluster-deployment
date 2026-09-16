@@ -446,13 +446,20 @@ The zodan procedures come from the same branch as the node's Spock:
 fetched from that branch on GitHub, else the copy bundled in
 `configuration/spock` so an air-gapped host still works. A spock60 node
 therefore loads zodan from `main` and a spock50 node from `v5_STABLE`, matching
-the replication API those procedures call. Spock's own `add_node` refuses to join nodes whose
-Spock major.minor differ, so a node's Spock has to match the cluster's — the
-run refuses a mismatch up front rather than letting you discover it after a
-40-minute build. Upgrade the whole cluster's Spock first if you want to move
-majors. Spock lives inside a PostgreSQL prefix, so a node cannot change
-the Spock of a prefix that running nodes are already using — give it its own
-`--pg-version`, or take the cluster's Spock.
+the replication API those procedures call.
+
+That pairing is what makes a **mixed-version add** work: a spock60 node can
+join a spock50 cluster, because the zodan on `main` allows a new node to run
+the same or a newer major.minor than every existing node — its sync worker can
+read an older provider's stream, not the other way around. The reverse is
+refused up front, as is any add where an existing node runs Spock older than
+5.0.9. So a cluster migrates majors one node at a time; until the rest follow,
+it is mixed, and the run says so. (The `v5_STABLE` zodan requires an exact
+major.minor match, which is why the branch the script comes from matters.)
+
+Spock lives inside a PostgreSQL prefix, so a node cannot change the Spock of a
+prefix that running nodes are already using — give it its own `--pg-version`,
+or take the cluster's Spock.
 
 A source-built cluster compiles the major it needs: PostgreSQL and Spock are
 built into `/opt/pgedge/pg<major>` alongside the existing installation, which
