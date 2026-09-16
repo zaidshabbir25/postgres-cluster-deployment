@@ -482,14 +482,21 @@ class ClusterDeployer:
         Loaded everywhere, not just where add_node runs, so any node can later
         run spock.health_check or add a further node without a reload.
         """
+        # The branch this cluster's Spock came from, so the procedures match
+        # the extension and not merely its major.
+        branch = ((self.plan.source_build or {}).get("spock_branch")
+                  or source_build.default_spock_branch(self.plan.spock_major))
+
         script = None
         for node in self.plan.spock_nodes:
             executor = self.executor_for_node(node)
             script = spock_management.load_zodan(
-                executor, self.plan, node, run_logger=self.log
+                executor, self.plan, node, run_logger=self.log, branch=branch
             )
             self.log.info(f"    {node.name}: zodan procedures loaded")
-        self.plan.zodan_sql = script or self.plan.zodan_sql
+        # plan.zodan_sql stays whatever the caller set: it names a file in
+        # configuration/spock, and storing a branch-fetched name here would
+        # make every later lookup miss.
         return f"{script} loaded on {len(self.plan.spock_nodes)} node(s)"
 
     def step_crosswire(self):

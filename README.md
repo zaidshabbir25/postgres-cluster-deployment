@@ -435,6 +435,25 @@ copy and runs its leader's version, so `--pg-version` is rejected there.
 Binaries are found per major (`/usr/pgsql-18/bin`, or `/opt/pgedge/pg18/bin` for
 a source build), so asking for a newer major on a host that already runs the
 cluster's installs that major alongside the existing one rather than reusing it.
+**Which Spock?** It defaults to the cluster's major, and a source-built cluster
+also asks which branch or tag of [spock](https://github.com/pgEdge/spock) to
+compile — defaulting to the branch that major is developed on (`v5_STABLE` for
+spock50, `main` for spock60), or to the branch the cluster itself was built from
+when the major is unchanged — useful for trying a fix or a release candidate on one node.
+
+The zodan procedures come from the same branch as the node's Spock:
+`samples/Z0DAN/zodan.sql` out of the source checkout when there is one, else
+fetched from that branch on GitHub, else the copy bundled in
+`configuration/spock` so an air-gapped host still works. A spock60 node
+therefore loads zodan from `main` and a spock50 node from `v5_STABLE`, matching
+the replication API those procedures call. Spock's own `add_node` refuses to join nodes whose
+Spock major.minor differ, so a node's Spock has to match the cluster's — the
+run refuses a mismatch up front rather than letting you discover it after a
+40-minute build. Upgrade the whole cluster's Spock first if you want to move
+majors. Spock lives inside a PostgreSQL prefix, so a node cannot change
+the Spock of a prefix that running nodes are already using — give it its own
+`--pg-version`, or take the cluster's Spock.
+
 A source-built cluster compiles the major it needs: PostgreSQL and Spock are
 built into `/opt/pgedge/pg<major>` alongside the existing installation, which
 takes 20-40 minutes and leaves the other nodes untouched. That path needs an

@@ -34,6 +34,13 @@ ZODAN_BY_SPOCK_MAJOR = {
 
 REMOTE_ZODAN_DIR = "/tmp/pgcluster"
 
+# zodan lives in the Spock repository, and its procedures track the Spock API
+# they call — so the copy that matches a node is the one on the branch that
+# node's Spock was built from: v5_STABLE for spock50, main for spock60.
+ZODAN_REPO_PATH = "samples/Z0DAN/zodan.sql"
+ZODAN_RAW_URL = ("https://raw.githubusercontent.com/pgEdge/spock/"
+                 "{branch}/" + ZODAN_REPO_PATH)
+
 # Extensions every Spock node needs. dblink is not optional: zodan's procedures
 # reach across nodes through it.
 REQUIRED_EXTENSIONS = ("spock", "dblink")
@@ -96,14 +103,114 @@ def spock_version(executor, plan, node):
     )
 
 
-def load_zodan(executor, plan, node, run_logger=None):
-    """Upload and install zodan's procedures on a node."""
-    local = zodan_script(plan.spock_major, plan.zodan_sql or None)
-    remote = f"{REMOTE_ZODAN_DIR}/{local.name}"
+def _safe_name(text):
+    """A branch name usable as a filename."""
+    return re.sub(r"[^A-Za-z0-9._-]", "-", str(text)).strip("-") or "branch"
+
+
+def stage_zodan(executor, plan, node, branch, run_logger=None):
+    """Put the zodan script matching `branch` on the host.
+
+    Three sources, in order of how closely they match the Spock actually
+    installed:
+
+      1. the Spock checkout a source build already made, when it sits on this
+         branch — byte-for-byte what the extension was built from;
+      2. the branch on GitHub, for a package-mode host with no checkout;
+      3. the copy bundled in configuration/spock, so an air-gapped host still
+         works. It tracks a Spock major rather than a branch, which is why it
+         is last.
+
+    An explicit plan.zodan_sql skips straight to the bundled directory: naming
+    a script is an instruction, not a preference. It is ignored for a node
+    whose Spock major differs from the cluster's, though — that name was chosen
+    for the cluster's major, and loading a Spock 5 script into a Spock 6 node
+    produces procedures that call an API the extension no longer has.
+    Returns (remote path, origin).
+    """
+    from aspects import source_build  # local: source_build imports nothing here
 
     executor.run(f"mkdir -p {REMOTE_ZODAN_DIR}", node=node.name)
     executor.run(f"chmod 755 {REMOTE_ZODAN_DIR}", node=node.name)
-    executor.put_file(local, remote, owner=plan.db_user, mode="644", node=node.name)
+    spock_major = getattr(node, "spock_major", "") or plan.spock_major
+    # A pinned name is honoured only where it can be right. Two ways it cannot
+    # be: it was chosen for the cluster's major and this node runs the other
+    # one, or it is the bundled script of a different major — which is what an
+    # older version of this tool used to write into the saved state
+    # automatically, so it is residue rather than an instruction.
+    pinned = plan.zodan_sql or ""
+    other_majors = {
+        filename for major, filename in ZODAN_BY_SPOCK_MAJOR.items()
+        if str(major) != str(spock_major)
+    }
+    if pinned and (str(spock_major) != str(plan.spock_major)
+                   or pinned in other_majors):
+        if run_logger:
+            run_logger.warn(
+                f"{node.name}: ignoring the pinned {pinned}, which is not the "
+                f"zodan script for spock{spock_major}"
+            )
+        pinned = ""
+
+    def adopt(remote):
+        executor.try_run(f"chown {plan.db_user}: {shlex.quote(remote)}",
+                         node=node.name)
+        executor.try_run(f"chmod 644 {shlex.quote(remote)}", node=node.name)
+
+    if not pinned:
+        remote = f"{REMOTE_ZODAN_DIR}/zodan-{_safe_name(branch)}.sql"
+        checkout = f"{source_build.BUILD_ROOT}/spock"
+        on_branch, current = executor.try_run(
+            f"git -C {shlex.quote(checkout)} rev-parse --abbrev-ref HEAD "
+            f"2>/dev/null", node=node.name,
+        )
+        if on_branch and current.strip() == str(branch):
+            copied, _ = executor.try_run(
+                f"cp {shlex.quote(checkout)}/{ZODAN_REPO_PATH} "
+                f"{shlex.quote(remote)}", node=node.name,
+            )
+            if copied:
+                adopt(remote)
+                return remote, f"the {branch} checkout at {checkout}"
+
+        url = ZODAN_RAW_URL.format(branch=branch)
+        fetched, _ = executor.try_run(
+            f"curl -fsSL --max-time 60 -o {shlex.quote(remote)} "
+            f"{shlex.quote(url)} && test -s {shlex.quote(remote)}",
+            node=node.name,
+        )
+        if fetched:
+            adopt(remote)
+            return remote, url
+
+        if run_logger:
+            run_logger.warn(
+                f"{node.name}: could not read {ZODAN_REPO_PATH} from branch "
+                f"{branch}; falling back to the copy bundled for spock"
+                f"{spock_major}"
+            )
+
+    local = zodan_script(spock_major, pinned or None)
+    remote = f"{REMOTE_ZODAN_DIR}/{local.name}"
+    executor.put_file(local, remote, owner=plan.db_user, mode="644",
+                      node=node.name)
+    return remote, f"the bundled {local.name}"
+
+
+def load_zodan(executor, plan, node, run_logger=None, branch=None):
+    """Install zodan's procedures on a node.
+
+    The script follows the Spock running on *this* node: the procedures call
+    Spock's own API, which changed between 50 and 60, so a node added with a
+    different Spock major needs the script from that major's branch rather
+    than the cluster's.
+    """
+    from aspects import source_build
+
+    spock_major = getattr(node, "spock_major", "") or plan.spock_major
+    branch = branch or source_build.default_spock_branch(spock_major)
+    remote, origin = stage_zodan(executor, plan, node, branch,
+                                 run_logger=run_logger)
 
     _, output = executor.try_run(f"wc -l {shlex.quote(remote)}", node=node.name)
     pg_server_management.psql_file(
@@ -111,8 +218,10 @@ def load_zodan(executor, plan, node, run_logger=None):
         dbname=plan.db_name, node=node.name,
     )
     if run_logger:
-        run_logger.node(node.name, f"zodan loaded from {remote} ({output.strip()})")
-    return local.name
+        run_logger.node(node.name,
+                        f"zodan for spock{spock_major} loaded from {origin} "
+                        f"({output.strip()})")
+    return remote.rsplit("/", 1)[-1]
 
 
 def enable_ddl_replication(executor, plan, node, run_logger=None):

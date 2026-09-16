@@ -51,7 +51,8 @@ Deployment method
   --mode packages|source    native pgEdge packages, or build from source   [packages]
   --channel release|staging|daily
                             pgEdge repository channel (packages mode)      [release]
-  --spock-branch BRANCH     Spock git branch (source mode)                 [main]
+  --spock-branch BRANCH     Spock git branch (source mode)
+                            [v5_STABLE for spock50, main for spock60]
   --etcd-version V          etcd release to install (source mode)          [3.5.17]
   --jobs N                  make -j value (source mode)
 
@@ -89,6 +90,9 @@ Growing a running cluster
   --pg-version X.Y          PostgreSQL for the new node; must match the cluster
                             or be newer. Not valid for a standby, which copies
                             its leader.                    [the cluster's]
+  --spock-major 50|60       Spock major for the new node   [the cluster's]
+  --spock-branch BRANCH     Spock git branch or tag to build, for a source-built
+                            cluster  [the cluster's, or that major's default]
   --host NAME               host from the inventory to place it on
                             [a host with no Spock node yet]
   --source NODE             existing node to join through                [n1]
@@ -271,7 +275,8 @@ PYEOF
 }
 
 cluster_facts() {
-  # cluster_facts [name] -> "<cluster>|<pg version>|<spock nodes>|<all nodes>"
+  # cluster_facts [name] ->
+  #   "<cluster>|<pg version>|<spock nodes>|<all nodes>|<mode>|<spock major>|<branch>"
   # Empty when nothing is deployed yet.
   python3 - "${1:-}" <<'PYEOF'
 import sys
@@ -288,7 +293,24 @@ print("|".join([
     plan.pg_version or plan.pg_major,
     ",".join(n.name for n in plan.spock_nodes),
     ",".join(n.name for n in plan.nodes),
+    plan.deploy_mode,
+    str(plan.spock_major),
+    (plan.source_build or {}).get("spock_branch", "main"),
 ]))
+PYEOF
+}
+
+default_spock_branch() {
+  # The branch a Spock major is developed on, straight from source_build so the
+  # prompt and the build cannot drift apart.
+  python3 - "$1" <<'PYEOF'
+import sys
+try:
+    from aspects.source_build import default_spock_branch
+except Exception:
+    print("main")
+else:
+    print(default_spock_branch(sys.argv[1]))
 PYEOF
 }
 
@@ -368,6 +390,8 @@ NODE_ARGS=()
 NODE_ROLE=""
 NODE_LEADER=""
 NODE_PG_VERSION=""
+NODE_SPOCK_MAJOR=""
+NODE_SPOCK_BRANCH=""
 CLUSTER_NAME=""
 
 while [[ $# -gt 0 ]]; do
@@ -393,6 +417,8 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "$1 needs a value"
       [[ "$1" == "--cluster" ]] && CLUSTER_NAME="$2"
       [[ "$1" == "--pg-version" ]] && NODE_PG_VERSION="$2"
+      [[ "$1" == "--spock-major" ]] && NODE_SPOCK_MAJOR="$2"
+      [[ "$1" == "--spock-branch" ]] && NODE_SPOCK_BRANCH="$2"
       ARGS+=("$1" "$2"); INTERACTIVE=false; shift 2 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -411,12 +437,14 @@ if [[ -n "$ADD_NODE" ]]; then
   [[ "$CLEANUP" == false ]] || die "--add-node and --cleanup do the opposite of each other; pick one"
   FACTS="$(cluster_facts "$CLUSTER_NAME")"
   [[ -n "$FACTS" ]] || die "no deployed cluster found — deploy one before adding a node"
-  IFS='|' read -r FACT_CLUSTER FACT_PG FACT_SPOCK FACT_ALL <<<"$FACTS"
+  IFS='|' read -r FACT_CLUSTER FACT_PG FACT_SPOCK FACT_ALL FACT_MODE \
+    FACT_SPOCK_MAJOR FACT_BRANCH <<<"$FACTS"
 
   say ""
   say "${BOLD}Adding node $ADD_NODE to cluster '$FACT_CLUSTER'${RESET}"
   rule
   say "   PostgreSQL : $FACT_PG"
+  say "   Spock      : spock${FACT_SPOCK_MAJOR}${FACT_MODE:+ ($FACT_MODE)}"
   say "   Spock nodes: ${FACT_SPOCK:-none}"
   say "   All nodes  : ${FACT_ALL:-none}"
   rule
@@ -492,6 +520,47 @@ if [[ -n "$ADD_NODE" ]]; then
     NODE_ARGS+=(--pg-version "$NODE_PG_VERSION")
   elif [[ -n "$NODE_PG_VERSION" ]]; then
     die "--pg-version does not apply to a standby: it runs the same version as its leader"
+  fi
+
+  # --- Spock version and branch ---------------------------------------
+  # A standby copies its leader byte for byte, so it runs the leader's Spock.
+  if [[ "$NODE_ROLE" != "standby" ]]; then
+    if [[ -z "$NODE_SPOCK_MAJOR" ]]; then
+      say "${BOLD}4) Which Spock version should $ADD_NODE run?${RESET}"
+      say "   ${DIM}The cluster runs spock${FACT_SPOCK_MAJOR}, and spock.add_node refuses to join"
+      say "   a node whose Spock major.minor differs from its peers' — so this"
+      say "   has to match until the whole cluster is upgraded.${RESET}"
+      say ""
+      NODE_SPOCK_MAJOR="$(ask_choice "   Spock major version (50 or 60)" "$FACT_SPOCK_MAJOR" 50 60)"
+      say ""
+    fi
+    if [[ "$NODE_SPOCK_MAJOR" != "$FACT_SPOCK_MAJOR" ]]; then
+      die "the cluster runs spock$FACT_SPOCK_MAJOR; spock.add_node refuses to cross-wire a spock$NODE_SPOCK_MAJOR node into it. Upgrade the cluster's Spock first, or add this node with spock$FACT_SPOCK_MAJOR"
+    fi
+    NODE_ARGS+=(--spock-major "$NODE_SPOCK_MAJOR")
+
+    if [[ "$FACT_MODE" == "source" ]]; then
+      if [[ -z "$NODE_SPOCK_BRANCH" ]]; then
+        say "${BOLD}5) Which Spock branch should $ADD_NODE build from?${RESET}"
+        say "   ${DIM}This cluster is built from source, so Spock is compiled from a"
+        say "   git branch or tag of github.com/pgEdge/spock.${RESET}"
+        say ""
+        # The cluster's branch is the right default only while the major
+        # matches; otherwise take that major's own branch.
+        if [[ "$NODE_SPOCK_MAJOR" == "$FACT_SPOCK_MAJOR" && -n "$FACT_BRANCH" ]]; then
+          BRANCH_DEFAULT="$FACT_BRANCH"
+        else
+          BRANCH_DEFAULT="$(default_spock_branch "$NODE_SPOCK_MAJOR")"
+        fi
+        NODE_SPOCK_BRANCH="$(ask "   Spock branch or tag" "$BRANCH_DEFAULT")"
+        say ""
+      fi
+      NODE_ARGS+=(--spock-branch "$NODE_SPOCK_BRANCH")
+    elif [[ -n "$NODE_SPOCK_BRANCH" ]]; then
+      die "--spock-branch applies to a source-built cluster; this one installs packages"
+    fi
+  elif [[ -n "$NODE_SPOCK_MAJOR" || -n "$NODE_SPOCK_BRANCH" ]]; then
+    die "--spock-major and --spock-branch do not apply to a standby: it runs exactly what its leader runs"
   fi
 
   say "${DIM}The node is prepared, then bootstrapped and joined to the cluster."
@@ -682,7 +751,7 @@ if [[ "$INTERACTIVE" == true ]]; then
     SPOCK_BRANCH=""
   else
     CHANNEL=""
-    SPOCK_BRANCH="$(ask "   Spock git branch to build" "main")"
+    SPOCK_BRANCH="$(ask "   Spock git branch to build" "$(default_spock_branch "$SPOCK_MAJOR")")"
   fi
   DB_NAME="$(ask "   Database name" "postgres")"
   DB_USER="$(ask "   Database superuser" "postgres")"

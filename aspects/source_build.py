@@ -30,6 +30,17 @@ ETCD_RELEASE_URL = (
 
 DEFAULT_ETCD_VERSION = "3.5.17"
 
+# Which Spock branch a major is developed on. Spock 5 has a stable branch of
+# its own; 6 is still what main carries. Building spock50 from main would
+# compile Spock 6 sources against a cluster expecting Spock 5.
+SPOCK_BRANCH_BY_MAJOR = {"50": "v5_STABLE", "60": "main"}
+FALLBACK_SPOCK_BRANCH = "main"
+
+
+def default_spock_branch(spock_major):
+    """The branch to build a given Spock major from."""
+    return SPOCK_BRANCH_BY_MAJOR.get(str(spock_major), FALLBACK_SPOCK_BRANCH)
+
 
 def make_reachable(executor, path, node=None):
     """Let the database user read and run what root just installed.
@@ -391,7 +402,8 @@ def register_library_path(executor, pg_major, node=None):
     return prefix
 
 
-def build_major(executor, host, plan, pg_version, run_logger=None):
+def build_major(executor, host, plan, pg_version, spock_branch=None,
+                run_logger=None):
     """Build one PostgreSQL major plus Spock, alongside anything already there.
 
     This is what lets a source-built cluster grow a node on a newer major: the
@@ -409,10 +421,12 @@ def build_major(executor, host, plan, pg_version, run_logger=None):
         )
 
     spec = plan.source_build or {}
-    spock_branch = spec.get("spock_branch", "main")
+    spock_branch = (spock_branch or spec.get("spock_branch")
+                    or default_spock_branch(plan.spock_major))
     jobs = spec.get("jobs")
     pg_major = pg_version.split(".")[0]
-    details = {"host": host.name, "pg_version": pg_version}
+    details = {"host": host.name, "pg_version": pg_version,
+               "spock_branch": spock_branch}
 
     def say(message):
         if run_logger:
@@ -429,7 +443,8 @@ def build_major(executor, host, plan, pg_version, run_logger=None):
     count, names = apply_spock_patches(executor, source_dir, spock_dir, pg_major,
                                        node=host.name)
     details["patches"] = names
-    say(f"applied {count} Spock patch(es) for pg{pg_major}")
+    say(f"applied {count} Spock patch(es) for pg{pg_major} "
+        f"from branch {spock_branch}")
 
     prefix = build_postgresql(executor, source_dir, pg_major, node=host.name,
                               jobs=jobs)
@@ -443,6 +458,26 @@ def build_major(executor, host, plan, pg_version, run_logger=None):
     return details
 
 
+def rebuild_spock(executor, host, plan, pg_major, spock_branch,
+                  run_logger=None):
+    """Build Spock from a branch against a PostgreSQL that is already there.
+
+    Only safe when no running node uses that prefix: spock.so is per prefix,
+    so replacing it changes the Spock under every node sharing it. The caller
+    is responsible for that check.
+    """
+    spec = plan.source_build or {}
+    spock_dir, revision = fetch_spock_source(executor, spock_branch, node=host.name)
+    module = build_spock(executor, spock_dir, pg_major, node=host.name,
+                         jobs=spec.get("jobs"))
+    make_reachable(executor, install_dir(pg_major), node=host.name)
+    if run_logger:
+        run_logger.info(f"    {host.name}: Spock rebuilt from {spock_branch} "
+                        f"({revision[:12]}) for pg{pg_major}")
+    return {"spock_branch": spock_branch, "spock_revision": revision,
+            "spock_module": module}
+
+
 def build_host(executor, host, plan, run_logger=None):
     """Run the whole source build on one host. Returns a details dict."""
     family = host.family
@@ -450,7 +485,8 @@ def build_host(executor, host, plan, run_logger=None):
 
     spec = plan.source_build or {}
     pg_version = spec.get("pg_version") or plan.pg_version
-    spock_branch = spec.get("spock_branch", "main")
+    spock_branch = (spec.get("spock_branch")
+                    or default_spock_branch(plan.spock_major))
     etcd_version = spec.get("etcd_version", DEFAULT_ETCD_VERSION)
     jobs = spec.get("jobs")
 

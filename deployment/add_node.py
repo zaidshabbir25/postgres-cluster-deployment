@@ -166,9 +166,43 @@ def check_version(plan, requested):
     return requested
 
 
+SPOCK_MAJORS = ("50", "60")
+
+
+def check_spock(plan, requested):
+    """Resolve the Spock major for a new node. Returns (major, warnings).
+
+    A different major is refused here rather than discovered later: Spock's own
+    add_node procedure calls check_spock_version_compatibility first, which
+    rejects any join where the two nodes' major.minor differ —
+
+        ERROR: Spock version mismatch: new node has version 6.0.0, but source
+        version is 5.0.11. Major.minor versions must match (patch differences
+        are allowed).
+
+    Finding that out after building PostgreSQL and Spock for half an hour
+    helps nobody.
+    """
+    major = str(requested or plan.spock_major)
+    if major not in SPOCK_MAJORS:
+        raise AddNodeError(
+            f"Spock major must be one of {', '.join(SPOCK_MAJORS)}, not "
+            f"{major!r}"
+        )
+    if major != str(plan.spock_major):
+        raise AddNodeError(
+            f"this cluster runs spock{plan.spock_major}, and spock.add_node "
+            f"refuses to join a node whose Spock major.minor differs from its "
+            f"peers' — a spock{major} node cannot be cross-wired into it. "
+            f"Upgrade the whole cluster's Spock first, or add this node with "
+            f"--spock-major {plan.spock_major}."
+        )
+    return major, []
+
+
 def add(cluster_name, host_name=None, node_name=None, source_node=None,
         inventory_path=None, db_password=None, run_logger=None,
-        skip_verify=False, pg_version=""):
+        skip_verify=False, pg_version="", spock_major="", spock_branch=""):
     """Add one Spock node. Returns a result dict; never raises."""
     plan, metadata = state.load(cluster_name, db_password=db_password)
     plan.db_password = state.resolve_password(plan, explicit=db_password)
@@ -205,6 +239,27 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         # dead end, and finding that out after a 20-minute prepare is no help.
         wanted_version = check_version(plan, pg_version)
         wanted_major = pg_server_management.major_of(wanted_version) or plan.pg_major
+        wanted_spock, spock_notes = check_spock(plan, spock_major)
+        for note in spock_notes:
+            warnings.append(note)
+            log.warn(note)
+        # The cluster's recorded branch belongs to the cluster's Spock major;
+        # a node on the other major needs that major's branch instead.
+        if spock_branch:
+            wanted_branch = spock_branch
+        elif wanted_spock == str(plan.spock_major):
+            wanted_branch = ((plan.source_build or {}).get("spock_branch")
+                             or source_build.default_spock_branch(wanted_spock))
+        else:
+            wanted_branch = source_build.default_spock_branch(wanted_spock)
+        if spock_branch and plan.deploy_mode != "source":
+            note = (
+                f"--spock-branch {spock_branch} only applies to a source build; "
+                f"this cluster installs packages, so spock{wanted_spock} comes "
+                f"from the {plan.repo_channel} channel"
+            )
+            warnings.append(note)
+            log.warn(note)
         if wanted_major != plan.pg_major:
             warnings.append(
                 f"{name} will run PostgreSQL {wanted_major} while the rest of "
@@ -229,12 +284,17 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             scope=f"{plan.cluster_name}-{name}",
             config_file=f"/etc/patroni/{name}.yml",
             pgpass_file=f"{plan.data_root}/pgpass_{name}",
+            spock_major=wanted_spock,
         )
 
         log.banner(f"Adding Spock node {name} to cluster '{cluster_name}'")
         log.info(f"    host      : {target_host.name} ({target_host.address})")
         log.info(f"    version   : PostgreSQL {wanted_version} "
                  f"(cluster runs {cluster_version(plan)})")
+        log.info(f"    spock     : spock{wanted_spock}"
+                 + (f" from branch {wanted_branch}"
+                    if plan.deploy_mode == "source" else
+                    f" (cluster runs spock{plan.spock_major})"))
         log.info(f"    postgres  : {node.address}:{node.pg_port}")
         log.info(f"    patroni   : {node.address}:{node.restapi_port}")
         log.info(f"    scope     : {node.scope}")
@@ -280,6 +340,42 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                     f"node on a machine running {cluster_version(plan)} or newer."
                 )
             node.pg_version = installed_version
+
+            # The server is already here, so the install path that would have
+            # honoured a Spock choice never runs. Doing it now means touching
+            # spock.so inside a prefix — which is shared by every node built
+            # against it, so it is only safe while no node uses this one.
+            # Only a branch can differ now: check_spock has already refused a
+            # different major.
+            spock_asked_for = bool(spock_branch)
+            sharers = [n.name for n in existing_nodes if n.bin_dir == node.bin_dir]
+            if spock_asked_for and sharers:
+                log.step_end("failed", "Spock is shared with running nodes")
+                raise AddNodeError(
+                    f"{', '.join(sharers)} already run from {node.bin_dir}, and "
+                    f"Spock lives inside that prefix — installing spock"
+                    f"{wanted_spock}"
+                    + (f" from {wanted_branch}" if spock_branch else "")
+                    + f" there would swap it under them mid-flight. Give {name} "
+                      f"its own PostgreSQL with a different --pg-version, or "
+                      f"add it with the cluster's spock{plan.spock_major}."
+                )
+            if spock_asked_for and plan.deploy_mode == "source":
+                source_build.rebuild_spock(
+                    executor, target_host, plan, wanted_major, wanted_branch,
+                    run_logger=log,
+                )
+            elif spock_asked_for:
+                package_management.install(
+                    executor, target_host.family,
+                    platform_detect.server_packages(
+                        target_host.family, wanted_major, wanted_spock
+                    ),
+                    node=node.name,
+                )
+                log.info(f"    installed spock{wanted_spock} for "
+                         f"PostgreSQL {wanted_major}")
+
             if "." in str(wanted_version) and installed_version != wanted_version:
                 warnings.append(
                     f"{target_host.name} already has PostgreSQL "
@@ -305,7 +401,8 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                 log.info(f"    building PostgreSQL {wanted_version} from source "
                          f"— this takes 20-40 minutes")
                 build = source_build.build_major(
-                    executor, target_host, plan, wanted_version, run_logger=log
+                    executor, target_host, plan, wanted_version,
+                    spock_branch=wanted_branch, run_logger=log,
                 )
                 node.bin_dir = source_build.bin_dir(wanted_major)
                 node.pg_version = pg_server_management.server_version(
@@ -332,7 +429,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                     executor, target_host.family, plan.repo_channel, node=node.name
                 )
                 packages = platform_detect.server_packages(
-                    target_host.family, wanted_major, plan.spock_major
+                    target_host.family, wanted_major, wanted_spock
                 )
                 packages += platform_detect.patroni_packages(target_host.family)
                 log.info(f"    installing {', '.join(packages)}")
@@ -448,7 +545,11 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             node=node.name,
         )
         spock_management.create_extensions(executor, plan, node, run_logger=log)
-        script = spock_management.load_zodan(executor, plan, node, run_logger=log)
+        # The branch this node's Spock came from, so zodan matches the
+        # extension rather than just its major.
+        script = spock_management.load_zodan(executor, plan, node,
+                                             run_logger=log,
+                                             branch=wanted_branch)
         version = spock_management.spock_version(executor, plan, node)
         log.step_end("passed", f"spock {version or 'unknown'}, {script} loaded")
 

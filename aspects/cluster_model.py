@@ -59,6 +59,9 @@ class Node:
     # Routable form of `address` for Patroni's connect_address, which rejects
     # loopback names. Empty means `address` is already routable.
     advertise_address: str = ""
+    # Set only when this node's Spock differs from the cluster's; empty means
+    # it follows ClusterPlan.spock_major.
+    spock_major: str = ""
     leader: Optional[str] = None   # for standbys: the Spock node they follow
     standbys: List[str] = field(default_factory=list)  # for Spock nodes
 
