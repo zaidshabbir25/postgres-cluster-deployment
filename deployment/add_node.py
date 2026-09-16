@@ -172,16 +172,20 @@ SPOCK_MAJORS = ("50", "60")
 def check_spock(plan, requested):
     """Resolve the Spock major for a new node. Returns (major, warnings).
 
-    A different major is refused here rather than discovered later: Spock's own
-    add_node procedure calls check_spock_version_compatibility first, which
-    rejects any join where the two nodes' major.minor differ —
+    A newer Spock on the new node is supported and is how a cluster migrates
+    majors: zodan on `main` allows it explicitly —
 
-        ERROR: Spock version mismatch: new node has version 6.0.0, but source
-        version is 5.0.11. Major.minor versions must match (patch differences
-        are allowed).
+        the new node must run the same or a newer major.minor than every
+        existing node (for example a 6.0.x node joining a cluster of 5.0.x
+        nodes, or of 5.0.x and 6.0.x nodes)
 
-    Finding that out after building PostgreSQL and Spock for half an hour
-    helps nobody.
+    — because the new node's sync worker knows how to talk to older providers,
+    not the other way around. An *older* Spock is refused for that same
+    reason, here rather than after a half-hour build.
+
+    The direction only holds with the newer zodan: the v5_STABLE script
+    requires major.minor to match exactly, so a mixed add loads zodan from the
+    new node's own branch (see spock_management.stage_zodan).
     """
     major = str(requested or plan.spock_major)
     if major not in SPOCK_MAJORS:
@@ -189,15 +193,23 @@ def check_spock(plan, requested):
             f"Spock major must be one of {', '.join(SPOCK_MAJORS)}, not "
             f"{major!r}"
         )
-    if major != str(plan.spock_major):
+    if int(major) < int(plan.spock_major):
         raise AddNodeError(
-            f"this cluster runs spock{plan.spock_major}, and spock.add_node "
-            f"refuses to join a node whose Spock major.minor differs from its "
-            f"peers' — a spock{major} node cannot be cross-wired into it. "
-            f"Upgrade the whole cluster's Spock first, or add this node with "
-            f"--spock-major {plan.spock_major}."
+            f"this cluster runs spock{plan.spock_major}, and a new node may "
+            f"not run an older Spock than its peers — its sync worker would "
+            f"have to read a stream from a newer provider. Add the node with "
+            f"--spock-major {plan.spock_major} or later."
         )
-    return major, []
+    notes = []
+    if major != str(plan.spock_major):
+        notes.append(
+            f"mixed-version add: {plan.spock_major} -> {major}. spock.add_node "
+            f"allows a newer node to join older peers, and every node must "
+            f"already run Spock 5.0.9 or later for that check to pass. Until "
+            f"the other nodes are upgraded the cluster is mixed — that is a "
+            f"migration in progress, not a resting state."
+        )
+    return major, notes
 
 
 def add(cluster_name, host_name=None, node_name=None, source_node=None,
@@ -345,9 +357,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             # honoured a Spock choice never runs. Doing it now means touching
             # spock.so inside a prefix — which is shared by every node built
             # against it, so it is only safe while no node uses this one.
-            # Only a branch can differ now: check_spock has already refused a
-            # different major.
-            spock_asked_for = bool(spock_branch)
+            spock_asked_for = bool(spock_branch) or wanted_spock != str(plan.spock_major)
             sharers = [n.name for n in existing_nodes if n.bin_dir == node.bin_dir]
             if spock_asked_for and sharers:
                 log.step_end("failed", "Spock is shared with running nodes")
