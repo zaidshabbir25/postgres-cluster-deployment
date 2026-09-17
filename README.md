@@ -484,6 +484,28 @@ the name default to the next free `nN`.
 
 ---
 
+## Tests
+
+[![Regression](https://github.com/zaidshabbir25/postgres-cluster-deployment/actions/workflows/regression.yml/badge.svg)](https://github.com/zaidshabbir25/postgres-cluster-deployment/actions/workflows/regression.yml)
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Around 230 unit tests, two seconds, no machine touched: every module reaches
+hosts through an executor, so a recording stand-in for it drives the whole
+deployment and the tests assert on the commands that would have run. The shell
+script is covered too — `tests/test_deploy_script.py` runs it with its `exec`
+hand-offs stubbed, checking each prompt against the `deployment.cli` command
+line it produces. See [tests/README.md](tests/README.md).
+
+Every pull request runs the same suite on Python 3.9 (what Rocky 9 ships) and
+3.12, checks the shell scripts parse and are intact, and imports every module —
+see [.github/workflows/regression.yml](.github/workflows/regression.yml).
+
+---
+
 ## Operating a deployed cluster
 
 Deployment is `pg_deploy_cluster.sh`; everything afterwards is
