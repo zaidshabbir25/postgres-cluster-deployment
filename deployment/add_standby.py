@@ -85,14 +85,22 @@ def next_standby_name(plan, leader):
 
 
 def add(cluster_name, leader_name, host_name=None, db_password=None,
-        run_logger=None):
-    """Add one standby. Returns a result dict."""
+        run_logger=None, synchronous_mode=None, synchronous_node_count=None,
+        synchronous_mode_strict=None):
+    """Add one standby. Returns a result dict.
+
+    `synchronous_mode` ("async"/"sync"/"quorum") applies to the leader's scope
+    only, and is applied to the running DCS once the standby is streaming —
+    setting it earlier would make a strict scope refuse writes while the clone
+    is still being taken.
+    """
     plan, metadata = state.load(cluster_name, db_password=db_password)
     plan.db_password = state.resolve_password(plan, explicit=db_password)
 
     log = run_logger or RunLogger(new_run_id(f"{cluster_name}-add-standby"))
     executors = {}
     started = time.time()
+    warnings = []
 
     try:
         try:
@@ -235,6 +243,37 @@ def add(cluster_name, leader_name, host_name=None, db_password=None,
             raise StandbyError(f"{name} joined but does not appear in the DCS")
         log.step_end("passed", roles)
 
+        # --- replication mode -----------------------------------------
+        # Only now: bootstrap.dcs was read when the scope was created, so a
+        # running cluster takes this through patronictl, and a strict scope
+        # must not be told to wait for a standby that is not streaming yet.
+        if synchronous_mode is not None:
+            leader.synchronous_mode = patroni_management.normalise_sync_mode(
+                synchronous_mode)
+            if synchronous_node_count:
+                leader.synchronous_node_count = int(synchronous_node_count)
+        if synchronous_mode_strict is not None:
+            plan.synchronous_mode_strict = bool(synchronous_mode_strict)
+
+        log.step_start("Set the replication mode",
+                       patroni_management.describe_sync(plan, leader))
+        applied, output = patroni_management.apply_sync_settings(
+            leader_executor, plan, leader, node_name=leader.name
+        )
+        if applied:
+            log.step_end("passed",
+                         patroni_management.describe_sync(plan, leader))
+        else:
+            # The standby is up and streaming either way; only the durability
+            # guarantee is missing, so this is reported, not fatal.
+            log.step_end("failed", output[:200])
+            warnings.append(
+                f"could not set the replication mode on {leader.scope}: "
+                f"{output[:200]}. The standby is streaming asynchronously; "
+                f"apply it by hand with `patronictl -c {leader.config_file} "
+                f"edit-config {leader.scope}`"
+            )
+
         snapshot = health.snapshot(plan, run_logger=log)
         state.save(plan, extra={
             **metadata,
@@ -262,6 +301,7 @@ def add(cluster_name, leader_name, host_name=None, db_password=None,
             "host": target_host.name,
             "duration": duration,
             "steps": log.steps,
+            "warnings": warnings,
             "health": snapshot,
             "plan": plan,
             "log_dir": str(log.root),

@@ -12,7 +12,9 @@ from deployment.cli import build_parser
 def node_add_args(**overrides):
     args = dict(cluster=None, db_password=None, inventory=None, host=None,
                 name="n3", source=None, role="leader", leader=None,
-                pg_version="", spock_major="", spock_branch="", skip_verify=False)
+                pg_version="", spock_major="", spock_branch="",
+                sync_mode=None, sync_count=None, sync_strict=False,
+                skip_verify=False)
     args.update(overrides)
     return types.SimpleNamespace(**args)
 

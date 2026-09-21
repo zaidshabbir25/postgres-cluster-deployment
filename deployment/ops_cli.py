@@ -178,6 +178,9 @@ def cmd_node_add(args):
             leader_name=args.leader,
             host_name=args.host,
             db_password=args.db_password,
+            synchronous_mode=args.sync_mode,
+            synchronous_node_count=args.sync_count,
+            synchronous_mode_strict=args.sync_strict or None,
         )
         kind = "add-standby"
     else:
@@ -185,6 +188,12 @@ def cmd_node_add(args):
             print("--leader only applies with --role standby; a Spock node "
                   "leads its own scope. Use --source to choose the node the "
                   "join runs through.", file=sys.stderr)
+            return EXIT_USAGE
+        if args.sync_mode or args.sync_count or args.sync_strict:
+            print("--sync-mode, --sync-count and --sync-strict describe how a "
+                  "leader replicates to its standbys, so they apply with "
+                  "--role standby. A new Spock node starts its own scope with "
+                  "no standby to replicate to.", file=sys.stderr)
             return EXIT_USAGE
         result = add_node.add(
             cluster_name=cluster,
@@ -966,6 +975,17 @@ def _register_node(subparsers, add_common):
     adding.add_argument("--spock-branch", default="",
                         help="Spock git branch to build, for a source-built "
                              "cluster [the cluster's]")
+    adding.add_argument("--sync-mode", default=None,
+                        choices=("off", "on", "quorum", "async", "sync"),
+                        help="with --role standby: how the leader replicates "
+                             "to it — async/off, sync/on, or quorum "
+                             "[the cluster's]")
+    adding.add_argument("--sync-count", type=int, default=None,
+                        help="with --role standby: synchronous standbys in "
+                             "that scope [1]")
+    adding.add_argument("--sync-strict", action="store_true",
+                        help="with --role standby and a synchronous mode: "
+                             "block writes when no standby is available")
     adding.add_argument("--skip-verify", action="store_true")
     adding.set_defaults(func=cmd_node_add)
 

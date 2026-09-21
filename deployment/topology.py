@@ -18,6 +18,7 @@ Placement rules, in priority order:
 """
 
 from aspects import etcd_management, platform_detect
+from aspects.patroni_management import normalise_sync_mode as patroni_sync_mode
 from aspects.cluster_model import ClusterPlan, Node, ROLE_SPOCK, ROLE_STANDBY
 
 DEFAULT_DATA_ROOT = "/var/lib/pgedge"
@@ -53,7 +54,9 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
                  repo_channel="release", deploy_mode="packages",
                  base_pg_port=5432, base_restapi_port=8008,
                  data_root=DEFAULT_DATA_ROOT, extra_hba_cidrs=None,
-                 source_build=None, zodan_sql="", run_id=""):
+                 source_build=None, zodan_sql="", run_id="",
+                 synchronous_mode="off", synchronous_node_count=1,
+                 synchronous_mode_strict=False):
     """Build the ClusterPlan. Returns (plan, warnings)."""
     if not hosts:
         raise TopologyError("no hosts available — check the inventory")
@@ -204,6 +207,9 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
         base_restapi_port=base_restapi_port,
         data_root=data_root,
         zodan_sql=zodan_sql,
+        synchronous_mode=patroni_sync_mode(synchronous_mode),
+        synchronous_node_count=int(synchronous_node_count or 1),
+        synchronous_mode_strict=bool(synchronous_mode_strict),
         etcd_endpoints=etcd_management.endpoints(etcd_members),
         extra_hba_cidrs=list(extra_hba_cidrs or []),
         hosts=list(hosts),
@@ -213,7 +219,39 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
     )
 
     _check_port_collisions(plan)
+    warnings.extend(check_synchronous(plan))
     return plan, warnings
+
+
+def check_synchronous(plan):
+    """Report where the requested replication mode cannot do what it says."""
+    if plan.synchronous_mode == "off":
+        return []
+
+    notes = []
+    without = [n.name for n in plan.spock_nodes if not n.standbys]
+    if without:
+        notes.append(
+            f"synchronous replication was requested, but "
+            f"{', '.join(without)} "
+            f"{'has' if len(without) == 1 else 'have'} no standby — "
+            f"{'that scope stays' if len(without) == 1 else 'those scopes stay'} "
+            f"asynchronous until one is added (./pg_deploy_cluster.sh "
+            f"--add-node <name> --role standby --leader <node>)"
+        )
+    for node in plan.spock_nodes:
+        if node.standbys and plan.synchronous_node_count > len(node.standbys):
+            notes.append(
+                f"{node.scope} asks for {plan.synchronous_node_count} "
+                f"synchronous standbys but has {len(node.standbys)}; Patroni "
+                f"reduces the count to what exists"
+            )
+    if plan.synchronous_mode_strict:
+        notes.append(
+            "synchronous_mode_strict is on: a scope whose standby is down "
+            "refuses writes rather than falling back to asynchronous"
+        )
+    return notes
 
 
 def _check_port_collisions(plan):

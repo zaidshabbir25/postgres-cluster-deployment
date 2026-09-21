@@ -62,6 +62,10 @@ class Node:
     # Set only when this node's Spock differs from the cluster's; empty means
     # it follows ClusterPlan.spock_major.
     spock_major: str = ""
+    # Per-scope replication mode, for a leader whose scope differs from the
+    # cluster default. Empty means it follows ClusterPlan.synchronous_mode.
+    synchronous_mode: str = ""
+    synchronous_node_count: int = 0
     leader: Optional[str] = None   # for standbys: the Spock node they follow
     standbys: List[str] = field(default_factory=list)  # for Spock nodes
 
@@ -122,6 +126,14 @@ class ClusterPlan:
     data_root: str = "/var/lib/pgedge"
 
     zodan_sql: str = ""
+
+    # Replication mode for the Patroni scopes, as Patroni names it:
+    # "off" (asynchronous), "on" (synchronous) or "quorum". Patroni owns
+    # synchronous_standby_names; these settings live in the DCS, so changing
+    # them on a running cluster means patronictl edit-config, not a file.
+    synchronous_mode: str = "off"
+    synchronous_node_count: int = 1
+    synchronous_mode_strict: bool = False
     etcd_endpoints: List[str] = field(default_factory=list)
     extra_hba_cidrs: List[str] = field(default_factory=list)
 

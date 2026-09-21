@@ -80,6 +80,7 @@ def line(output, prefix):
 
 def deployment_answers(hosts="1", method="1", nodes="2", pg_major="17",
                        pg_version=None, standby="n", standby_list=None,
+                       sync="n", sync_count=None, sync_strict=None,
                        cluster="", spock_major="", channel_or_branch="",
                        db_name="", db_user="", base_port="", base_restapi="",
                        clean="n", proceed="yes"):
@@ -94,6 +95,11 @@ def deployment_answers(hosts="1", method="1", nodes="2", pg_major="17",
     answers.append(standby)
     if standby_list is not None:
         answers.append(standby_list)
+        answers.append(sync)                    # asked only when there is one
+        if sync == "y":
+            if sync_count is not None:          # asked only for several
+                answers.append(sync_count)
+            answers.append(sync_strict or "n")
     answers += [cluster, spock_major, channel_or_branch, db_name, db_user,
                 base_port, base_restapi, clean, proceed]
     return "\n".join(answers) + "\n"
@@ -206,6 +212,61 @@ def test_shared_machines_are_asked_which_ports_to_start_from(script, inventory):
     deploy = line(output, "DEPLOY:")
     assert "--base-port 6432" in deploy
     assert "--base-restapi-port 8108" in deploy
+
+
+def test_a_standby_is_asked_how_it_replicates(script, inventory):
+    """Asynchronous by default; the question only appears with a standby."""
+    plain = run(script, inventory, answers=deployment_answers())[1]
+    async_ = run(script, inventory,
+                 answers=deployment_answers(standby="y", standby_list="n1"))[1]
+    sync = run(script, inventory,
+               answers=deployment_answers(standby="y", standby_list="n1",
+                                          sync="y", sync_strict="y"))[1]
+
+    # bash prints a `read -p` prompt only to a terminal, so the question is
+    # recognised here by the explanation `say` puts above it.
+    assert "A standby can be asynchronous or synchronous" not in plain
+    assert "A standby can be asynchronous or synchronous" in async_
+    assert "--sync-mode async" in line(async_, "DEPLOY:")
+    assert "--sync-mode sync" in line(sync, "DEPLOY:")
+    assert "--sync-strict" in line(sync, "DEPLOY:")
+    assert "Strict mode refuses writes" in sync
+
+
+def test_several_standbys_are_asked_how_many_must_confirm(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(standby="y", standby_list="all",
+                                                  sync="y", sync_count="2"))
+
+    assert "--sync-count 2" in line(output, "DEPLOY:")
+
+
+def test_add_standby_is_asked_how_its_leader_replicates(script, inventory):
+    code, output = run(script, inventory, "--add-node", "n1s1",
+                       answers="2\nn1\ny\nn\n", facts=SOURCE_50)
+
+    add = line(output, "ADD:")
+    assert "--role standby" in add
+    assert "--sync-mode sync" in add
+    assert "--sync-count 1" in add
+
+
+def test_add_standby_takes_the_mode_from_flags(script, inventory):
+    code, output = run(script, inventory, "--add-node", "n1s1", "--role", "standby",
+                       "--leader", "n1", "--sync-mode", "sync", "--sync-strict",
+                       facts=SOURCE_50)
+
+    add = line(output, "ADD:")
+    assert "--sync-mode sync" in add
+    assert "--sync-strict" in add
+
+
+def test_sync_flags_make_no_sense_for_a_spock_node(script, inventory):
+    code, output = run(script, inventory, "--add-node", "n3", "--role", "leader",
+                       "--sync-mode", "sync", facts=SOURCE_50)
+
+    assert code != 0
+    assert "apply with --role standby" in output
 
 
 def test_answering_no_cancels_without_deploying(script, inventory):
