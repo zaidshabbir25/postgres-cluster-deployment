@@ -398,6 +398,37 @@ before doing any of it unless `--yes` is given.
 
 ---
 
+## Source builds and pre-releases
+
+A source build fetches one tarball from the PostgreSQL mirror, so it needs an
+exact version. The prompt asks the mirror what exists rather than guessing:
+
+```
+4) Which PostgreSQL version?
+   Major version (16, 17, 18 or 19) [17]: 19
+   A source build downloads an exact release tarball.
+   Published for 19: 19beta1 19beta2 19beta3
+
+   Exact version to build [19beta3]:
+```
+
+A major that has not reached release has only pre-releases — there is no
+`19.0` to download — so `19beta3` is as exact as it gets and is accepted
+everywhere a version is: it installs to `/opt/pgedge/pg19`, and version
+comparisons order it correctly (`19beta1 < 19beta3 < 19.0`). A version the
+mirror does not carry is refused at the prompt, and again before the download
+on the host:
+
+```
+PostgreSQL 19.0 is not published at https://ftp.postgresql.org/pub/source/...
+Available for 19: 19beta1, 19beta2, 19beta3 — the newest is 19beta3.
+```
+
+Without a network on the control machine the prompt accepts what you type and
+the check on the host still catches it.
+
+---
+
 ## Synchronous or asynchronous standbys
 
 A standby replicates asynchronously by default: commits never wait, and a

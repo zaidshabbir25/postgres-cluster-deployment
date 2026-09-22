@@ -24,6 +24,16 @@ def host():
     return probed
 
 
+# Captured before the autouse fixture replaces it, for the tests that are
+# about the download itself.
+REAL_FETCH = sb.fetch_postgres_source
+
+
+@pytest.fixture
+def real_fetch(monkeypatch):
+    monkeypatch.setattr(sb, "fetch_postgres_source", REAL_FETCH)
+
+
 @pytest.fixture(autouse=True)
 def stub_slow_steps(monkeypatch):
     """Everything that would fetch or compile, replaced by a note."""
@@ -196,8 +206,57 @@ def test_build_major_leaves_the_clusters_own_paths_alone(source_plan, host):
 
 
 def test_build_major_needs_an_exact_version(source_plan, host):
-    with pytest.raises(ValueError, match="full PostgreSQL version"):
+    with pytest.raises(ValueError, match="one exact PostgreSQL version"):
         sb.build_major(FakeExecutor(), host, source_plan, "18")
+
+
+def test_a_pre_release_counts_as_exact(source_plan, host):
+    """A major with no release yet has only betas, and they carry no minor."""
+    details = sb.build_major(FakeExecutor(), host, source_plan, "19beta3")
+
+    assert details["prefix"] == "/opt/pgedge/pg19"
+
+
+def test_the_mirror_is_asked_before_the_download(real_fetch):
+    """Otherwise an invented 19.0 surfaces as curl's 404 half an hour in."""
+    index = ' '.join(f'<a href="v{v}/">'
+                     for v in ("18.6", "19beta1", "19beta2", "19beta3"))
+    executor = FakeExecutor({"curl -fsI": (False, ""), "curl -fsSL": (True, index)})
+
+    with pytest.raises(RuntimeError) as failure:
+        sb.fetch_postgres_source(executor, "19.0")
+
+    assert "is not published" in str(failure.value)
+    assert "19beta1, 19beta2, 19beta3" in str(failure.value)
+    assert "the newest is 19beta3" in str(failure.value)
+
+
+def test_a_published_version_downloads(real_fetch):
+    executor = FakeExecutor({"curl -fsI": (True, "")})
+
+    source_dir = sb.fetch_postgres_source(executor, "19beta3")
+
+    assert source_dir == "/opt/pgedge/build/postgresql-19beta3"
+    assert executor.ran("postgresql-19beta3.tar.bz2")
+
+
+def test_an_unreachable_mirror_still_gives_a_usable_error(real_fetch):
+    executor = FakeExecutor({"curl -fsI": (False, ""), "curl -fsSL": (False, "")})
+
+    with pytest.raises(RuntimeError, match="lists nothing for 19"):
+        sb.fetch_postgres_source(executor, "19.0")
+
+
+@pytest.mark.parametrize("major, expected", [
+    ("19", ["19beta1", "19beta2", "19beta3"]),
+    ("18", ["18.6"]),
+    ("16", []),
+])
+def test_the_index_is_parsed_per_major(major, expected):
+    index = ' '.join(f'<a href="v{v}/">v{v}/</a>'
+                     for v in ("17.11", "18.6", "19beta1", "19beta2", "19beta3"))
+
+    assert sb.parse_source_index(index, major) == expected
 
 
 def test_rebuild_spock_only_touches_spock(source_plan, host):

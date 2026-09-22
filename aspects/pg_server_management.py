@@ -136,6 +136,16 @@ def is_at_least(candidate, minimum):
     return version_key(candidate) >= version_key(minimum)
 
 
+def is_exact_version(version):
+    """Does this name a single release, rather than just a major?
+
+    A source build fetches one tarball, so "17" is not enough — but "19beta3"
+    is: a major that has not reached release has only pre-releases, and they
+    carry no minor number.
+    """
+    return bool(re.match(r"^\d+(\.\d+|beta\d+|rc\d+)", str(version or "").strip()))
+
+
 def major_of(version):
     """'17.11' -> '17'."""
     match = re.match(r"^(\d+)", str(version or "").strip())

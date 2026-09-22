@@ -359,6 +359,23 @@ ask_sync_mode() {
   say ""
 }
 
+published_pg_versions() {
+  # published_pg_versions <major> -> the versions on the PostgreSQL source
+  # mirror, oldest first, one per line. Silent when there is no network: the
+  # prompt then accepts what it is given and the build reports any 404.
+  python3 - "$1" <<'PYEOF'
+import sys
+from urllib.request import urlopen
+try:
+    from aspects.source_build import PG_SOURCE_INDEX, parse_source_index
+    with urlopen(PG_SOURCE_INDEX, timeout=15) as response:
+        html = response.read().decode("utf-8", "replace")
+    print("\n".join(parse_source_index(html, sys.argv[1])))
+except Exception:
+    pass
+PYEOF
+}
+
 version_at_least() {
   # version_at_least <candidate> <minimum>
   #   0 = candidate is the same or newer
@@ -771,13 +788,29 @@ if [[ "$INTERACTIVE" == true ]]; then
   PG_VERSION=""
   if [[ "$MODE" == "source" ]]; then
     say "   ${DIM}A source build downloads an exact release tarball.${RESET}"
-    while [[ -z "$PG_VERSION" ]]; do
-      PG_VERSION="$(ask "   Exact version to build (e.g. ${PG_MAJOR}.11)" "")"
+    # Ask the mirror rather than guess: a major that has not reached release
+    # has only betas, so an invented ${PG_MAJOR}.0 is a 404 half an hour in.
+    PUBLISHED="$(published_pg_versions "$PG_MAJOR")"
+    NEWEST="$(printf '%s' "$PUBLISHED" | tail -n 1)"
+    if [[ -n "$PUBLISHED" ]]; then
+      say "   ${DIM}Published for $PG_MAJOR: $(printf '%s' "$PUBLISHED" | tr '\n' ' ')${RESET}"
+    fi
+    say ""
+    for _ in 1 2 3 4 5; do
+      PG_VERSION="$(ask "   Exact version to build" "${NEWEST:-}")"
       if [[ ! "$PG_VERSION" =~ ^${PG_MAJOR}(\.[0-9]+|beta[0-9]+|rc[0-9]+) ]]; then
-        warn "That does not look like a $PG_MAJOR release (expected ${PG_MAJOR}.x)."
+        warn "That does not look like a $PG_MAJOR release (expected ${PG_MAJOR}.x, ${PG_MAJOR}betaN or ${PG_MAJOR}rcN)."
         PG_VERSION=""
+        continue
       fi
+      if [[ -n "$PUBLISHED" ]] && ! printf '%s\n' "$PUBLISHED" | grep -qx "$PG_VERSION"; then
+        warn "PostgreSQL $PG_VERSION is not published; the newest for $PG_MAJOR is $NEWEST."
+        PG_VERSION=""
+        continue
+      fi
+      break
     done
+    [[ -n "$PG_VERSION" ]] || die "no published PostgreSQL version chosen for $PG_MAJOR"
   fi
   say ""
 
