@@ -398,6 +398,88 @@ before doing any of it unless `--yes` is given.
 
 ---
 
+## Source builds and pre-releases
+
+A source build fetches one tarball from the PostgreSQL mirror, so it needs an
+exact version. The prompt asks the mirror what exists rather than guessing:
+
+```
+4) Which PostgreSQL version?
+   Major version (16, 17, 18 or 19) [17]: 19
+   A source build downloads an exact release tarball.
+   Published for 19: 19beta1 19beta2 19beta3
+
+   Exact version to build [19beta3]:
+```
+
+A major that has not reached release has only pre-releases — there is no
+`19.0` to download — so `19beta3` is as exact as it gets and is accepted
+everywhere a version is: it installs to `/opt/pgedge/pg19`, and version
+comparisons order it correctly (`19beta1 < 19beta3 < 19.0`). A version the
+mirror does not carry is refused at the prompt, and again before the download
+on the host:
+
+```
+PostgreSQL 19.0 is not published at https://ftp.postgresql.org/pub/source/...
+Available for 19: 19beta1, 19beta2, 19beta3 — the newest is 19beta3.
+```
+
+Without a network on the control machine the prompt accepts what you type and
+the check on the host still catches it.
+
+---
+
+## Synchronous or asynchronous standbys
+
+A standby replicates asynchronously by default: commits never wait, and a
+failover can lose the last few. Synchronous replication holds each commit until
+a standby confirms it, at the cost of a round trip per write. The deployment
+asks once a standby is requested, and `--add-node --role standby` asks again for
+that scope:
+
+```
+   Synchronous replication to the standby? (y/n) [n]: y
+   How many standbys must confirm each commit [1]: 1
+   Refuse writes when no standby is available? (y/n) [n]: n
+```
+
+or, without the prompts:
+
+```bash
+./pg_deploy_cluster.sh --nodes 2 --standby n1,n2 --sync-mode sync --sync-count 1
+./pg_deploy_cluster.sh --add-node n1s1 --role standby --leader n1 --sync-mode sync
+```
+
+The answers become Patroni's own settings, in the DCS of the scope they apply
+to:
+
+```yaml
+synchronous_mode: on          # off (default), on, or quorum
+synchronous_node_count: 1     # standbys that must confirm each commit
+synchronous_mode_strict: false
+```
+
+Patroni computes `synchronous_standby_names` from these — never set it by hand.
+
+Three things worth knowing:
+
+- **It is per scope.** Each Spock node leads its own Patroni scope, so the mode
+  belongs to one node and its standbys. A scope with no standby is left
+  asynchronous whatever you ask for: under `synchronous_mode_strict` such a
+  scope would refuse writes forever.
+- **Without `--sync-strict`, synchronous degrades to asynchronous** when no
+  standby is available, so writes continue but are no longer guaranteed to be
+  replicated. With it they block instead — durability over availability.
+- **These live in the DCS, not in a file.** A new scope gets them from
+  `bootstrap.dcs`; a running one is changed through `patronictl edit-config`,
+  which is what `--add-node --role standby --sync-mode ...` does for you, after
+  the standby is streaming.
+
+`quorum` (Patroni's quorum-based commit, where any N of the standbys may
+confirm) is accepted wherever `sync` is.
+
+---
+
 ## Growing a running cluster
 
 ```bash
@@ -481,6 +563,28 @@ standby.
 
 This is the same operation as `./pg_cluster_ctl.sh node add`, which also lets
 the name default to the next free `nN`.
+
+---
+
+## Tests
+
+[![Regression](https://github.com/zaidshabbir25/postgres-cluster-deployment/actions/workflows/regression.yml/badge.svg)](https://github.com/zaidshabbir25/postgres-cluster-deployment/actions/workflows/regression.yml)
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Around 230 unit tests, two seconds, no machine touched: every module reaches
+hosts through an executor, so a recording stand-in for it drives the whole
+deployment and the tests assert on the commands that would have run. The shell
+script is covered too — `tests/test_deploy_script.py` runs it with its `exec`
+hand-offs stubbed, checking each prompt against the `deployment.cli` command
+line it produces. See [tests/README.md](tests/README.md).
+
+Every pull request runs the same suite on Python 3.9 (what Rocky 9 ships) and
+3.12, checks the shell scripts parse and are intact, and imports every module —
+see [.github/workflows/regression.yml](.github/workflows/regression.yml).
 
 ---
 

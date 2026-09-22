@@ -1,0 +1,150 @@
+name: Regression
+
+# Every pull request runs the suite before anyone reads the diff, and main is
+# checked again after a merge so a bad combination of two green PRs is caught.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to the same PR supersedes the run in flight.
+concurrency:
+  group: regression-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is what Rocky 9 ships and therefore what the control machine
+        # usually runs; the newest is where the dependencies move first.
+        python: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run the regression suite
+        run: pytest -q --junitxml=test-results.xml
+
+      - name: Publish the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-python-${{ matrix.python }}
+          path: test-results.xml
+          if-no-files-found: ignore
+
+  shell:
+    name: shell scripts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check syntax
+        run: |
+          for script in *.sh; do
+            echo "== $script"
+            bash -n "$script"
+          done
+
+      - name: Check the entry points are intact
+        # A commit once truncated pg_deploy_cluster.sh to a single byte and the
+        # repository carried a one-line deploy script for a day. Size and a
+        # couple of landmarks are enough to catch that class of accident.
+        run: |
+          fail=0
+          check() {
+            local script="$1" minimum="$2"; shift 2
+            local size
+            size=$(wc -c < "$script")
+            if [ "$size" -lt "$minimum" ]; then
+              echo "::error file=$script::$script is $size bytes, expected at least $minimum — truncated?"
+              fail=1
+            fi
+            for landmark in "$@"; do
+              if ! grep -q -- "$landmark" "$script"; then
+                echo "::error file=$script::$script no longer contains '$landmark'"
+                fail=1
+              fi
+            done
+          }
+          check pg_deploy_cluster.sh 20000 "Usage: ./pg_deploy_cluster.sh" "--add-node" "--cleanup"
+          check pg_cluster_ctl.sh     1000 "#!/usr/bin/env bash"
+          check pg_cluster_status.sh   500 "#!/usr/bin/env bash"
+          check pg_dashboard.sh        500 "#!/usr/bin/env bash"
+          exit $fail
+
+      - name: shellcheck
+        # Advisory: the scripts predate it, so a finding annotates the PR
+        # rather than blocking it.
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=error *.sh || true
+
+  imports:
+    name: imports
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Every module imports cleanly
+        # The tests import most of the tree, but not all of it; a module that
+        # only the dashboard or a report touches still has to load.
+        run: |
+          python - <<'PY'
+          import importlib
+          import pkgutil
+          import sys
+
+          failures = []
+          for package_name in ("aspects", "deployment", "reports"):
+              try:
+                  package = importlib.import_module(package_name)
+              except ModuleNotFoundError:
+                  continue
+              for module in pkgutil.iter_modules(package.__path__):
+                  name = f"{package_name}.{module.name}"
+                  try:
+                      importlib.import_module(name)
+                  except Exception as exc:                       # noqa: BLE001
+                      failures.append(f"{name}: {exc!r}")
+
+          for failure in failures:
+              print(f"::error::{failure}")
+          print(f"{'FAILED' if failures else 'ok'}: {len(failures)} import failure(s)")
+          sys.exit(1 if failures else 0)
+          PY

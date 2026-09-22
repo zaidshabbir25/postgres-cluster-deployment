@@ -13,15 +13,18 @@ source build, and pulling in a Go toolchain to get etcd would double the
 prerequisites.
 """
 
+import re
 import shlex
 
-from aspects import etcd_management, package_management, platform_detect, service_management
+from aspects import (etcd_management, package_management, pg_server_management,
+                     platform_detect, service_management)
 
 BUILD_ROOT = "/opt/pgedge/build"
 INSTALL_ROOT = "/opt/pgedge"
 PATRONI_VENV = "/opt/pgedge/patroni-venv"
 
 PG_SOURCE_URL = "https://ftp.postgresql.org/pub/source/v{version}/postgresql-{version}.tar.bz2"
+PG_SOURCE_INDEX = "https://ftp.postgresql.org/pub/source/"
 SPOCK_REPO = "https://github.com/pgEdge/spock.git"
 ETCD_RELEASE_URL = (
     "https://github.com/etcd-io/etcd/releases/download/v{version}/"
@@ -126,11 +129,50 @@ def ensure_postgres_user(executor, db_user, family, node=None):
     return home
 
 
+def parse_source_index(html, pg_major=""):
+    """Versions published on the PostgreSQL source mirror, newest last.
+
+    The index is a directory listing of vNN.N and vNNbetaN entries; a major
+    that has not reached release yet has only pre-releases, which is why
+    asking for 19.0 today gets a 404 while 19beta3 is right there.
+    """
+    found = set()
+    for match in re.finditer(r'v(\d+(?:\.\d+|beta\d+|rc\d+)?)/', html or ""):
+        version = match.group(1)
+        if not pg_major or pg_server_management.major_of(version) == str(pg_major):
+            found.add(version)
+    return sorted(found, key=pg_server_management.version_key)
+
+
+def published_versions(executor, pg_major, node=None):
+    """Ask the mirror which versions of a major exist. [] if it cannot say."""
+    ok, output = executor.try_run(
+        f"curl -fsSL --max-time 30 {shlex.quote(PG_SOURCE_INDEX)}", node=node
+    )
+    return parse_source_index(output, pg_major) if ok else []
+
+
 def fetch_postgres_source(executor, pg_version, node=None):
     """Download and unpack the PostgreSQL tarball. Returns the source dir."""
     tarball = f"postgresql-{pg_version}.tar.bz2"
     source_dir = f"{BUILD_ROOT}/postgresql-{pg_version}"
     url = PG_SOURCE_URL.format(version=pg_version)
+
+    # Checked before the download so the failure names the versions that do
+    # exist, rather than surfacing as curl's bare 404 after the build has
+    # already installed its toolchain.
+    exists, _ = executor.try_run(
+        f"curl -fsI --max-time 30 {shlex.quote(url)} >/dev/null", node=node
+    )
+    if not exists:
+        major = pg_server_management.major_of(pg_version)
+        available = published_versions(executor, major, node=node)
+        raise RuntimeError(
+            f"PostgreSQL {pg_version} is not published at {url}."
+            + (f" Available for {major}: {', '.join(available)} — the newest is "
+               f"{available[-1]}." if available else
+               f" The mirror lists nothing for {major}; check the version.")
+        )
 
     executor.run(f"mkdir -p {BUILD_ROOT}", node=node)
     executor.run(
@@ -414,9 +456,10 @@ def build_major(executor, host, plan, pg_version, spock_branch=None,
     Nothing about the existing installation is touched — a different major
     installs to its own prefix.
     """
-    if not pg_version or "." not in str(pg_version):
+    if not pg_server_management.is_exact_version(pg_version):
         raise ValueError(
-            f"A source build needs a full PostgreSQL version (e.g. 18.6), got "
+            f"A source build needs one exact PostgreSQL version to fetch — "
+            f"18.6, or 19beta3 for a major that has no release yet — got "
             f"{pg_version!r}."
         )
 
@@ -424,7 +467,7 @@ def build_major(executor, host, plan, pg_version, spock_branch=None,
     spock_branch = (spock_branch or spec.get("spock_branch")
                     or default_spock_branch(plan.spock_major))
     jobs = spec.get("jobs")
-    pg_major = pg_version.split(".")[0]
+    pg_major = pg_server_management.major_of(pg_version)   # "19beta3" -> "19"
     details = {"host": host.name, "pg_version": pg_version,
                "spock_branch": spock_branch}
 
@@ -490,9 +533,10 @@ def build_host(executor, host, plan, run_logger=None):
     etcd_version = spec.get("etcd_version", DEFAULT_ETCD_VERSION)
     jobs = spec.get("jobs")
 
-    if not pg_version or "." not in str(pg_version):
+    if not pg_server_management.is_exact_version(pg_version):
         raise ValueError(
-            f"A source build needs a full PostgreSQL version (e.g. 17.11), got "
+            f"A source build needs one exact PostgreSQL version to fetch — "
+            f"17.11, or 19beta3 for a major that has no release yet — got "
             f"{pg_version!r}. Set source_build.pg_version or pass --pg-version."
         )
 

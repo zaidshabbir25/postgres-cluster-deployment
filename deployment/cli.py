@@ -114,6 +114,9 @@ def cmd_deploy(args):
         "clean": args.clean,
         "skip_verify": args.skip_verify,
         "zodan_sql": args.zodan_sql,
+        "synchronous_mode": args.sync_mode,
+        "synchronous_node_count": args.sync_count,
+        "synchronous_mode_strict": args.sync_strict,
     }
 
     if args.mode == "source":
@@ -168,6 +171,9 @@ def _cmd_plan(args):
         base_restapi_port=int(args.base_restapi_port or defaults.get("base_restapi_port", 8008)),
         data_root=args.data_root or defaults.get("data_root", topology.DEFAULT_DATA_ROOT),
         extra_hba_cidrs=_split_list(args.hba_cidr),
+        synchronous_mode=args.sync_mode,
+        synchronous_node_count=args.sync_count,
+        synchronous_mode_strict=args.sync_strict,
     )
 
     if getattr(args, "json", False):
@@ -355,6 +361,9 @@ def cmd_add_standby(args):
         leader_name=args.leader,
         host_name=args.host,
         db_password=args.db_password,
+        synchronous_mode=args.sync_mode,
+        synchronous_node_count=args.sync_count,
+        synchronous_mode_strict=args.sync_strict or None,
     )
 
     if result["outcome"] == "succeeded":
@@ -506,6 +515,15 @@ def build_parser():
     deploy.add_argument("--data-root", default=topology.DEFAULT_DATA_ROOT)
     deploy.add_argument("--hba-cidr", action="append",
                         help="extra CIDR to allow in pg_hba (repeatable)")
+    deploy.add_argument("--sync-mode", default="off",
+                        choices=("off", "on", "quorum", "async", "sync"),
+                        help="replication to the standbys: async/off, sync/on, "
+                             "or quorum [off]")
+    deploy.add_argument("--sync-count", type=int, default=1,
+                        help="synchronous standbys per scope [1]")
+    deploy.add_argument("--sync-strict", action="store_true",
+                        help="block writes when no standby is available, "
+                             "instead of falling back to asynchronous")
     deploy.add_argument("--zodan-sql", default="",
                         help="override the zodan script (default: chosen by "
                              "--spock-major)")
@@ -543,6 +561,10 @@ def build_parser():
     plan_parser.add_argument("--base-restapi-port", type=int, default=8008)
     plan_parser.add_argument("--data-root", default=topology.DEFAULT_DATA_ROOT)
     plan_parser.add_argument("--hba-cidr", action="append")
+    plan_parser.add_argument("--sync-mode", default="off",
+                             choices=("off", "on", "quorum", "async", "sync"))
+    plan_parser.add_argument("--sync-count", type=int, default=1)
+    plan_parser.add_argument("--sync-strict", action="store_true")
     plan_parser.add_argument("--json", action="store_true")
     plan_parser.set_defaults(func=_cmd_plan)
 
@@ -565,6 +587,14 @@ def build_parser():
                          help="Spock node the standby follows (e.g. n1)")
     standby.add_argument("--host", help="host to place it on (default: a host "
                                         "other than the leader's)")
+    standby.add_argument("--sync-mode", default=None,
+                         choices=("off", "on", "quorum", "async", "sync"),
+                         help="how the leader replicates to it: async/off, "
+                              "sync/on, or quorum [the cluster's]")
+    standby.add_argument("--sync-count", type=int, default=None,
+                         help="synchronous standbys in that scope [1]")
+    standby.add_argument("--sync-strict", action="store_true",
+                         help="block writes when no standby is available")
     standby.set_defaults(func=cmd_add_standby)
 
     # --- remove -------------------------------------------------------

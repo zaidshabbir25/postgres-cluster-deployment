@@ -401,12 +401,13 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                 # compiled into its own prefix, alongside whatever is already
                 # installed — refusing would leave the node unbuildable, since
                 # no repository supplies this cluster's servers.
-                if "." not in str(wanted_version):
+                if not pg_server_management.is_exact_version(wanted_version):
                     log.step_end("failed", "no exact version to build")
                     raise AddNodeError(
                         f"This cluster is built from source, so {name} needs an "
-                        f"exact PostgreSQL version to compile (e.g. "
-                        f"{wanted_major}.1), not {wanted_version!r}."
+                        f"exact PostgreSQL version to compile — {wanted_major}.1, "
+                        f"or {wanted_major}beta3 for a major with no release "
+                        f"yet — not {wanted_version!r}."
                     )
                 log.info(f"    building PostgreSQL {wanted_version} from source "
                          f"— this takes 20-40 minutes")

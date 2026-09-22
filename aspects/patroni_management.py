@@ -43,6 +43,55 @@ DEFAULT_LOOP_WAIT = 10
 DEFAULT_RETRY_TIMEOUT = 10
 MAX_LAG_ON_FAILOVER = 1048576  # 1 MB
 
+# Patroni's replication modes, as it spells them.
+SYNC_OFF, SYNC_ON, SYNC_QUORUM = "off", "on", "quorum"
+SYNC_MODES = (SYNC_OFF, SYNC_ON, SYNC_QUORUM)
+
+
+def normalise_sync_mode(value):
+    """Accept the words people use and return what Patroni expects.
+
+    Patroni takes off/on/quorum (and booleans). "async"/"sync" are what the
+    prompts and flags offer, because that is what the choice is called.
+    """
+    text = str(value if value is not None else "").strip().lower()
+    if text in ("", "off", "false", "no", "async", "asynchronous"):
+        return SYNC_OFF
+    if text in ("on", "true", "yes", "sync", "synchronous"):
+        return SYNC_ON
+    if text == "quorum":
+        return SYNC_QUORUM
+    raise ValueError(
+        f"unknown replication mode {value!r}; use one of: async (off), "
+        f"sync (on), quorum"
+    )
+
+
+def sync_settings(plan, node):
+    """The DCS block governing one scope's replication mode.
+
+    A scope is one Spock node plus its own standbys, so the mode is per scope:
+    a leader may carry its own, otherwise the cluster's applies. Empty when
+    replication is asynchronous, which is Patroni's default and needs nothing
+    written — and empty, too, for a scope with no standby at all: there is
+    nothing to replicate synchronously to, and under synchronous_mode_strict
+    such a scope would refuse writes forever.
+    """
+    mode = normalise_sync_mode(getattr(node, "synchronous_mode", "")
+                               or plan.synchronous_mode)
+    if mode == SYNC_OFF or not node.standbys:
+        return {}
+
+    count = (getattr(node, "synchronous_node_count", 0)
+             or plan.synchronous_node_count or 1)
+    settings = {"synchronous_mode": mode, "synchronous_node_count": int(count)}
+    if plan.synchronous_mode_strict:
+        # Without this Patroni drops to asynchronous when no standby is
+        # available, so writes continue but are no longer guaranteed to be
+        # replicated. With it they block instead.
+        settings["synchronous_mode_strict"] = True
+    return settings
+
 
 def config_path(node_name):
     return f"{CONFIG_DIR}/{node_name}.yml"
@@ -164,6 +213,10 @@ def build_config(plan, node):
             dcs["slots"] = {
                 standby: {"type": "physical"} for standby in node.standbys
             }
+        # Synchronous replication is a property of the scope, so it belongs
+        # beside the slots. Patroni computes synchronous_standby_names from it
+        # and rejects a hand-written one.
+        dcs.update(sync_settings(plan, node))
 
         config["bootstrap"] = {
             "dcs": dcs,
@@ -739,6 +792,45 @@ def rest_health(executor, node, node_name=None):
 # ---------------------------------------------------------------------------
 # Operations
 # ---------------------------------------------------------------------------
+
+
+def apply_sync_settings(executor, plan, node, node_name=None):
+    """Push this scope's replication mode into a running cluster's DCS.
+
+    bootstrap.dcs is read once, when the scope is first created; everything
+    after that has to go through patronictl edit-config. Returns (ok, detail);
+    a scope that is asynchronous has its settings cleared rather than left
+    behind. Patroni applies the change on its next HA loop.
+    """
+    settings = sync_settings(plan, node)
+    if settings:
+        pairs = [f"{key}={str(value).lower() if isinstance(value, bool) else value}"
+                 for key, value in settings.items()]
+    else:
+        # `key=null` is how patronictl removes a key from the DCS config.
+        pairs = ["synchronous_mode=off"]
+
+    binary = patronictl_binary(executor, node=node_name)
+    arguments = " ".join(f"-s {shlex.quote(pair)}" for pair in pairs)
+    ok, output = executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} edit-config "
+        f"{shlex.quote(node.scope)} --force {arguments} 2>&1",
+        node=node_name,
+    )
+    return ok, output.strip()
+
+
+def describe_sync(plan, node):
+    """One line saying how this scope replicates, for a log or a report."""
+    settings = sync_settings(plan, node)
+    if not settings:
+        return f"{node.scope}: asynchronous replication"
+    strict = " (strict: writes block when no standby is available)" \
+        if settings.get("synchronous_mode_strict") else \
+        " (falls back to asynchronous when no standby is available)"
+    return (f"{node.scope}: {settings['synchronous_mode']} synchronous "
+            f"replication, {settings['synchronous_node_count']} synchronous "
+            f"standby(s){strict}")
 
 
 def switchover(executor, node, candidate, node_name=None):

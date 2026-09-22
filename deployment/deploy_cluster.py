@@ -428,7 +428,12 @@ class ClusterDeployer:
 
         if failures:
             raise RuntimeError("\n\n".join(failures))
-        return f"{len(standbys)} standby node(s) streaming from their leaders"
+
+        for node in self.plan.spock_nodes:
+            if node.standbys:
+                self.log.info(f"    {patroni_management.describe_sync(self.plan, node)}")
+        return (f"{len(standbys)} standby node(s) streaming from their leaders"
+                f" ({self.plan.synchronous_mode} synchronous mode)")
 
     def step_validate_patroni(self):
         problems, scopes = [], {}
@@ -795,6 +800,17 @@ def deploy(options):
         extra_hba_cidrs=options.get("hba_cidrs") or defaults.get("hba_cidrs", []),
         source_build=options.get("source_build") or defaults.get("source_build", {}),
         zodan_sql=options.get("zodan_sql") or pins.get("zodan_sql", ""),
+        synchronous_mode=options.get("synchronous_mode")
+        or defaults.get("synchronous_mode", "off"),
+        synchronous_node_count=int(
+            options.get("synchronous_node_count")
+            or defaults.get("synchronous_node_count", 1)
+        ),
+        synchronous_mode_strict=bool(
+            options.get("synchronous_mode_strict")
+            if options.get("synchronous_mode_strict") is not None
+            else defaults.get("synchronous_mode_strict", False)
+        ),
         run_id=run_id,
     )
 
