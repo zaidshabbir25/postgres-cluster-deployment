@@ -745,6 +745,14 @@ class ClusterDeployer:
                     f"    # or: psql service={node.name}"
                 )
 
+            self.log.info("")
+            self.log.info("Each node keeps its own PostgreSQL log:")
+            for node in self.plan.nodes:
+                self.log.info(
+                    f"  {node.name:<6} {pg_server_management.log_directory(node)}"
+                )
+            self.log.info("  ./pg_cluster_ctl.sh db logs --node n1")
+
         if result["warnings"]:
             self.log.info("")
             self.log.info(f"Warnings ({len(result['warnings'])}):")

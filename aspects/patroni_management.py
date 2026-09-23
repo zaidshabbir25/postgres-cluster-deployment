@@ -194,6 +194,12 @@ def build_config(plan, node):
         parameters = pg_server_management.spock_guc_parameters(
             plan.pg_version or plan.pg_major
         )
+        # The server's own log, under <data_dir>/log. In the DCS rather than
+        # in postgresql.conf because Patroni rewrites that file, and because
+        # every member of the scope should log the same way.
+        parameters.update(
+            pg_server_management.logging_parameters(plan.log_retention_days)
+        )
         # Patroni renders postgresql.conf itself, so these belong in the DCS
         # parameters block rather than being appended to a file it will rewrite.
         dcs = {
@@ -792,6 +798,33 @@ def rest_health(executor, node, node_name=None):
 # ---------------------------------------------------------------------------
 # Operations
 # ---------------------------------------------------------------------------
+
+
+def apply_logging_settings(executor, plan, node, node_name=None):
+    """Turn on the server log for a scope that is already running.
+
+    bootstrap.dcs applies once, when the scope is created, so a cluster
+    deployed before this existed has to be told through patronictl. Returns
+    (ok, detail). logging_collector needs a restart to take effect; the caller
+    is told so rather than restarted behind its back.
+    """
+    parameters = pg_server_management.logging_parameters(plan.log_retention_days)
+    binary = patronictl_binary(executor, node=node_name)
+    arguments = " ".join(
+        f"-s {shlex.quote(f'postgresql.parameters.{key}={value}')}"
+        for key, value in parameters.items()
+    )
+    ok, output = executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} edit-config "
+        f"{shlex.quote(node.scope)} --force {arguments} 2>&1",
+        node=node_name,
+    )
+    if not ok:
+        return False, output.strip()
+    return True, (
+        f"{node.scope} logs to {pg_server_management.log_directory(node)} "
+        f"after a restart: patronictl -c {node.config_file} restart {node.scope}"
+    )
 
 
 def apply_sync_settings(executor, plan, node, node_name=None):

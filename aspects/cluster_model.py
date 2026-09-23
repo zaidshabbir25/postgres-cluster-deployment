@@ -131,6 +131,10 @@ class ClusterPlan:
     # "off" (asynchronous), "on" (synchronous) or "quorum". Patroni owns
     # synchronous_standby_names; these settings live in the DCS, so changing
     # them on a running cluster means patronictl edit-config, not a file.
+    # Days of PostgreSQL server log to keep under <data_dir>/log. 7 rotates
+    # one file per weekday, which is what most people want and needs no cron.
+    log_retention_days: int = 7
+
     synchronous_mode: str = "off"
     synchronous_node_count: int = 1
     synchronous_mode_strict: bool = False

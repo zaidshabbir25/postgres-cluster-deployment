@@ -143,6 +143,43 @@ def guc_show(executor, plan, node, pattern="%"):
     )
 
 
+def server_log(executor, plan, node, lines=100, follow_file=None):
+    """Read a node's PostgreSQL log from under its data directory.
+
+    Separate from `service logs`, which shows the unit's journal: the journal
+    carries Patroni's view of events, while this is the server's own account —
+    checkpoints, lock waits, recovery, the statements that failed.
+
+    Returns (path, text). An empty path means the node is not logging to a
+    file, which is worth saying plainly rather than showing nothing.
+    """
+    directory = pg.log_directory(node)
+    ok, listing = executor.try_run(
+        f"ls -1t {shlex.quote(directory)}/*.log 2>/dev/null | head -n 20",
+        node=node.name,
+    )
+    files = [line.strip() for line in (listing or "").splitlines() if line.strip()]
+    if not ok or not files:
+        return "", (
+            f"no log files under {directory}. The server logs to its stderr "
+            f"unless logging_collector is on — turn it on with "
+            f"`db logging-on --node {node.name}`."
+        )
+
+    path = follow_file or files[0]
+    _, text = executor.try_run(
+        f"tail -n {int(lines)} {shlex.quote(path)}", node=node.name
+    )
+    return path, text
+
+
+def enable_server_log(executor, plan, node):
+    """Make a running scope keep its server log under <data_dir>/log."""
+    return patroni_management.apply_logging_settings(
+        executor, plan, node, node_name=node.name
+    )
+
+
 def guc_set(executor, plan, node, guc_name, guc_value, through_patroni=True):
     """Set a GUC.
 

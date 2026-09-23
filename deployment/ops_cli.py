@@ -531,6 +531,27 @@ def cmd_db(args):
             print(f"{'OK' if ok else 'FAILED'}: {message}")
             return EXIT_OK if ok else EXIT_FAIL
 
+        if action == "logs":
+            path, text = db.server_log(executor, plan, node, lines=args.lines)
+            if args.json:
+                print(json.dumps({"node": node.name, "path": path,
+                                  "log": text}, indent=2))
+            else:
+                print(f"  {node.name}: {path or 'no log file'}")
+                print(text)
+            return EXIT_OK if path else EXIT_FAIL
+
+        if action == "logging-on":
+            targets = plan.spock_nodes if args.all_nodes else [node]
+            failures = []
+            for target in targets:
+                ok, message = db.enable_server_log(executor_for(target), plan,
+                                                   target)
+                print(f"{'OK' if ok else 'FAILED'}: {target.name} — {message}")
+                if not ok:
+                    failures.append(target.name)
+            return EXIT_FAIL if failures else EXIT_OK
+
         if action == "guc-reset":
             ok, output = db.guc_reset(executor, plan, node, args.name)
             print(f"{'OK' if ok else 'FAILED'}: {args.name} reset. {output[:400]}")
@@ -1143,6 +1164,14 @@ def _register_db(subparsers, add_common):
     p.add_argument("value")
     p.add_argument("--local-only", action="store_true",
                    help="ALTER SYSTEM on this node only; Patroni may revert it")
+
+    p = base("logs", "read a node's PostgreSQL log from under its data directory")
+    p.add_argument("--lines", type=int, default=100,
+                   help="how many lines to show [100]")
+
+    p = base("logging-on", "make a scope keep its server log under <data_dir>/log")
+    p.add_argument("--all-nodes", action="store_true",
+                   help="every Spock node, not just this one")
 
     p = base("guc-reset", "remove a GUC override from the DCS")
     p.add_argument("name")

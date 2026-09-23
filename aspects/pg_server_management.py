@@ -88,6 +88,55 @@ def output_plugin_libraries_guc(pg_version, libraries=None, quoted=True):
     return {"output_plugin_libraries": f"'{value}'" if quoted else value}
 
 
+# PostgreSQL's own log, kept inside each node's data directory. A relative
+# log_directory is resolved against the data directory, so every node's log
+# lands beside its data rather than in a shared place where two nodes on one
+# machine would write over each other.
+LOG_DIRECTORY = "log"
+
+
+def logging_parameters(retention_days=7):
+    """GUCs that make the server keep its own log under <data_dir>/log.
+
+    Without logging_collector the server writes to stderr, which systemd hands
+    to the journal and Patroni's unit swallows — so there is no file to read
+    when a node misbehaves, and nothing under the data directory at all.
+
+    The default rotation keeps one file per day of the week and truncates when
+    it comes round again, so the directory never grows without bound and needs
+    no cron job to tidy it.
+    """
+    days = max(1, min(int(retention_days or 7), 31))
+    filename = "postgresql-%a.log" if days == 7 else "postgresql-%Y-%m-%d.log"
+    return {
+        "logging_collector": "on",
+        "log_destination": "stderr",
+        "log_directory": LOG_DIRECTORY,
+        "log_filename": filename,
+        # Rotate daily, truncating a file from the previous cycle rather than
+        # appending to it.
+        "log_rotation_age": "1d",
+        "log_rotation_size": "100MB",
+        "log_truncate_on_rotation": "on",
+        "log_file_mode": "0600",
+        # Who did what, where, and when — a log line without this is hard to
+        # match against a replication problem.
+        "log_line_prefix": "%m [%p] %q%u@%d/%a ",
+        "log_checkpoints": "on",
+        "log_connections": "off",
+        "log_disconnections": "off",
+        "log_lock_waits": "on",
+        "log_min_duration_statement": "1000",
+        "log_temp_files": "0",
+        "log_autovacuum_min_duration": "0",
+    }
+
+
+def log_directory(node):
+    """Where this node's server log actually lands."""
+    return f"{node.data_dir.rstrip('/')}/{LOG_DIRECTORY}"
+
+
 def spock_guc_parameters(pg_version):
     """The GUCs every Spock node in a multi-master cluster needs.
 

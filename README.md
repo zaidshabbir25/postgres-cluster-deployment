@@ -398,6 +398,44 @@ before doing any of it unless `--yes` is given.
 
 ---
 
+## Where the logs are
+
+Three different logs, and it is worth knowing which answers which question:
+
+| log | what it holds | how to read it |
+|-----|---------------|----------------|
+| PostgreSQL server log | checkpoints, lock waits, recovery, failed statements | `./pg_cluster_ctl.sh db logs --node n1` |
+| Patroni's journal | leader elections, failovers, what Patroni decided | `./pg_cluster_ctl.sh service logs --node n1` |
+| this tool's run log | what the deployment did, command by command | `logs/<run-id>/` |
+
+Each node keeps its own server log **inside its data directory**, at
+`/var/lib/pgedge/<node>/log`. That path is a consequence of `log_directory`
+being relative: PostgreSQL resolves it against the data directory, so two nodes
+sharing a machine never write over each other. The settings go into the scope's
+DCS, where Patroni applies them to the leader and every standby:
+
+```yaml
+logging_collector: on
+log_directory: log                    # relative → <data_dir>/log
+log_filename: postgresql-%a.log       # one file per weekday
+log_rotation_age: 1d
+log_truncate_on_rotation: on          # reuse last week's file, no cron needed
+log_file_mode: "0600"
+log_line_prefix: '%m [%p] %q%u@%d/%a '
+log_min_duration_statement: 1000      # statements slower than a second
+```
+
+A cluster deployed before this existed has no collector running, so it has no
+file to read. Turn it on in place — it is a DCS change, and `logging_collector`
+needs a restart to take effect:
+
+```bash
+./pg_cluster_ctl.sh db logging-on --all-nodes
+./pg_cluster_ctl.sh service restart --node n1     # one node at a time
+```
+
+---
+
 ## Source builds and pre-releases
 
 A source build fetches one tarball from the PostgreSQL mirror, so it needs an
