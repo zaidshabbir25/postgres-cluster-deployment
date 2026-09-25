@@ -11,7 +11,9 @@ Run it with ./pg_dashboard.sh (which sets up the venv and passes flags through).
 """
 
 import argparse
+import hmac
 import os
+import secrets
 import sys
 import threading
 import time
@@ -23,7 +25,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from flask import Flask, jsonify, render_template, request
+    from flask import (Flask, jsonify, make_response, redirect, render_template,
+                       request)
 except ImportError:  # pragma: no cover - dependency guard
     raise SystemExit(
         "Flask is required for the dashboard.\n"
@@ -36,6 +39,10 @@ from dashboard import node_api
 
 DEFAULT_INTERVAL = 20
 MIN_INTERVAL = 5
+
+# Name of the cookie a browser keeps once it has presented the token, so the
+# token itself stays out of every later URL (and out of the address bar).
+TOKEN_COOKIE = "pgcluster_token"
 
 
 class ClusterWatcher:
@@ -185,9 +192,61 @@ class WatcherRegistry:
             self._watchers.clear()
 
 
+def install_auth(app, token):
+    """Require a shared token on everything but the stylesheet and scripts.
+
+    Deliberately simple: one token, presented as a header, a `?token=` once, or
+    the cookie that first visit leaves behind. It is not a user system — it is
+    the difference between "anyone who can reach the port" and "anyone who has
+    the token", which is what makes a non-loopback bind defensible at all.
+    Put TLS in front of it if the network between you and the VM is not one you
+    control; a token over plain HTTP is visible to anyone on the path.
+    """
+    if not token:
+        return
+
+    @app.before_request
+    def check_token():
+        if request.endpoint == "static":
+            return None
+
+        presented = (
+            request.headers.get("X-Dashboard-Token")
+            or request.args.get("token")
+            or request.cookies.get(TOKEN_COOKIE)
+            or ""
+        )
+        if hmac.compare_digest(presented, token):
+            # Seen in the URL: set the cookie and drop it from the address bar,
+            # so it does not end up in history, bookmarks or a screenshot.
+            if request.args.get("token"):
+                stripped = {k: v for k, v in request.args.items() if k != "token"}
+                query = ("?" + "&".join(f"{k}={v}" for k, v in stripped.items())
+                         if stripped else "")
+                response = make_response(redirect(request.path + query))
+                response.set_cookie(TOKEN_COOKIE, token, httponly=True,
+                                    samesite="Lax")
+                return response
+            return None
+
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "a token is required: send it as "
+                                     "X-Dashboard-Token, or open the dashboard "
+                                     "once with ?token=..."}), 401
+        return (
+            "<h1>Token required</h1>"
+            "<p>This dashboard is protected. Open it once with "
+            "<code>?token=&lt;your token&gt;</code> and the browser will "
+            "remember.</p>",
+            401,
+            {"Content-Type": "text/html; charset=utf-8"},
+        )
+
+
 def create_app(interval=DEFAULT_INTERVAL, db_password=None, default_cluster=None,
-               changes_allowed=False, inventory_path=None):
+               changes_allowed=False, inventory_path=None, auth_token=None):
     app = Flask(__name__)
+    install_auth(app, auth_token)
     registry = WatcherRegistry(interval=interval, db_password=db_password)
     app.config["REGISTRY"] = registry
 
@@ -283,21 +342,33 @@ def main(argv=None):
     parser.add_argument("--debug", action="store_true", help="Flask debug mode")
     parser.add_argument("--allow-changes", action="store_true",
                         help="enable the add-node page, which changes the "
-                             "cluster (loopback binds only)")
+                             "cluster (a non-loopback bind then needs a token)")
+    parser.add_argument("--auth-token", default=os.environ.get("PG_DASHBOARD_TOKEN"),
+                        help="require this token on every request "
+                             "[$PG_DASHBOARD_TOKEN]")
     parser.add_argument("--inventory", help="host inventory to offer new hosts "
                                             "from [configuration/inventory.json]")
     args = parser.parse_args(argv)
 
-    # The dashboard has no authentication. Reading cluster health over a public
-    # bind is the operator's call; letting anyone who can reach the port build
-    # nodes on their machines is not.
+    # Reading cluster health over a public bind is the operator's call. Letting
+    # anyone who can reach the port build nodes on their machines is not — so a
+    # non-loopback bind may change things only when a token guards it.
     loopback = args.host in ("127.0.0.1", "localhost", "::1")
-    if args.allow_changes and not loopback:
+    if args.allow_changes and not loopback and not args.auth_token:
+        suggestion = secrets.token_urlsafe(24)
         print(
-            f"--allow-changes needs a loopback bind: the dashboard has no "
-            f"authentication, and {args.host} would let anyone who can reach "
-            f"the port add nodes to this cluster. Use an SSH tunnel:\n"
-            f"  ssh -L {args.port}:127.0.0.1:{args.port} <this-host>",
+            f"--allow-changes on {args.host} needs --auth-token: without one, "
+            f"anyone who can reach this port could add nodes to your cluster.\n"
+            f"\nEither tunnel instead of publishing (nothing to protect):\n"
+            f"  ssh -L {args.port}:127.0.0.1:{args.port} <user>@<this-host>\n"
+            f"  then open http://127.0.0.1:{args.port}/add-node\n"
+            f"\nor publish it behind a token:\n"
+            f"  ./pg_dashboard.sh --host {args.host} --allow-changes \\\n"
+            f"      --auth-token {suggestion}\n"
+            f"  then open http://{args.host}:{args.port}/add-node?token={suggestion}\n"
+            f"\nA token over plain HTTP is visible to anyone on the path; put "
+            f"TLS in front of it, or keep the port closed to the internet and "
+            f"open it to your own address only.",
             file=sys.stderr,
         )
         return 2
@@ -318,7 +389,12 @@ def main(argv=None):
         default_cluster=args.cluster,
         changes_allowed=args.allow_changes,
         inventory_path=args.inventory,
+        auth_token=args.auth_token,
     )
+
+    if not loopback:
+        print(f"Bound to {args.host} — reachable from the network. "
+              f"{'Token required.' if args.auth_token else 'No token: anyone who can reach this port can read your cluster topology and health.'}")
 
     print(f"Dashboard on http://{args.host}:{args.port}")
     if args.allow_changes:

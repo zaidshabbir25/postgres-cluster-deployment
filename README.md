@@ -515,14 +515,27 @@ Adding takes minutes, so the page starts a background job and follows it step by
 step, with the run's log underneath. One add runs at a time; the link
 `/add-node?role=standby&leader=n1` opens the form with that leader chosen.
 
-**It changes the cluster, so it is off by default.** `--allow-changes` also
-refuses a non-loopback bind: the dashboard has no authentication, and a public
-one would let anyone who can reach the port build nodes on your machines. Use an
-SSH tunnel:
+**It changes the cluster, so it is off by default**, and the default bind is
+`127.0.0.1`. Reaching it from your laptop, in order of preference:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 <host>
+# 1. Tunnel — nothing is published, nothing to protect
+ssh -L 8080:127.0.0.1:8080 user@vm
+./pg_dashboard.sh --allow-changes            # on the VM
+#    then open http://127.0.0.1:8080/add-node on your laptop
+
+# 2. Published, behind a token
+./pg_dashboard.sh --host 0.0.0.0 --allow-changes --auth-token "$(openssl rand -base64 24)"
+#    then open http://<vm-ip>:8080/add-node?token=<token> once; the browser
+#    keeps a cookie and the token leaves the address bar
 ```
+
+`--allow-changes` on a non-loopback bind **requires** `--auth-token`: without
+one, anyone who can reach the port could add nodes to your machines. The token
+is a shared secret, not a user system, and over plain HTTP it is visible to
+anyone on the path — put TLS in front of it, or restrict the port to your own
+address. A read-only dashboard may still be bound publicly without a token; it
+exposes topology and health.
 
 ---
 

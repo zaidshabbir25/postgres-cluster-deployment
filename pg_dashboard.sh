@@ -14,8 +14,10 @@
 # reads the cached snapshot.
 #
 # Binding to 0.0.0.0 exposes cluster topology and health to anyone who can
-# reach the port. There is no authentication — put it behind something, or
-# leave it on localhost and use an SSH tunnel.
+# reach the port. Use --auth-token to require a shared token, put TLS in front
+# of it, or leave it on localhost and reach it through an SSH tunnel:
+#
+#   ssh -L 8080:127.0.0.1:8080 user@host    # then http://127.0.0.1:8080
 #
 set -euo pipefail
 
@@ -32,7 +34,10 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "  --port N          port                              [8080]"
   echo "  --interval N      seconds between health polls       [20]"
   echo "  --cluster NAME    cluster to show first"
-  echo "  --allow-changes   enable the add-node page (loopback binds only)"
+  echo "  --allow-changes   enable the add-node page; a non-loopback bind"
+  echo "                    then needs --auth-token"
+  echo "  --auth-token T    require this token on every request"
+  echo "                    [\$PG_DASHBOARD_TOKEN]"
   echo "  --inventory PATH  inventory to offer new hosts from"
   echo "  --debug           Flask debug mode"
   exit 0

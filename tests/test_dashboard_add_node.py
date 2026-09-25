@@ -375,9 +375,77 @@ def test_changes_allowed_is_reported_to_the_page(client, readonly_client):
     assert readonly_client.get("/api/add-node/options").get_json()["changes_allowed"] is False
 
 
-def test_allow_changes_refuses_a_public_bind(capsys):
-    """No authentication: a public bind must not accept cluster changes."""
+def test_allow_changes_refuses_an_unprotected_public_bind(capsys):
+    """Anyone who can reach the port must not be able to add nodes."""
     code = dashboard.main(["--host", "0.0.0.0", "--allow-changes"])
+    printed = capsys.readouterr().err
 
     assert code == 2
-    assert "loopback" in capsys.readouterr().err
+    assert "--auth-token" in printed
+    assert "ssh -L" in printed          # the tunnel is offered first
+
+
+def test_a_token_permits_a_public_bind(cluster, monkeypatch, capsys):
+    """With a token the bind is a choice, not an accident."""
+    served = {}
+    monkeypatch.setattr(dashboard.Flask, "run",
+                        lambda self, **kwargs: served.update(kwargs))
+
+    code = dashboard.main(["--host", "0.0.0.0", "--allow-changes",
+                           "--auth-token", "s3cret"])
+
+    assert code == 0
+    assert served["host"] == "0.0.0.0"
+    assert "Token required" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# the token
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def guarded(cluster):
+    _, inventory_path = cluster
+    app = dashboard.create_app(changes_allowed=True, inventory_path=inventory_path,
+                               auth_token="s3cret")
+    return app.test_client()
+
+
+@pytest.mark.parametrize("path", ["/", "/add-node", "/api/health",
+                                  "/api/add-node/options"])
+def test_without_a_token_nothing_is_served(guarded, path):
+    assert guarded.get(path).status_code == 401
+
+
+def test_a_wrong_token_is_refused(guarded):
+    assert guarded.get("/api/health",
+                       headers={"X-Dashboard-Token": "guess"}).status_code == 401
+
+
+def test_a_header_token_is_accepted(guarded):
+    assert guarded.get("/api/add-node/options",
+                       headers={"X-Dashboard-Token": "s3cret"}).status_code == 200
+
+
+def test_a_url_token_becomes_a_cookie_and_leaves_the_address_bar(guarded):
+    """So it stays out of history, bookmarks and screenshots."""
+    response = guarded.get("/add-node?token=s3cret")
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/add-node"
+    assert "pgcluster_token" in response.headers.get("Set-Cookie", "")
+    assert "HttpOnly" in response.headers.get("Set-Cookie", "")
+    assert guarded.get("/add-node").status_code == 200      # the cookie carries
+
+
+def test_the_stylesheet_is_not_behind_the_token(guarded):
+    """Otherwise the 401 page renders unstyled and looks broken."""
+    assert guarded.get("/static/add-node.css").status_code == 200
+
+
+def test_changes_are_refused_without_the_token(guarded, fake_add):
+    response = guarded.post("/api/add-node", json={"role": "leader", "host": "host-a"})
+
+    assert response.status_code == 401
+    assert fake_add == []
