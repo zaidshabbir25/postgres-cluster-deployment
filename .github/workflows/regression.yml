@@ -131,7 +131,7 @@ jobs:
           import sys
 
           failures = []
-          for package_name in ("aspects", "deployment", "reports"):
+          for package_name in ("aspects", "deployment", "reports", "dashboard"):
               try:
                   package = importlib.import_module(package_name)
               except ModuleNotFoundError:

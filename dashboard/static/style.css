@@ -307,3 +307,15 @@ footer {
 
 .spin { animation: pulse 1.1s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+
+/* Link to the add-node form, shown only when the dashboard may change things. */
+.bar-right .add-link {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+  padding: 6px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+}
+.bar-right .add-link:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }

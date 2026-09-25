@@ -8,6 +8,8 @@
 #
 # The page shows every node's Patroni role, whether it accepts writes, its
 # Spock subscription state and replication slots, plus etcd and host health.
+# With --allow-changes it also serves /add-node, a form that adds a Spock node
+# or a standby to the running cluster.
 # A background poller refreshes on --interval seconds; the browser only ever
 # reads the cached snapshot.
 #
@@ -30,6 +32,8 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "  --port N          port                              [8080]"
   echo "  --interval N      seconds between health polls       [20]"
   echo "  --cluster NAME    cluster to show first"
+  echo "  --allow-changes   enable the add-node page (loopback binds only)"
+  echo "  --inventory PATH  inventory to offer new hosts from"
   echo "  --debug           Flask debug mode"
   exit 0
 fi

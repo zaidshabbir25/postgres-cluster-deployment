@@ -480,6 +480,52 @@ confirm) is accepted wherever `sync` is.
 
 ---
 
+## Adding a node from the browser
+
+The dashboard can also add nodes, not just watch them:
+
+```bash
+./pg_dashboard.sh --allow-changes          # http://127.0.0.1:8080/add-node
+```
+
+The form asks the same four questions the CLI does — what the node should be,
+where it should run, what it should run, and how its leader replicates to it —
+and every answer is checked by the same functions `--add-node` uses, so the two
+cannot drift apart. It shows what it is about to build before you commit to it:
+
+```
+WHAT WILL BE BUILT
+  Name         n3
+  Host         host-a (10.0.1.11)
+  PostgreSQL   10.0.1.11:5433 · 19beta3
+  Patroni      10.0.1.11:8009 · scope pgedge-n3
+  Spock        spock60 from main
+  Binaries     /opt/pgedge/pg19/bin
+  Build        compiled from source on the host — 20-40 minutes
+```
+
+Ports, the scope, the next free node name and a standby's name (`n1s2`, after
+the `n1s1` that already exists) are all computed rather than typed. The version
+list for a source-built cluster comes from the PostgreSQL mirror, so a major
+with no release yet offers its betas and nothing else. Choices that cannot work
+are refused with the reason — an older PostgreSQL than the cluster's, an older
+Spock, a replication mode on a node that has no standby.
+
+Adding takes minutes, so the page starts a background job and follows it step by
+step, with the run's log underneath. One add runs at a time; the link
+`/add-node?role=standby&leader=n1` opens the form with that leader chosen.
+
+**It changes the cluster, so it is off by default.** `--allow-changes` also
+refuses a non-loopback bind: the dashboard has no authentication, and a public
+one would let anyone who can reach the port build nodes on your machines. Use an
+SSH tunnel:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 <host>
+```
+
+---
+
 ## Growing a running cluster
 
 ```bash

@@ -26,6 +26,9 @@
     </label>
     {% endif %}
     <span class="meta" id="freshness">—</span>
+    {% if changes_allowed %}
+    <a class="add-link" href="{{ url_for('nodes.page') }}{% if cluster %}?cluster={{ cluster }}{% endif %}">+ Add node</a>
+    {% endif %}
     <button id="refresh" type="button">Refresh</button>
   </div>
 </header>

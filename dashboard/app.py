@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - dependency guard
     )
 
 from aspects import health, inventory, state
+from dashboard import node_api
 
 DEFAULT_INTERVAL = 20
 MIN_INTERVAL = 5
@@ -184,10 +185,20 @@ class WatcherRegistry:
             self._watchers.clear()
 
 
-def create_app(interval=DEFAULT_INTERVAL, db_password=None, default_cluster=None):
+def create_app(interval=DEFAULT_INTERVAL, db_password=None, default_cluster=None,
+               changes_allowed=False, inventory_path=None):
     app = Flask(__name__)
     registry = WatcherRegistry(interval=interval, db_password=db_password)
     app.config["REGISTRY"] = registry
+
+    # Adding a node changes the cluster, so it is off unless asked for — see
+    # --allow-changes, which main() refuses to combine with a public bind.
+    runner = node_api.JobRunner()
+    app.config["JOBS"] = runner
+    app.register_blueprint(node_api.build_blueprint(
+        runner, inventory_path=inventory_path,
+        changes_allowed=changes_allowed, db_password=db_password,
+    ))
 
     def resolve_cluster():
         """Which cluster this request is about."""
@@ -210,6 +221,7 @@ def create_app(interval=DEFAULT_INTERVAL, db_password=None, default_cluster=None
             clusters=clusters,
             interval=interval,
             requested=request.args.get("cluster", ""),
+            changes_allowed=changes_allowed,
         )
 
     @app.route("/api/clusters")
@@ -269,7 +281,26 @@ def main(argv=None):
     parser.add_argument("--cluster", default=os.environ.get("PG_CLUSTER_NAME"),
                         help="cluster to show by default")
     parser.add_argument("--debug", action="store_true", help="Flask debug mode")
+    parser.add_argument("--allow-changes", action="store_true",
+                        help="enable the add-node page, which changes the "
+                             "cluster (loopback binds only)")
+    parser.add_argument("--inventory", help="host inventory to offer new hosts "
+                                            "from [configuration/inventory.json]")
     args = parser.parse_args(argv)
+
+    # The dashboard has no authentication. Reading cluster health over a public
+    # bind is the operator's call; letting anyone who can reach the port build
+    # nodes on their machines is not.
+    loopback = args.host in ("127.0.0.1", "localhost", "::1")
+    if args.allow_changes and not loopback:
+        print(
+            f"--allow-changes needs a loopback bind: the dashboard has no "
+            f"authentication, and {args.host} would let anyone who can reach "
+            f"the port add nodes to this cluster. Use an SSH tunnel:\n"
+            f"  ssh -L {args.port}:127.0.0.1:{args.port} <this-host>",
+            file=sys.stderr,
+        )
+        return 2
 
     clusters = state.list_clusters()
     if not clusters:
@@ -285,9 +316,13 @@ def main(argv=None):
         interval=args.interval,
         db_password=os.environ.get("PG_CLUSTER_DB_PASSWORD"),
         default_cluster=args.cluster,
+        changes_allowed=args.allow_changes,
+        inventory_path=args.inventory,
     )
 
     print(f"Dashboard on http://{args.host}:{args.port}")
+    if args.allow_changes:
+        print(f"Add nodes at  http://{args.host}:{args.port}/add-node")
     print(f"Clusters: {', '.join(clusters)}")
     print(f"Polling every {max(MIN_INTERVAL, args.interval)}s")
     # Threaded so a slow first collection cannot block the page load.

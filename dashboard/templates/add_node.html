@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Add a node — {{ cluster or 'no cluster' }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='add-node.css') }}">
+</head>
+<body data-cluster="{{ cluster or '' }}" data-changes="{{ 'yes' if changes_allowed else 'no' }}">
+
+<header class="bar">
+  <div class="bar-left">
+    <a class="back" href="{{ url_for('index') }}{% if cluster %}?cluster={{ cluster }}{% endif %}">&larr; Health</a>
+    <h1>Add a node</h1>
+    <span class="badge" id="cluster-badge">{{ cluster or 'no cluster' }}</span>
+  </div>
+  <div class="bar-right">
+    {% if clusters|length > 1 %}
+    <label class="picker">
+      <span class="sr">Cluster</span>
+      <select id="cluster-picker">
+        {% for name in clusters %}
+        <option value="{{ name }}" {% if name == cluster %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% endif %}
+  </div>
+</header>
+
+<main class="add-node">
+  <p class="notice" id="notice" hidden></p>
+
+  {% if not changes_allowed %}
+  <p class="notice warn">
+    This dashboard is read-only. Restart it with
+    <code>./pg_dashboard.sh --allow-changes</code> to add nodes from here.
+    The form below still previews what would be built.
+  </p>
+  {% endif %}
+
+  <form id="add-node-form" autocomplete="off">
+    <!-- 1. role ------------------------------------------------------ -->
+    <section class="field-group">
+      <h2><span class="step-n">1</span> What should it be?</h2>
+      <div class="segmented" role="radiogroup" aria-label="Node role" id="role">
+        <button type="button" role="radio" aria-checked="true" data-value="leader" class="on">
+          <strong>Spock node</strong>
+          <small>a multi-master peer, cross-wired to every other node</small>
+        </button>
+        <button type="button" role="radio" aria-checked="false" data-value="standby">
+          <strong>Standby</strong>
+          <small>a physical replica Patroni can promote</small>
+        </button>
+      </div>
+
+      <div class="row two" id="identity">
+        <label class="labelled">
+          <span>Node name</span>
+          <input type="text" id="name" name="name" placeholder="n3"
+                 pattern="[A-Za-z][A-Za-z0-9_]*" spellcheck="false">
+          <small class="hint" id="name-hint">The next free name is offered.</small>
+        </label>
+
+        <label class="labelled" data-role="standby" hidden>
+          <span>Leader it follows</span>
+          <select id="leader" name="leader"></select>
+          <small class="hint">A standby copies one Spock node and can only be
+            promoted into that node's place.</small>
+        </label>
+
+        <label class="labelled" data-role="leader">
+          <span>Join through</span>
+          <select id="source" name="source"></select>
+          <small class="hint">The existing node that runs <code>spock.add_node</code>.</small>
+        </label>
+      </div>
+    </section>
+
+    <!-- 2. host ------------------------------------------------------ -->
+    <section class="field-group">
+      <h2><span class="step-n">2</span> Where should it run?</h2>
+      <div class="host-grid" id="hosts" role="radiogroup" aria-label="Host"></div>
+      <small class="hint">
+        Hosts already in the cluster carry the nodes shown on each card. An
+        inventory host that is not in the cluster yet is prepared from scratch.
+      </small>
+    </section>
+
+    <!-- 3. versions -------------------------------------------------- -->
+    <section class="field-group" data-role="leader">
+      <h2><span class="step-n">3</span> What should it run?</h2>
+
+      <div class="row two">
+        <div class="labelled">
+          <span>PostgreSQL</span>
+          <div class="combo" data-combo="pg_version">
+            <input type="text" id="pg_version" name="pg_version" spellcheck="false"
+                   role="combobox" aria-expanded="false" aria-autocomplete="list"
+                   aria-controls="pg_version-list">
+            <button type="button" class="combo-toggle" tabindex="-1" aria-label="Show versions">▾</button>
+            <ul class="combo-list" id="pg_version-list" role="listbox" hidden></ul>
+          </div>
+          <small class="hint" id="pg-hint"></small>
+        </div>
+
+        <div class="labelled">
+          <span>Spock</span>
+          <div class="segmented small" role="radiogroup" aria-label="Spock major" id="spock_major"></div>
+          <small class="hint" id="spock-hint"></small>
+        </div>
+      </div>
+
+      <div class="labelled" id="branch-field" hidden>
+        <span>Spock branch or tag</span>
+        <div class="combo" data-combo="spock_branch">
+          <input type="text" id="spock_branch" name="spock_branch" spellcheck="false"
+                 role="combobox" aria-expanded="false" aria-autocomplete="list"
+                 aria-controls="spock_branch-list">
+          <button type="button" class="combo-toggle" tabindex="-1" aria-label="Show branches">▾</button>
+          <ul class="combo-list" id="spock_branch-list" role="listbox" hidden></ul>
+        </div>
+        <small class="hint">This cluster builds from source, so Spock is compiled
+          from a branch of github.com/pgEdge/spock.</small>
+      </div>
+    </section>
+
+    <!-- 4. replication ------------------------------------------------ -->
+    <section class="field-group" data-role="standby" hidden>
+      <h2><span class="step-n">3</span> How should its leader replicate to it?</h2>
+
+      <div class="segmented" role="radiogroup" aria-label="Replication mode" id="sync_mode">
+        <button type="button" role="radio" aria-checked="true" data-value="async" class="on">
+          <strong>Asynchronous</strong>
+          <small>commits never wait; a failover can lose the last few</small>
+        </button>
+        <button type="button" role="radio" aria-checked="false" data-value="sync">
+          <strong>Synchronous</strong>
+          <small>each commit waits for the standby to confirm it</small>
+        </button>
+        <button type="button" role="radio" aria-checked="false" data-value="quorum">
+          <strong>Quorum</strong>
+          <small>any N standbys may confirm</small>
+        </button>
+      </div>
+
+      <div class="row two sync-extra" hidden>
+        <label class="labelled">
+          <span>Standbys that must confirm</span>
+          <div class="stepper">
+            <button type="button" data-step="-1" aria-label="Fewer">−</button>
+            <input type="number" id="sync_count" name="sync_count" value="1" min="1" max="5">
+            <button type="button" data-step="1" aria-label="More">+</button>
+          </div>
+        </label>
+
+        <label class="switch">
+          <input type="checkbox" id="sync_strict" name="sync_strict">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="switch-text">
+            <strong>Refuse writes when no standby is available</strong>
+            <small>durability over availability — without this, Patroni falls
+              back to asynchronous so writes keep flowing</small>
+          </span>
+        </label>
+      </div>
+    </section>
+
+    <!-- preview ------------------------------------------------------- -->
+    <section class="preview" id="preview" aria-live="polite">
+      <h2>What will be built</h2>
+      <dl id="preview-grid"></dl>
+      <ul class="messages" id="preview-messages"></ul>
+    </section>
+
+    <div class="actions">
+      <button type="submit" id="submit" class="primary" disabled>Add node</button>
+      <span class="hint" id="submit-hint"></span>
+    </div>
+  </form>
+
+  <!-- progress -------------------------------------------------------- -->
+  <section class="job" id="job" hidden aria-live="polite">
+    <h2>
+      <span class="spinner" id="job-spinner"></span>
+      <span id="job-title">Working…</span>
+      <span class="badge" id="job-elapsed"></span>
+    </h2>
+    <ol class="timeline" id="job-steps"></ol>
+    <details id="job-log-wrap">
+      <summary>Log</summary>
+      <pre id="job-log"></pre>
+    </details>
+    <p class="hint" id="job-footer"></p>
+  </section>
+</main>
+
+<script src="{{ url_for('static', filename='add-node.js') }}"></script>
+</body>
+</html>

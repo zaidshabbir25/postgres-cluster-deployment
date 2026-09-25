@@ -1,0 +1,362 @@
+/* Add-node form. Extends style.css — same tokens, same dark-mode handling. */
+
+/* A class that sets `display` outranks the UA rule behind the hidden
+   attribute, and several below do. Say it once, here. */
+[hidden] { display: none !important; }
+
+.bar-left .back {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 13px;
+  margin-right: 4px;
+}
+.bar-left .back:hover { color: var(--accent); }
+
+main.add-node { max-width: 940px; }
+
+.notice.warn {
+  background: var(--degraded-bg);
+  color: var(--degraded);
+  border: 1px solid currentColor;
+}
+
+/* --- sections ---------------------------------------------------------- */
+
+.field-group {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px 20px 20px;
+  margin-bottom: 16px;
+}
+.field-group h2 {
+  font-size: 15px;
+  margin: 0 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.step-n {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.row { display: grid; gap: 16px; }
+.row.two { grid-template-columns: 1fr 1fr; }
+@media (max-width: 720px) { .row.two { grid-template-columns: 1fr; } }
+
+.labelled { display: flex; flex-direction: column; gap: 6px; }
+.labelled > span:first-child {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.hint { font-size: 12px; color: var(--muted); line-height: 1.45; }
+.hint.bad { color: var(--down); }
+
+input[type="text"], input[type="number"], select {
+  font: inherit;
+  font-size: 14px;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 9px 11px;
+  width: 100%;
+}
+input:focus-visible, select:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+input[aria-invalid="true"] { border-color: var(--down); }
+
+/* --- segmented control ------------------------------------------------- */
+
+.segmented {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 8px;
+}
+@media (max-width: 720px) { .segmented { grid-auto-flow: row; } }
+
+.segmented button {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color .12s, background .12s;
+}
+.segmented button:hover { border-color: var(--accent); }
+.segmented button strong { font-size: 13.5px; font-weight: 600; }
+.segmented button small { font-size: 11.5px; color: var(--muted); line-height: 1.35; }
+.segmented button.on {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+}
+.segmented button.on small { color: var(--ink); }
+
+.segmented.small button { flex-direction: row; align-items: baseline; gap: 7px; padding: 9px 12px; }
+.segmented.small button small { color: var(--muted); }
+
+/* --- host cards -------------------------------------------------------- */
+
+.host-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.host-card {
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  padding: 11px 13px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.host-card:hover { border-color: var(--accent); }
+.host-card.on {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+}
+.host-card .host-name { font-weight: 600; font-size: 13.5px; }
+.host-card .host-addr { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--muted); }
+.host-card .host-nodes { font-size: 11.5px; color: var(--muted); }
+.host-card .tag {
+  align-self: flex-start;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--unknown-bg);
+  color: var(--unknown);
+}
+.host-card .tag.new { background: var(--ok-bg); color: var(--ok); }
+
+/* --- combobox ---------------------------------------------------------- */
+
+.combo { position: relative; }
+.combo input { padding-right: 34px; }
+.combo-toggle {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 6px 8px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.combo-list {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 232px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .14);
+}
+.combo-list li {
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13.5px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.combo-list li small { color: var(--muted); font-size: 11.5px; }
+.combo-list li[aria-selected="true"], .combo-list li.active {
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+}
+.combo-list .group {
+  padding: 6px 10px 2px;
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  cursor: default;
+}
+
+/* --- stepper and switch ------------------------------------------------ */
+
+.stepper { display: flex; align-items: stretch; gap: 0; max-width: 150px; }
+.stepper button {
+  width: 36px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 16px;
+  cursor: pointer;
+}
+.stepper button:first-child { border-radius: 7px 0 0 7px; }
+.stepper button:last-child { border-radius: 0 7px 7px 0; }
+.stepper input {
+  border-radius: 0;
+  border-left: 0;
+  border-right: 0;
+  text-align: center;
+  -moz-appearance: textfield;
+}
+.stepper input::-webkit-outer-spin-button,
+.stepper input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+.switch { display: flex; align-items: flex-start; gap: 11px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch .track {
+  flex: none;
+  width: 40px;
+  height: 23px;
+  border-radius: 999px;
+  background: var(--line);
+  position: relative;
+  transition: background .15s;
+  margin-top: 2px;
+}
+.switch .thumb {
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 19px; height: 19px;
+  border-radius: 50%;
+  background: var(--panel);
+  box-shadow: 0 1px 3px rgba(0,0,0,.25);
+  transition: transform .15s;
+}
+.switch input:checked + .track { background: var(--accent); }
+.switch input:checked + .track .thumb { transform: translateX(17px); }
+.switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch-text { display: flex; flex-direction: column; gap: 2px; }
+.switch-text strong { font-size: 13px; font-weight: 600; }
+.switch-text small { font-size: 11.5px; color: var(--muted); line-height: 1.4; }
+
+/* --- preview ----------------------------------------------------------- */
+
+.preview {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  padding: 16px 20px 18px;
+  margin-bottom: 16px;
+}
+.preview h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 12px; }
+.preview dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 18px;
+  margin: 0;
+  font-size: 13.5px;
+}
+.preview dt { color: var(--muted); }
+.preview dd { margin: 0; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+.preview .messages { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 7px; }
+.preview .messages li {
+  font-size: 12.5px;
+  line-height: 1.45;
+  padding: 8px 11px;
+  border-radius: 7px;
+  background: var(--degraded-bg);
+  color: var(--degraded);
+}
+.preview .messages li.error { background: var(--down-bg); color: var(--down); }
+
+/* --- actions and job --------------------------------------------------- */
+
+.actions { display: flex; align-items: center; gap: 14px; margin-bottom: 24px; }
+button.primary {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 10px 20px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+button.primary:disabled { opacity: .45; cursor: not-allowed; }
+
+.job {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px 20px;
+  margin-bottom: 30px;
+}
+.job h2 { display: flex; align-items: center; gap: 10px; font-size: 15px; margin: 0 0 14px; }
+
+.spinner {
+  width: 14px; height: 14px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+.spinner.done { animation: none; border: 0; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+
+.timeline { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.timeline li {
+  display: grid;
+  grid-template-columns: 18px 1fr max-content;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 2px;
+  font-size: 13.5px;
+  border-bottom: 1px solid var(--line);
+}
+.timeline li:last-child { border-bottom: 0; }
+.timeline .mark { text-align: center; font-size: 12px; }
+.timeline .running .mark { color: var(--accent); }
+.timeline .passed  .mark { color: var(--ok); }
+.timeline .failed  .mark { color: var(--down); }
+.timeline .msg { color: var(--muted); font-size: 12px; }
+.timeline .secs { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+
+.job pre {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 11px 13px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  margin: 10px 0 0;
+}
+.job summary { cursor: pointer; font-size: 13px; color: var(--muted); margin-top: 12px; }
