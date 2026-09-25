@@ -77,8 +77,9 @@ def published_versions(majors):
 class Job:
     """One background add, and everything the page needs to follow it."""
 
-    def __init__(self, kind, cluster, summary, params):
+    def __init__(self, kind, cluster, summary, params, node_name=""):
         self.id = uuid.uuid4().hex[:12]
+        self.node_name = node_name
         self.kind = kind                     # "node" | "standby"
         self.cluster = cluster
         self.summary = summary
@@ -117,7 +118,22 @@ class Job:
             "warnings": (self.result or {}).get("warnings", []),
             "node": (self.result or {}).get("node")
                     or (self.result or {}).get("standby"),
+            "cleanup": self.cleanup_hint(),
         }
+
+    def cleanup_hint(self):
+        """What to run when a failure left the node registered but unbuilt."""
+        if self.status != "failed" or not self.node_name:
+            return ""
+        try:
+            plan, _ = state.load(self.cluster)
+        except Exception:
+            return ""
+        if self.node_name not in {node.name for node in plan.nodes}:
+            return ""
+        return (f"{self.node_name} is registered but not joined. Remove it "
+                f"before retrying:  ./pg_cluster_ctl.sh node remove "
+                f"{self.node_name} --wipe-data")
 
     def tail(self, lines=60):
         path = Path(self.logger.root) / "deploy.log"
@@ -156,7 +172,7 @@ class JobRunner:
             return [self._jobs[job_id] for job_id in reversed(self._order)
                     if job_id in self._jobs]
 
-    def start(self, kind, cluster, summary, params, call):
+    def start(self, kind, cluster, summary, params, call, node_name=""):
         busy = self.running()
         if busy is not None:
             raise RuntimeError(
@@ -164,7 +180,7 @@ class JobRunner:
                 f"adds would race on the same cluster state."
             )
 
-        job = Job(kind, cluster, summary, params)
+        job = Job(kind, cluster, summary, params, node_name=node_name)
         with self._lock:
             self._jobs[job.id] = job
             self._order.append(job.id)
@@ -266,7 +282,8 @@ def preview(cluster_name, form, inventory_path=None):
     Nothing is contacted and nothing is changed: this is the plan only.
     """
     errors, warnings = [], []
-    plan, _ = state.load(cluster_name)
+    plan, metadata = state.load(cluster_name)
+    last_change = str(metadata.get("last_change") or "")
 
     role = (form.get("role") or "leader").lower()
     leader_name = (form.get("leader") or "").strip()
@@ -282,7 +299,19 @@ def preview(cluster_name, form, inventory_path=None):
             errors.append(f"node name {name!r} must start with a letter and "
                           f"contain only letters, digits or underscores")
         if name in {node.name for node in plan.nodes}:
-            errors.append(f"node {name!r} already exists in this cluster")
+            # A failed add leaves its node registered on purpose, so that it
+            # can be inspected and removed. Saying only "already exists" sends
+            # the operator looking for a node that never finished being built.
+            half_joined = (metadata.get("failed_node") == name
+                           or ("FAILED add-node" in last_change
+                               and name in last_change))
+            errors.append(
+                f"node {name!r} is registered from an add that failed — remove "
+                f"it before retrying: ./pg_cluster_ctl.sh node remove {name} "
+                f"--wipe-data"
+                if half_joined else
+                f"node {name!r} already exists in this cluster"
+            )
 
     # --- where it goes ----------------------------------------------
     host = None
@@ -474,12 +503,15 @@ def build_blueprint(runner, inventory_path=None, changes_allowed=True,
                     skip_verify=bool(form.get("skip_verify")),
                     pg_version=node["pg_version"],
                     spock_major=node["spock_major"],
-                    spock_branch=node["spock_branch"],
+                    # The chosen branch, not the resolved one: passing the
+                    # default back in would read as "change Spock", which is
+                    # refused when running nodes share the prefix.
+                    spock_branch=(form.get("spock_branch") or "").strip(),
                 )
 
         try:
             job = runner.start("standby" if standby else "node", cluster,
-                               summary, form, call)
+                               summary, form, call, node_name=node["name"])
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 409
         return jsonify(job.view()), 202

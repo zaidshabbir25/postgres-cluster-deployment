@@ -223,6 +223,9 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
     executors = {}
     started = time.time()
     warnings = []
+    # Set once the node is registered in the plan: a failure after that point
+    # leaves it inspectable and removable, and whoever retries has to know.
+    registered = ""
 
     try:
         if not plan.spock_nodes:
@@ -318,6 +321,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         # Register before generating any config: pg_hba and .pgpass are built
         # from plan.nodes, and every node must know about the newcomer.
         plan.nodes.append(node)
+        registered = name
 
         # --- 1. prepare the host ---------------------------------------
         log.step_start("Prepare host",
@@ -357,7 +361,17 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             # honoured a Spock choice never runs. Doing it now means touching
             # spock.so inside a prefix — which is shared by every node built
             # against it, so it is only safe while no node uses this one.
-            spock_asked_for = bool(spock_branch) or wanted_spock != str(plan.spock_major)
+            #
+            # "Asked for" has to mean *different from what is installed*. A
+            # branch that merely repeats the cluster's own is what these
+            # binaries were already built from: rebuilding it would change
+            # nothing and refusing it would block a perfectly ordinary add.
+            cluster_branch = ((plan.source_build or {}).get("spock_branch")
+                              or source_build.default_spock_branch(plan.spock_major))
+            spock_asked_for = (
+                wanted_spock != str(plan.spock_major)
+                or (bool(spock_branch) and spock_branch != cluster_branch)
+            )
             sharers = [n.name for n in existing_nodes if n.bin_dir == node.bin_dir]
             if spock_asked_for and sharers:
                 log.step_end("failed", "Spock is shared with running nodes")
@@ -619,6 +633,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         state.save(plan, extra={
             **metadata,
             "last_change": f"added Spock node {name} via {source.name}",
+            "failed_node": "",
             "run_id": log.run_id,
         })
 
@@ -655,6 +670,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             state.save(plan, extra={
                 **metadata,
                 "last_change": f"FAILED add-node: {exc}",
+                "failed_node": registered,
                 "run_id": log.run_id,
             })
         except Exception:

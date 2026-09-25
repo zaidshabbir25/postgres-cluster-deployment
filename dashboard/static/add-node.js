@@ -547,9 +547,11 @@ function showJob(job) {
   els.jobLog.textContent = job.log || "";
   const footer = [];
   if (job.error) footer.push(job.error);
+  if (job.cleanup) footer.push(job.cleanup);
   (job.warnings || []).forEach((warning) => footer.push(warning));
   footer.push(`Logs: ${job.log_dir}`);
   els.jobFooter.textContent = footer.join(" · ");
+  els.jobFooter.classList.toggle("bad", Boolean(job.error));
 }
 
 /* ------------------------------------------------------------------ boot */

@@ -354,6 +354,77 @@ def test_an_unknown_job_is_a_404(client):
 # ---------------------------------------------------------------------------
 
 
+def test_the_clusters_own_branch_is_not_a_spock_change(client, fake_add):
+    """Submitting the resolved default would read as "change Spock", which is
+    refused when running nodes share the prefix — an ordinary add must not."""
+    response = client.post("/api/add-node", json={
+        "role": "leader", "host": "host-a", "name": "n3",
+        "pg_version": "17.11", "spock_major": "50", "spock_branch": "",
+    })
+
+    assert response.status_code == 202
+    wait_for(client, response.get_json()["id"])
+    assert fake_add[0]["spock_branch"] == ""      # not "v5_STABLE"
+
+
+def test_an_explicitly_different_branch_is_passed_through(client, fake_add):
+    client.post("/api/add-node", json={
+        "role": "leader", "host": "host-a", "name": "n3",
+        "spock_branch": "my-fix",
+    })
+    time.sleep(0.2)
+
+    assert fake_add[0]["spock_branch"] == "my-fix"
+
+
+def test_a_node_left_by_a_failed_add_says_how_to_clear_it(client, cluster):
+    """Retrying the same name otherwise reads as "already exists"."""
+    plan, _ = cluster
+    from aspects.cluster_model import Node, ROLE_SPOCK
+
+    plan.nodes.append(Node(
+        name="n3", role=ROLE_SPOCK, host="host-a", address="10.0.1.11",
+        pg_port=5434, restapi_port=8010, data_dir="/var/lib/pgedge/n3",
+        scope="pgedge-n3", config_file="/etc/patroni/n3.yml", pgpass_file="/p"))
+    state.save(plan, extra={"failed_node": "n3",
+                            "last_change": "FAILED add-node: something broke"})
+
+    data = preview(client, role="leader", host="host-a", name="n3")
+
+    assert data["ok"] is False
+    assert "registered from an add that failed" in data["errors"][0]
+    assert "node remove n3 --wipe-data" in data["errors"][0]
+
+
+def test_a_failed_job_carries_the_cleanup_command(client, cluster, monkeypatch):
+    plan, _ = cluster
+
+    def fail_after_registering(**kwargs):
+        from aspects.cluster_model import Node, ROLE_SPOCK
+        plan.nodes.append(Node(
+            name="n3", role=ROLE_SPOCK, host="host-a", address="10.0.1.11",
+            pg_port=5434, restapi_port=8010, data_dir="/d", scope="pgedge-n3",
+            config_file="/c", pgpass_file="/p"))
+        state.save(plan, extra={"failed_node": "n3"})
+        return {"outcome": "failed", "failure": "the build died"}
+
+    monkeypatch.setattr(add_node, "add", fail_after_registering)
+    response = client.post("/api/add-node", json={"role": "leader", "host": "host-a",
+                                                  "name": "n3"})
+    job = wait_for(client, response.get_json()["id"])
+
+    assert job["status"] == "failed"
+    assert "node remove n3 --wipe-data" in job["cleanup"]
+
+
+def test_a_successful_job_carries_no_cleanup(client, fake_add):
+    response = client.post("/api/add-node", json={"role": "leader", "host": "host-a"})
+    job = wait_for(client, response.get_json()["id"])
+
+    assert job["status"] == "succeeded"
+    assert job["cleanup"] == ""
+
+
 def test_a_500_names_the_exception_that_caused_it(cluster, monkeypatch):
     """Flask wraps it as InternalServerError; the wrapper explains nothing."""
     monkeypatch.setattr(node_api, "cluster_options",
