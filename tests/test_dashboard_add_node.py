@@ -350,6 +350,27 @@ def test_an_unknown_job_is_a_404(client):
 
 
 # ---------------------------------------------------------------------------
+# failures the operator has to diagnose
+# ---------------------------------------------------------------------------
+
+
+def test_a_500_names_the_exception_that_caused_it(cluster, monkeypatch):
+    """Flask wraps it as InternalServerError; the wrapper explains nothing."""
+    monkeypatch.setattr(node_api, "cluster_options",
+                        lambda *a, **k: (_ for _ in ()).throw(KeyError("spock_major")))
+    app = dashboard.create_app(changes_allowed=True)
+    app.config["PROPAGATE_EXCEPTIONS"] = False
+
+    response = app.test_client().get("/api/add-node/options")
+    body = response.get_json()
+
+    assert response.status_code == 500
+    assert body["error"] == "KeyError: 'spock_major'"
+    assert body["path"] == "/api/add-node/options"
+    assert "terminal" in body["hint"]
+
+
+# ---------------------------------------------------------------------------
 # the read-only default
 # ---------------------------------------------------------------------------
 

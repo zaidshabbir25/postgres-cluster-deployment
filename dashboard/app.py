@@ -318,8 +318,24 @@ def create_app(interval=DEFAULT_INTERVAL, db_password=None, default_cluster=None
         return jsonify({"refreshing": cluster})
 
     @app.errorhandler(500)
-    def on_error(exc):  # pragma: no cover - defensive
-        return jsonify({"error": f"dashboard error: {exc}"}), 500
+    def on_error(exc):
+        """Report what actually failed, not Flask's wrapper for it.
+
+        A 500 reaches this handler as InternalServerError; the exception that
+        caused it hangs off `original_exception`. Without unwrapping, every
+        failure reads "the server encountered an internal error", which tells
+        an operator nothing and sends them to the terminal to find the
+        traceback. This is a single-operator tool on loopback (or behind a
+        token), so the message itself is safe to show.
+        """
+        cause = getattr(exc, "original_exception", None) or exc
+        app.logger.exception("%s failed", request.path, exc_info=cause)
+        return jsonify({
+            "error": f"{type(cause).__name__}: {cause}",
+            "path": request.path,
+            "hint": "the full traceback is in the terminal running "
+                    "./pg_dashboard.sh",
+        }), 500
 
     return app
 
