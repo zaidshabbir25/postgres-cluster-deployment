@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - dependency guard
     )
 
 from aspects import health, inventory, state
-from dashboard import node_api
+from dashboard import deploy_api, node_api
 
 DEFAULT_INTERVAL = 20
 MIN_INTERVAL = 5
@@ -258,6 +258,10 @@ def create_app(interval=DEFAULT_INTERVAL, db_password=None, default_cluster=None
         runner, inventory_path=inventory_path,
         changes_allowed=changes_allowed, db_password=db_password,
     ))
+    app.register_blueprint(deploy_api.build_blueprint(
+        runner, inventory_path=inventory_path,
+        changes_allowed=changes_allowed, db_password=db_password,
+    ))
 
     def resolve_cluster():
         """Which cluster this request is about."""
@@ -390,11 +394,11 @@ def main(argv=None):
         return 2
 
     clusters = state.list_clusters()
-    if not clusters:
+    if not clusters and not args.allow_changes:
         print(
             "No deployed clusters found in configuration/clusters/.\n"
-            "Deploy one first with ./pg_deploy_cluster.sh — the dashboard reads "
-            "the state file that deployment writes.",
+            "Deploy one with ./pg_deploy_cluster.sh, or start the dashboard "
+            "with --allow-changes and deploy from the browser.",
             file=sys.stderr,
         )
         return 1
@@ -414,8 +418,9 @@ def main(argv=None):
 
     print(f"Dashboard on http://{args.host}:{args.port}")
     if args.allow_changes:
+        print(f"Deploy    at  http://{args.host}:{args.port}/deploy")
         print(f"Add nodes at  http://{args.host}:{args.port}/add-node")
-    print(f"Clusters: {', '.join(clusters)}")
+    print(f"Clusters: {', '.join(clusters) or 'none yet'}")
     print(f"Polling every {max(MIN_INTERVAL, args.interval)}s")
     # Threaded so a slow first collection cannot block the page load.
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True,

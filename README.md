@@ -480,13 +480,33 @@ confirm) is accepted wherever `sync` is.
 
 ---
 
-## Adding a node from the browser
+## Deploying and growing from the browser
 
-The dashboard can also add nodes, not just watch them:
+The dashboard can build a cluster and add nodes to it, not just watch:
 
 ```bash
-./pg_dashboard.sh --allow-changes          # http://127.0.0.1:8080/add-node
+./pg_dashboard.sh --allow-changes
+#   http://127.0.0.1:8080/deploy     build a cluster
+#   http://127.0.0.1:8080/add-node   add a node to one
 ```
+
+`/deploy` asks the same questions `./pg_deploy_cluster.sh` does — which
+machines, packages or source, how many nodes, which versions, standbys — and
+plans continuously as you answer. The table under "What will be built" comes
+from `topology.plan_cluster`, the same call the deployment makes, so it is the
+cluster you will get:
+
+| Node | Role | Host | PostgreSQL | Patroni | Scope | Follows |
+|------|------|------|------------|---------|-------|---------|
+| n1 | spock | host-a | 10.0.1.11:5432 | :8008 | demo-n1 | — |
+| n2 | spock | host-b | 10.0.1.12:5432 | :8008 | demo-n2 | — |
+| n1s1 | standby | host-b | 10.0.1.12:5433 | :8009 | demo-n1 | n1 |
+
+with the planner's own warnings beneath it (`single-member etcd`, `3 nodes
+across 2 hosts`). The form also writes the inventory: "Add a machine" appends a
+host to `configuration/inventory.json`, so a fresh install can go from nothing
+to a running cluster without touching a file. It starts with no cluster
+deployed — which is exactly when you need it.
 
 The form asks the same four questions the CLI does — what the node should be,
 where it should run, what it should run, and how its leader replicates to it —

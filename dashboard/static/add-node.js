@@ -210,31 +210,7 @@ function markSpock() {
   });
 }
 
-/* ------------------------------------------------------- segmented controls */
-
-function wireSegmented(group, onPick) {
-  group.addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-value]");
-    if (!button) return;
-    group.querySelectorAll("button").forEach((other) => {
-      const on = other === button;
-      other.classList.toggle("on", on);
-      other.setAttribute("aria-checked", on ? "true" : "false");
-    });
-    onPick(button.dataset.value);
-  });
-  group.addEventListener("keydown", (event) => {
-    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
-    const buttons = [...group.querySelectorAll("button")];
-    const current = buttons.findIndex((b) => b.classList.contains("on"));
-    const next = event.key === "ArrowLeft" || event.key === "ArrowUp"
-      ? (current - 1 + buttons.length) % buttons.length
-      : (current + 1) % buttons.length;
-    buttons[next].click();
-    buttons[next].focus();
-    event.preventDefault();
-  });
-}
+/* Controls come from form-kit.js, shared with the deploy form. */
 
 function applyRole(value) {
   state.role = value;
@@ -263,74 +239,6 @@ wireSegmented(els.syncMode, (value) => {
   preview();
 });
 
-/* ------------------------------------------------------------- combobox */
-
-function wireCombo(input, itemsFor) {
-  const list = document.getElementById(`${input.id}-list`);
-  const toggle = input.parentElement.querySelector(".combo-toggle");
-  let active = -1;
-
-  const close = () => {
-    list.hidden = true;
-    input.setAttribute("aria-expanded", "false");
-    active = -1;
-  };
-
-  const open = () => {
-    const items = itemsFor(input.value.trim());
-    list.innerHTML = "";
-    if (!items.length) { close(); return; }
-    items.forEach((item) => {
-      const li = document.createElement("li");
-      if (item.group) {
-        li.className = "group";
-        li.textContent = item.group;
-      } else {
-        li.setAttribute("role", "option");
-        li.dataset.value = item.value;
-        li.innerHTML = `<span>${item.value}</span>${
-          item.note ? `<small>${item.note}</small>` : ""}`;
-        li.addEventListener("mousedown", (event) => {
-          event.preventDefault();
-          input.value = item.value;
-          input.dataset.touched = "1";
-          close();
-          preview();
-        });
-      }
-      list.appendChild(li);
-    });
-    list.hidden = false;
-    input.setAttribute("aria-expanded", "true");
-  };
-
-  input.addEventListener("focus", open);
-  input.addEventListener("input", () => { input.dataset.touched = "1"; open(); preview(); });
-  input.addEventListener("blur", () => setTimeout(close, 120));
-  toggle.addEventListener("click", () => {
-    if (list.hidden) { input.focus(); open(); } else close();
-  });
-  input.addEventListener("keydown", (event) => {
-    const options = [...list.querySelectorAll("li[role='option']")];
-    if (event.key === "Escape") { close(); return; }
-    if (!options.length) return;
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      active = event.key === "ArrowDown"
-        ? Math.min(active + 1, options.length - 1)
-        : Math.max(active - 1, 0);
-      options.forEach((li, index) => li.classList.toggle("active", index === active));
-      options[active].scrollIntoView({ block: "nearest" });
-      event.preventDefault();
-    } else if (event.key === "Enter" && active >= 0) {
-      input.value = options[active].dataset.value;
-      input.dataset.touched = "1";
-      close();
-      preview();
-      event.preventDefault();
-    }
-  });
-}
-
 wireCombo(els.pgVersion, (typed) => {
   if (!state.options) return [];
   const { cluster, pg_versions: versions, pg_majors: majors } = state.options;
@@ -357,7 +265,7 @@ wireCombo(els.pgVersion, (typed) => {
   return needle
     ? items.filter((item) => item.group || item.value.toLowerCase().includes(needle))
     : items;
-});
+}, preview);
 
 wireCombo(els.branch, () => {
   if (!state.options) return [];
@@ -374,18 +282,11 @@ wireCombo(els.branch, () => {
     }
   });
   return items;
-});
+}, preview);
 
 /* --------------------------------------------------------------- stepper */
 
-document.querySelectorAll(".stepper button").forEach((button) => {
-  button.addEventListener("click", () => {
-    const input = button.parentElement.querySelector("input");
-    const next = Number(input.value || 1) + Number(button.dataset.step);
-    input.value = Math.min(Number(input.max), Math.max(Number(input.min), next));
-    preview();
-  });
-});
+wireSteppers(document, preview);
 els.syncCount.addEventListener("input", preview);
 els.syncStrict.addEventListener("change", preview);
 els.name.addEventListener("input", preview);

@@ -118,6 +118,56 @@ def load(path=None):
     return hosts, defaults
 
 
+def add_host(entry, path=None):
+    """Append one host to the inventory, creating the file if needed.
+
+    Written for a caller that has just been told about a machine — the web
+    form's "add a host" — so it validates the same things `load` would reject
+    later, and refuses a name or address that is already there rather than
+    silently producing a duplicate.
+    """
+    name = (entry.get("name") or "").strip()
+    address = (entry.get("host") or entry.get("address") or "").strip()
+    if not address:
+        raise InventoryError("a host needs an address")
+    name = name or address
+
+    try:
+        resolved = inventory_path(path)
+        raw = json.loads(resolved.read_text(encoding="utf-8"))
+    except (InventoryError, json.JSONDecodeError, OSError):
+        resolved = Path(path) if path else DEFAULT_INVENTORY
+        if not resolved.is_absolute():
+            resolved = REPO_ROOT / resolved
+        raw = {"defaults": {}, "hosts": []}
+
+    hosts = raw.setdefault("hosts", [])
+    for existing in hosts:
+        if (existing.get("name") or "").strip() == name:
+            raise InventoryError(f"the inventory already has a host named {name!r}")
+        if (existing.get("host") or "").strip() == address:
+            raise InventoryError(
+                f"{existing.get('name') or address} already points at {address}; "
+                f"list a machine once and let --nodes place several nodes on it"
+            )
+
+    record = {"name": name, "host": address,
+              "username": (entry.get("username") or "root").strip(),
+              "enabled": True}
+    if entry.get("local"):
+        record["local"] = True
+    else:
+        record["key_file"] = (entry.get("key_file") or "").strip()
+        record["port"] = int(entry.get("port") or 22)
+    if entry.get("description"):
+        record["description"] = str(entry["description"]).strip()
+
+    hosts.append(record)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    return record
+
+
 def check_key_permissions(hosts):
     """Warn about private keys other users can read.
 

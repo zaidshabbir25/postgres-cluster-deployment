@@ -8,8 +8,8 @@
 #
 # The page shows every node's Patroni role, whether it accepts writes, its
 # Spock subscription state and replication slots, plus etcd and host health.
-# With --allow-changes it also serves /add-node, a form that adds a Spock node
-# or a standby to the running cluster.
+# With --allow-changes it also serves /deploy, a form that builds a new cluster,
+# and /add-node, which adds a Spock node or a standby to a running one.
 # A background poller refreshes on --interval seconds; the browser only ever
 # reads the cached snapshot.
 #

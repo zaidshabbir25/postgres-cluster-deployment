@@ -760,19 +760,33 @@ class ClusterDeployer:
 # ---------------------------------------------------------------------------
 
 
-def deploy(options):
+def deploy(options, run_logger=None):
     """Build a plan from resolved options and deploy it.
 
     `options` is the dict pg_deploy_cluster.sh's Python side assembles from
-    flags and interactive answers.
+    flags and interactive answers. `options["hosts"]` narrows the inventory to
+    named hosts, which is how a caller that did its own choosing — the web
+    form — says "these, not every enabled entry". A caller that keeps its own
+    RunLogger passes it in, so it can follow the steps as they happen.
     """
     hosts, defaults = inventory.load(options.get("inventory"))
+
+    chosen = [name for name in (options.get("hosts") or []) if name]
+    if chosen:
+        by_name = {host.name: host for host in hosts}
+        missing = [name for name in chosen if name not in by_name]
+        if missing:
+            raise inventory.InventoryError(
+                f"no enabled host named {', '.join(missing)} in the inventory"
+            )
+        hosts = [by_name[name] for name in chosen]
 
     for warning in inventory.check_key_permissions(hosts):
         print(f"WARN  {warning}")
 
-    run_id = new_run_id(options.get("cluster_name") or "cluster")
-    run_logger = RunLogger(run_id)
+    run_id = run_logger.run_id if run_logger else new_run_id(
+        options.get("cluster_name") or "cluster")
+    run_logger = run_logger or RunLogger(run_id)
 
     pins = inventory.expected_versions(
         options.get("pg_major") or defaults.get("pg_major", "17"),

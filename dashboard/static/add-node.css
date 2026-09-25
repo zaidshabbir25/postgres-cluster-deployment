@@ -360,3 +360,50 @@ button.primary:disabled { opacity: .45; cursor: not-allowed; }
   margin: 10px 0 0;
 }
 .job summary { cursor: pointer; font-size: 13px; color: var(--muted); margin-top: 12px; }
+
+/* --- deploy form: chips, plan table ------------------------------------ */
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+}
+.chip:hover { border-color: var(--accent); }
+.chip.on {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+  color: var(--accent);
+}
+
+.plan-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; margin-bottom: 12px; }
+.plan-summary span { color: var(--muted); }
+.plan-summary b { color: var(--ink); }
+
+table.plan { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+table.plan th {
+  text-align: left;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 4px 10px 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+table.plan td {
+  padding: 6px 10px 6px 0;
+  border-bottom: 1px solid var(--line);
+  font-family: ui-monospace, Menlo, monospace;
+}
+table.plan tr:last-child td { border-bottom: 0; }
+
+.preview .messages li.plain { background: var(--unknown-bg); color: var(--muted); }
+#add-host summary { cursor: pointer; font-size: 13px; color: var(--accent); margin-top: 14px; }
+#add-host[open] summary { margin-bottom: 12px; }

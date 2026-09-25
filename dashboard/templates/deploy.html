@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deploy a cluster</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='add-node.css') }}">
+</head>
+<body data-changes="{{ 'yes' if changes_allowed else 'no' }}">
+
+<header class="bar">
+  <div class="bar-left">
+    {% if clusters %}
+    <a class="back" href="{{ url_for('index') }}">&larr; Health</a>
+    {% endif %}
+    <h1>Deploy a cluster</h1>
+  </div>
+  <div class="bar-right">
+    {% if clusters and changes_allowed %}
+    <a class="add-link" href="{{ url_for('nodes.page') }}">+ Add node</a>
+    {% endif %}
+  </div>
+</header>
+
+<main class="add-node">
+  <p class="notice" id="notice" hidden></p>
+
+  {% if not changes_allowed %}
+  <p class="notice warn">
+    This dashboard is read-only. Restart it with
+    <code>./pg_dashboard.sh --allow-changes</code> to deploy from here. The form
+    below still plans the cluster without building anything.
+  </p>
+  {% endif %}
+
+  <form id="deploy-form" autocomplete="off">
+    <!-- 1. hosts ----------------------------------------------------- -->
+    <section class="field-group">
+      <h2><span class="step-n">1</span> Which machines?</h2>
+      <div class="host-grid" id="hosts"></div>
+      <p class="hint" id="hosts-hint"></p>
+
+      <details id="add-host">
+        <summary>Add a machine to the inventory</summary>
+        <div class="row two">
+          <label class="labelled">
+            <span>Hostname or IP</span>
+            <input type="text" id="new-address" placeholder="10.0.1.13" spellcheck="false">
+          </label>
+          <label class="labelled">
+            <span>Name</span>
+            <input type="text" id="new-name" placeholder="host-c" spellcheck="false">
+          </label>
+        </div>
+        <div class="row two">
+          <label class="labelled">
+            <span>SSH user</span>
+            <input type="text" id="new-user" placeholder="rocky" spellcheck="false">
+          </label>
+          <label class="labelled">
+            <span>SSH port</span>
+            <div class="stepper">
+              <button type="button" data-step="-1" aria-label="Lower">−</button>
+              <input type="number" id="new-port" value="22" min="1" max="65535">
+              <button type="button" data-step="1" aria-label="Higher">+</button>
+            </div>
+          </label>
+        </div>
+        <label class="labelled">
+          <span>SSH key file</span>
+          <input type="text" id="new-key" placeholder="empty to use your ssh-agent" spellcheck="false">
+        </label>
+        <label class="switch" style="margin-top:12px">
+          <input type="checkbox" id="new-local">
+          <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+          <span class="switch-text">
+            <strong>This machine — no SSH</strong>
+            <small>run the deployment locally, for a single-host cluster</small>
+          </span>
+        </label>
+        <div class="actions" style="margin-top:14px">
+          <button type="button" id="save-host" class="primary">Add to inventory</button>
+          <span class="hint" id="new-host-hint"></span>
+        </div>
+      </details>
+    </section>
+
+    <!-- 2. method ---------------------------------------------------- -->
+    <section class="field-group">
+      <h2><span class="step-n">2</span> How should it be installed?</h2>
+      <div class="segmented" role="radiogroup" aria-label="Deployment method" id="deploy_mode">
+        <button type="button" role="radio" aria-checked="true" data-value="packages" class="on">
+          <strong>Native packages</strong>
+          <small>from the pgEdge repository — minutes</small>
+        </button>
+        <button type="button" role="radio" aria-checked="false" data-value="source">
+          <strong>Build from source</strong>
+          <small>compile PostgreSQL and Spock — 20-40 minutes per host</small>
+        </button>
+      </div>
+    </section>
+
+    <!-- 3. size and versions ----------------------------------------- -->
+    <section class="field-group">
+      <h2><span class="step-n">3</span> What should it run?</h2>
+
+      <div class="row two">
+        <label class="labelled">
+          <span>Spock nodes</span>
+          <div class="stepper">
+            <button type="button" data-step="-1" aria-label="Fewer">−</button>
+            <input type="number" id="node_count" value="2" min="1" max="32">
+            <button type="button" data-step="1" aria-label="More">+</button>
+          </div>
+          <small class="hint" id="nodes-hint">Every node accepts writes and is
+            cross-wired to the others.</small>
+        </label>
+
+        <div class="labelled">
+          <span>PostgreSQL major</span>
+          <div class="segmented small" role="radiogroup" aria-label="PostgreSQL major" id="pg_major"></div>
+        </div>
+      </div>
+
+      <div class="row two">
+        <div class="labelled" id="version-field" hidden>
+          <span>Exact version to build</span>
+          <div class="combo" data-combo="pg_version">
+            <input type="text" id="pg_version" role="combobox" spellcheck="false"
+                   aria-expanded="false" aria-controls="pg_version-list">
+            <button type="button" class="combo-toggle" tabindex="-1" aria-label="Show versions">▾</button>
+            <ul class="combo-list" id="pg_version-list" role="listbox" hidden></ul>
+          </div>
+          <small class="hint" id="version-hint"></small>
+        </div>
+
+        <div class="labelled" id="channel-field">
+          <span>Repository channel</span>
+          <div class="segmented small" role="radiogroup" aria-label="Channel" id="repo_channel">
+            <button type="button" role="radio" aria-checked="true" data-value="release" class="on"><strong>release</strong></button>
+            <button type="button" role="radio" aria-checked="false" data-value="staging"><strong>staging</strong></button>
+            <button type="button" role="radio" aria-checked="false" data-value="daily"><strong>daily</strong></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="row two">
+        <div class="labelled">
+          <span>Spock</span>
+          <div class="segmented small" role="radiogroup" aria-label="Spock major" id="spock_major"></div>
+        </div>
+
+        <div class="labelled" id="branch-field" hidden>
+          <span>Spock branch or tag</span>
+          <div class="combo" data-combo="spock_branch">
+            <input type="text" id="spock_branch" role="combobox" spellcheck="false"
+                   aria-expanded="false" aria-controls="spock_branch-list">
+            <button type="button" class="combo-toggle" tabindex="-1" aria-label="Show branches">▾</button>
+            <ul class="combo-list" id="spock_branch-list" role="listbox" hidden></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. standbys -------------------------------------------------- -->
+    <section class="field-group">
+      <h2><span class="step-n">4</span> Standbys</h2>
+      <p class="hint">A standby is a physical replica Patroni can promote if its
+        node fails. Optional — without one, a failed node stays down until you
+        fix it and the other nodes keep serving writes.</p>
+      <div class="chips" id="standbys" role="group" aria-label="Nodes that get a standby"></div>
+
+      <div id="sync-block" hidden>
+        <div class="segmented" role="radiogroup" aria-label="Replication mode" id="sync_mode" style="margin-top:14px">
+          <button type="button" role="radio" aria-checked="true" data-value="async" class="on">
+            <strong>Asynchronous</strong><small>commits never wait; a failover can lose the last few</small>
+          </button>
+          <button type="button" role="radio" aria-checked="false" data-value="sync">
+            <strong>Synchronous</strong><small>each commit waits for the standby</small>
+          </button>
+          <button type="button" role="radio" aria-checked="false" data-value="quorum">
+            <strong>Quorum</strong><small>any N standbys may confirm</small>
+          </button>
+        </div>
+        <div class="row two sync-extra" hidden style="margin-top:14px">
+          <label class="labelled">
+            <span>Standbys that must confirm</span>
+            <div class="stepper">
+              <button type="button" data-step="-1" aria-label="Fewer">−</button>
+              <input type="number" id="sync_count" value="1" min="1" max="5">
+              <button type="button" data-step="1" aria-label="More">+</button>
+            </div>
+          </label>
+          <label class="switch">
+            <input type="checkbox" id="sync_strict">
+            <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+            <span class="switch-text">
+              <strong>Refuse writes when no standby is available</strong>
+              <small>durability over availability</small>
+            </span>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. the rest --------------------------------------------------- -->
+    <section class="field-group">
+      <h2><span class="step-n">5</span> Names, ports and data</h2>
+      <div class="row two">
+        <label class="labelled">
+          <span>Cluster name</span>
+          <input type="text" id="cluster_name" value="pgedge" spellcheck="false">
+          <small class="hint">Used for the Patroni scopes and the saved state.</small>
+        </label>
+        <label class="labelled">
+          <span>Data directory root</span>
+          <input type="text" id="data_root" value="/var/lib/pgedge" spellcheck="false">
+        </label>
+      </div>
+      <div class="row two">
+        <label class="labelled">
+          <span>Database</span>
+          <input type="text" id="db_name" value="postgres" spellcheck="false">
+        </label>
+        <label class="labelled">
+          <span>Superuser</span>
+          <input type="text" id="db_user" value="postgres" spellcheck="false">
+        </label>
+      </div>
+      <div class="row two">
+        <label class="labelled">
+          <span>First PostgreSQL port</span>
+          <div class="stepper">
+            <button type="button" data-step="-1" aria-label="Lower">−</button>
+            <input type="number" id="base_port" value="5432" min="1024" max="65000">
+            <button type="button" data-step="1" aria-label="Higher">+</button>
+          </div>
+          <small class="hint">Nodes sharing a machine take the next port up.</small>
+        </label>
+        <label class="labelled">
+          <span>First Patroni REST port</span>
+          <div class="stepper">
+            <button type="button" data-step="-1" aria-label="Lower">−</button>
+            <input type="number" id="base_restapi_port" value="8008" min="1024" max="65000">
+            <button type="button" data-step="1" aria-label="Higher">+</button>
+          </div>
+        </label>
+      </div>
+      <label class="switch" style="margin-top:14px">
+        <input type="checkbox" id="clean">
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+        <span class="switch-text">
+          <strong>Wipe any previous deployment on these hosts first</strong>
+          <small>stops Patroni, deletes data directories and etcd state — required
+            to reuse a cluster name</small>
+        </span>
+      </label>
+    </section>
+
+    <!-- preview -------------------------------------------------------- -->
+    <section class="preview" id="preview" aria-live="polite">
+      <h2>What will be built</h2>
+      <div id="plan-summary" class="plan-summary"></div>
+      <table class="plan" id="plan-table"></table>
+      <ul class="messages" id="preview-messages"></ul>
+    </section>
+
+    <div class="actions">
+      <button type="submit" id="submit" class="primary" disabled>Deploy cluster</button>
+      <span class="hint" id="submit-hint"></span>
+    </div>
+  </form>
+
+  <section class="job" id="job" hidden aria-live="polite">
+    <h2>
+      <span class="spinner" id="job-spinner"></span>
+      <span id="job-title">Working…</span>
+      <span class="badge" id="job-elapsed"></span>
+    </h2>
+    <ol class="timeline" id="job-steps"></ol>
+    <details id="job-log-wrap" open>
+      <summary>Log</summary>
+      <pre id="job-log"></pre>
+    </details>
+    <p class="hint" id="job-footer"></p>
+  </section>
+</main>
+
+<script src="{{ url_for('static', filename='form-kit.js') }}"></script>
+<script src="{{ url_for('static', filename='deploy.js') }}"></script>
+</body>
+</html>

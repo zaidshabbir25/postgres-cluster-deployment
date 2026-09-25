@@ -95,6 +95,15 @@ jobs:
           check pg_dashboard.sh        500 "#!/usr/bin/env bash"
           exit $fail
 
+      - name: Dashboard scripts parse
+        # A syntax error here takes the whole page down silently — the browser
+        # just renders an empty form.
+        run: |
+          for script in dashboard/static/*.js; do
+            echo "== $script"
+            node --check "$script"
+          done
+
       - name: shellcheck
         # Advisory: the scripts predate it, so a finding annotates the PR
         # rather than blocking it.
