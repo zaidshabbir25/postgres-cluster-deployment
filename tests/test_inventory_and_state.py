@@ -177,6 +177,48 @@ def test_listing_and_deleting(state_dir, deployed_plan):
     assert state.list_clusters() == []
 
 
+def test_state_from_a_newer_build_still_loads(state_dir, deployed_plan):
+    """A state file outlives the code that wrote it.
+
+    Deploy on one branch, operate from another that predates a feature, and the
+    file carries settings this build has never heard of. Refusing to load it
+    would turn a missing feature into an unusable cluster.
+    """
+    import json
+
+    path = state.save(deployed_plan)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["plan"]["log_retention_days"] = 7
+    payload["plan"]["nodes"][0]["future_node_field"] = "x"
+    payload["plan"]["hosts"][0]["future_host_field"] = True
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded, _ = state.load("pgedge")
+
+    assert [n.name for n in loaded.nodes] == [n.name for n in deployed_plan.nodes]
+    assert loaded.node("n1").pg_port == deployed_plan.node("n1").pg_port
+
+
+def test_settings_this_build_does_not_know_survive_a_save(state_dir, deployed_plan):
+    """Otherwise operating from an older branch silently deletes them."""
+    import json
+
+    path = state.save(deployed_plan)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["plan"]["log_retention_days"] = 7
+    payload["plan"]["nodes"][0]["future_node_field"] = "x"
+    payload["plan"]["hosts"][0]["future_host_field"] = True
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded, _ = state.load("pgedge")
+    state.save(loaded)                       # what add-node does at the end
+
+    after = json.loads(path.read_text(encoding="utf-8"))["plan"]
+    assert after["log_retention_days"] == 7
+    assert after["nodes"][0]["future_node_field"] == "x"
+    assert after["hosts"][0]["future_host_field"] is True
+
+
 def test_loading_an_unknown_cluster_says_what_exists(state_dir):
     with pytest.raises(FileNotFoundError, match="No saved state"):
         state.load("nope")

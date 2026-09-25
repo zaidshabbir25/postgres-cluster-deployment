@@ -7,8 +7,44 @@ and where etcd lives. Deployment writes it, reports read it, and the dashboard
 polls against it — so it serialises cleanly to JSON and back.
 """
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields as dataclass_fields
 from typing import Any, Dict, List, Optional
+
+# Where a loaded object keeps the keys this build did not recognise, so that
+# saving it again does not delete another build's settings.
+CARRIED = "_carried_settings"
+
+
+def split_fields(dataclass_type, payload):
+    """(what this build understands, what it does not).
+
+    A state file outlives the code that wrote it. A cluster deployed by a newer
+    build records settings an older one has never heard of — and a branch that
+    predates a feature is exactly that older build. Refusing to load such a
+    file turns a missing feature into an unusable cluster; the settings this
+    build cannot use are simply not its business.
+    """
+    understood = {field_.name for field_ in dataclass_fields(dataclass_type)}
+    known, unknown = {}, {}
+    for key, value in payload.items():
+        (known if key in understood else unknown)[key] = value
+    return known, unknown
+
+
+def build(dataclass_type, payload):
+    """Construct from a payload, carrying anything unrecognised."""
+    known, unknown = split_fields(dataclass_type, payload)
+    instance = dataclass_type(**known)
+    if unknown:
+        setattr(instance, CARRIED, unknown)
+    return instance
+
+
+def with_carried(instance, payload):
+    """Put back the keys this build did not understand, so they survive a save."""
+    payload.update(getattr(instance, CARRIED, {}))
+    return payload
+
 
 # Roles a node can hold.
 ROLE_SPOCK = "spock"      # a multi-master Spock node, cross-wired to its peers
@@ -39,7 +75,7 @@ class Host:
     def to_dict(self):
         payload = asdict(self)
         payload.pop("key_file", None)  # never persist key paths into reports
-        return payload
+        return with_carried(self, payload)
 
 
 @dataclass
@@ -100,7 +136,7 @@ class Node:
         return " ".join(parts)
 
     def to_dict(self):
-        return asdict(self)
+        return with_carried(self, asdict(self))
 
 
 @dataclass
@@ -192,18 +228,18 @@ class ClusterPlan:
         # The password is a deployment input, not something to persist into a
         # report or state file that gets shared around.
         payload["db_password"] = "***"
-        return payload
+        return with_carried(self, payload)
 
     @classmethod
     def from_dict(cls, payload, db_password=None):
         data = dict(payload)
-        hosts = [Host(**h) for h in data.pop("hosts", [])]
-        nodes = [Node(**n) for n in data.pop("nodes", [])]
+        hosts = [build(Host, h) for h in data.pop("hosts", [])]
+        nodes = [build(Node, n) for n in data.pop("nodes", [])]
         if db_password is not None:
             data["db_password"] = db_password
         elif data.get("db_password") == "***":
             data["db_password"] = ""
-        plan = cls(**data)
+        plan = build(cls, data)
         plan.hosts = hosts
         plan.nodes = nodes
         return plan
