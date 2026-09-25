@@ -218,6 +218,55 @@ def test_add_refuses_a_cluster_with_no_spock_nodes(monkeypatch):
     assert "no Spock nodes" in result["failure"]
 
 
+def test_a_node_that_never_started_does_not_block_a_new_one(monkeypatch):
+    """A previous failed add leaves a node registered with an uninitialised
+    scope. It cannot be reloaded and does not need to be — it is serving
+    nobody — so it must not stop the next add."""
+    from aspects import patroni_management
+
+    plan = plan_with(("n1", "n4"))
+    live = {"n1"}
+
+    def members(executor, node, node_name=None):
+        return ([{"name": node.name, "role": "Leader", "state": "running"}]
+                if node.name in live else [])
+
+    monkeypatch.setattr(patroni_management, "list_members", members)
+
+    # what step 3 decides for each existing node
+    decisions = {}
+    for existing in plan.nodes:
+        reload_ok = existing.name in live
+        if reload_ok:
+            decisions[existing.name] = "reloaded"
+        elif not any(m["name"] == existing.name
+                     for m in members(None, existing)):
+            decisions[existing.name] = "skipped"
+        else:
+            decisions[existing.name] = "fatal"
+
+    assert decisions == {"n1": "reloaded", "n4": "skipped"}
+
+
+def test_a_failed_add_records_which_node_it_left_behind(monkeypatch):
+    """So the next attempt can say "remove n4" instead of "already exists"."""
+    from aspects import state
+
+    saved = {}
+    plan = plan_with()
+    monkeypatch.setattr(state, "load", lambda name, db_password=None: (plan, {}))
+    monkeypatch.setattr(state, "resolve_password", lambda *a, **k: "postgres")
+    monkeypatch.setattr(state, "save",
+                        lambda plan, extra=None: saved.update(extra or {}))
+    monkeypatch.setattr(add_node, "_executor_for",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("host is down")))
+
+    result = add_node.add("pgedge", node_name="n3")
+
+    assert result["outcome"] == "failed"
+    assert saved["failed_node"] == "n3"      # it was registered before the failure
+
+
 def test_a_failed_add_never_raises(monkeypatch):
     """Callers get a result dict; the CLI turns it into an exit code."""
     result = run_add(plan_with(), monkeypatch, node_name="n3", pg_version="1.0")

@@ -285,6 +285,15 @@ def preview(cluster_name, form, inventory_path=None):
     plan, metadata = state.load(cluster_name)
     last_change = str(metadata.get("last_change") or "")
 
+    stranded = str(metadata.get("failed_node") or "")
+    if stranded and stranded in {node.name for node in plan.nodes}:
+        warnings.append(
+            f"{stranded} is registered from an add that failed and is not "
+            f"running. It cannot be reloaded, so it will be skipped rather "
+            f"than blocking this add — but remove it when you can: "
+            f"./pg_cluster_ctl.sh node remove {stranded} --wipe-data"
+        )
+
     role = (form.get("role") or "leader").lower()
     leader_name = (form.get("leader") or "").strip()
     leader = next((n for n in plan.spock_nodes if n.name == leader_name), None)

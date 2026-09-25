@@ -514,7 +514,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             "Authorise the new node on its peers",
             "rewrite pg_hba on every existing node and reload Patroni",
         )
-        reloaded, hba_problems = [], []
+        reloaded, hba_problems, dormant = [], [], []
         for existing in existing_nodes:
             existing_executor = _executor_for(plan, existing.host, executors, log)
             # Regenerating from the plan (which now includes the new node)
@@ -531,16 +531,42 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             )
             if ok:
                 reloaded.append(existing.name)
-            else:
-                hba_problems.append(f"{existing.name}: {output.strip()[:200]}")
+                continue
+
+            # A node that never finished being built — a previous add that
+            # failed leaves one registered, its scope uninitialised — cannot be
+            # reloaded, and does not need to be: it is serving nobody, and the
+            # config just written is what it will read when it does start.
+            # Only a *running* node that refuses to reload is fatal, because
+            # that one really will turn the newcomer away.
+            members = patroni_management.list_members(
+                existing_executor, existing, node_name=existing.name
+            )
+            if not any(member.get("name") == existing.name for member in members):
+                dormant.append(existing.name)
+                warnings.append(
+                    f"{existing.name} is registered but not running (its scope "
+                    f"{existing.scope} is uninitialised), so it could not be "
+                    f"reloaded. Its configuration now includes {name} and will "
+                    f"apply when it starts. Remove it if it is a leftover: "
+                    f"./pg_cluster_ctl.sh node remove {existing.name} --wipe-data"
+                )
+                continue
+
+            hba_problems.append(f"{existing.name}: {output.strip()[:200]}")
+
         if hba_problems:
             log.step_end("failed", "; ".join(hba_problems))
             raise AddNodeError(
-                "could not reload Patroni on every existing node, so the new "
+                "could not reload Patroni on every running node, so the new "
                 "node's replication connections would be refused:\n  "
                 + "\n  ".join(hba_problems)
             )
-        log.step_end("passed", f"reloaded {', '.join(reloaded)}")
+        log.step_end(
+            "passed",
+            f"reloaded {', '.join(reloaded) or 'nothing'}"
+            + (f"; skipped {', '.join(dormant)} (not running)" if dormant else "")
+        )
 
         # --- 4. bring the new node up ---------------------------------
         log.step_start("Bootstrap the new node with Patroni",
