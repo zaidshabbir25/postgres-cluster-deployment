@@ -223,6 +223,9 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
     executors = {}
     started = time.time()
     warnings = []
+    # Set once the node is registered in the plan: a failure after that point
+    # leaves it inspectable and removable, and whoever retries has to know.
+    registered = ""
 
     try:
         if not plan.spock_nodes:
@@ -318,6 +321,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         # Register before generating any config: pg_hba and .pgpass are built
         # from plan.nodes, and every node must know about the newcomer.
         plan.nodes.append(node)
+        registered = name
 
         # --- 1. prepare the host ---------------------------------------
         log.step_start("Prepare host",
@@ -357,7 +361,17 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             # honoured a Spock choice never runs. Doing it now means touching
             # spock.so inside a prefix — which is shared by every node built
             # against it, so it is only safe while no node uses this one.
-            spock_asked_for = bool(spock_branch) or wanted_spock != str(plan.spock_major)
+            #
+            # "Asked for" has to mean *different from what is installed*. A
+            # branch that merely repeats the cluster's own is what these
+            # binaries were already built from: rebuilding it would change
+            # nothing and refusing it would block a perfectly ordinary add.
+            cluster_branch = ((plan.source_build or {}).get("spock_branch")
+                              or source_build.default_spock_branch(plan.spock_major))
+            spock_asked_for = (
+                wanted_spock != str(plan.spock_major)
+                or (bool(spock_branch) and spock_branch != cluster_branch)
+            )
             sharers = [n.name for n in existing_nodes if n.bin_dir == node.bin_dir]
             if spock_asked_for and sharers:
                 log.step_end("failed", "Spock is shared with running nodes")
@@ -500,7 +514,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             "Authorise the new node on its peers",
             "rewrite pg_hba on every existing node and reload Patroni",
         )
-        reloaded, hba_problems = [], []
+        reloaded, hba_problems, dormant = [], [], []
         for existing in existing_nodes:
             existing_executor = _executor_for(plan, existing.host, executors, log)
             # Regenerating from the plan (which now includes the new node)
@@ -517,16 +531,42 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             )
             if ok:
                 reloaded.append(existing.name)
-            else:
-                hba_problems.append(f"{existing.name}: {output.strip()[:200]}")
+                continue
+
+            # A node that never finished being built — a previous add that
+            # failed leaves one registered, its scope uninitialised — cannot be
+            # reloaded, and does not need to be: it is serving nobody, and the
+            # config just written is what it will read when it does start.
+            # Only a *running* node that refuses to reload is fatal, because
+            # that one really will turn the newcomer away.
+            members = patroni_management.list_members(
+                existing_executor, existing, node_name=existing.name
+            )
+            if not any(member.get("name") == existing.name for member in members):
+                dormant.append(existing.name)
+                warnings.append(
+                    f"{existing.name} is registered but not running (its scope "
+                    f"{existing.scope} is uninitialised), so it could not be "
+                    f"reloaded. Its configuration now includes {name} and will "
+                    f"apply when it starts. Remove it if it is a leftover: "
+                    f"./pg_cluster_ctl.sh node remove {existing.name} --wipe-data"
+                )
+                continue
+
+            hba_problems.append(f"{existing.name}: {output.strip()[:200]}")
+
         if hba_problems:
             log.step_end("failed", "; ".join(hba_problems))
             raise AddNodeError(
-                "could not reload Patroni on every existing node, so the new "
+                "could not reload Patroni on every running node, so the new "
                 "node's replication connections would be refused:\n  "
                 + "\n  ".join(hba_problems)
             )
-        log.step_end("passed", f"reloaded {', '.join(reloaded)}")
+        log.step_end(
+            "passed",
+            f"reloaded {', '.join(reloaded) or 'nothing'}"
+            + (f"; skipped {', '.join(dormant)} (not running)" if dormant else "")
+        )
 
         # --- 4. bring the new node up ---------------------------------
         log.step_start("Bootstrap the new node with Patroni",
@@ -619,6 +659,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         state.save(plan, extra={
             **metadata,
             "last_change": f"added Spock node {name} via {source.name}",
+            "failed_node": "",
             "run_id": log.run_id,
         })
 
@@ -655,6 +696,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             state.save(plan, extra={
                 **metadata,
                 "last_change": f"FAILED add-node: {exc}",
+                "failed_node": registered,
                 "run_id": log.run_id,
             })
         except Exception:
