@@ -40,10 +40,13 @@ def test_unknown_major_is_rejected():
         sm.zodan_script("70")
 
 
-def test_zodan_comes_from_the_source_checkout_when_it_is_on_that_branch(deployed_plan):
+def test_zodan_comes_from_the_source_checkout_when_it_is_on_that_ref(deployed_plan):
     deployed_plan.deploy_mode = "source"
     node = a_node(spock_major="60")
-    executor = FakeExecutor({"rev-parse --abbrev-ref": (True, "main")})
+    executor = FakeExecutor({
+        "rev-parse --verify -q HEAD": (True, "abc123"),
+        "main^{commit}": (True, "abc123"),
+    })
 
     remote, origin = sm.stage_zodan(executor, deployed_plan, node, "main")
 
@@ -112,12 +115,76 @@ def test_a_stale_pin_for_another_major_is_ignored(deployed_plan):
     assert logger.said("ignoring the pinned zodan-511.sql")
 
 
-def test_a_pin_matching_the_major_is_honoured(deployed_plan):
+def test_the_built_ref_outranks_the_bundled_default(deployed_plan):
+    """configuration/config<major>.env pins a name for every install.
+
+    It is a fallback, not a choice — a cluster built from tag v5.0.5 needs
+    v5.0.5's zodan, whose floor is 5.0.4. The bundled copy tracks a later
+    release that refuses to run against it.
+    """
+    deployed_plan.deploy_mode = "source"
+    deployed_plan.zodan_sql = "zodan-511.sql"        # the config17.env pin
+    node = a_node(spock_major="50")
+    executor = FakeExecutor({"rev-parse": (False, "")})
+
+    remote, origin = sm.stage_zodan(executor, deployed_plan, node, "v5.0.5")
+
+    assert "pgEdge/spock/v5.0.5/samples/Z0DAN/zodan.sql" in origin
+    assert remote.endswith("zodan-v5.0.5.sql")
+
+
+def test_a_checkout_on_a_tag_is_recognised(deployed_plan):
+    """Cloning a tag leaves a detached HEAD, so names cannot be compared."""
+    deployed_plan.deploy_mode = "source"
+    node = a_node(spock_major="50")
+    executor = FakeExecutor({
+        "rev-parse --verify -q HEAD": (True, "abc123"),
+        "v5.0.5^{commit}": (True, "abc123"),
+    })
+
+    _, origin = sm.stage_zodan(executor, deployed_plan, node, "v5.0.5")
+
+    assert "the v5.0.5 checkout" in origin
+
+
+def test_a_checkout_of_another_ref_is_not_used(deployed_plan):
+    node = a_node(spock_major="50")
+    executor = FakeExecutor({
+        "rev-parse --verify -q HEAD": (True, "abc123"),
+        "v5.0.5^{commit}": (True, "999999"),        # a different commit
+    })
+
+    _, origin = sm.stage_zodan(executor, deployed_plan, node, "v5.0.5")
+
+    assert "raw.githubusercontent.com" in origin
+
+
+def test_a_custom_pin_is_still_an_instruction(deployed_plan, monkeypatch):
+    """An air-gapped install names its own script and must keep getting it."""
+    from pathlib import Path as _Path
+
+    called = {}
+
+    def remember(major, override=None):
+        called["override"] = override
+        return _Path("configuration/spock/zodan-511.sql")
+
+    monkeypatch.setattr(sm, "zodan_script", remember)
+    deployed_plan.zodan_sql = "my-own-zodan.sql"
+    sm.stage_zodan(FakeExecutor(), deployed_plan, a_node(spock_major="50"),
+                   "v5_STABLE")
+
+    assert called["override"] == "my-own-zodan.sql"
+
+
+def test_the_bundled_copy_is_still_the_last_resort(deployed_plan):
+    """With no checkout and no network, the pinned default is what is left."""
     deployed_plan.spock_major = "50"
     deployed_plan.zodan_sql = "zodan-511.sql"
     node = a_node(spock_major="50")
+    executor = FakeExecutor({"rev-parse": (False, ""), "curl": (False, "")})
 
-    _, origin = sm.stage_zodan(FakeExecutor(), deployed_plan, node, "v5_STABLE")
+    _, origin = sm.stage_zodan(executor, deployed_plan, node, "v5_STABLE")
 
     assert "bundled zodan-511.sql" in origin
 

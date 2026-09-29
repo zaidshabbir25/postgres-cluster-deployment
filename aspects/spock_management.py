@@ -121,11 +121,18 @@ def stage_zodan(executor, plan, node, branch, run_logger=None):
          works. It tracks a Spock major rather than a branch, which is why it
          is last.
 
-    An explicit plan.zodan_sql skips straight to the bundled directory: naming
-    a script is an instruction, not a preference. It is ignored for a node
-    whose Spock major differs from the cluster's, though — that name was chosen
-    for the cluster's major, and loading a Spock 5 script into a Spock 6 node
-    produces procedures that call an API the extension no longer has.
+    A *custom* plan.zodan_sql skips straight to the bundled directory: naming
+    your own script is an instruction, and an air-gapped install depends on it.
+    A name that merely repeats the bundled default for this major is not an
+    instruction — configuration/config<major>.env sets one for every install —
+    and it must not outrank the branch the extension was actually built from.
+    That distinction matters: a cluster built from tag v5.0.5 needs v5.0.5's
+    zodan, and the bundled copy tracks a later release whose procedures refuse
+    to run against it.
+
+    A pin is also ignored for a node whose Spock major differs from the
+    cluster's: that name was chosen for the cluster's major, and a Spock 5
+    script in a Spock 6 node calls an API the extension no longer has.
     Returns (remote path, origin).
     """
     from aspects import source_build  # local: source_build imports nothing here
@@ -139,13 +146,13 @@ def stage_zodan(executor, plan, node, branch, run_logger=None):
     # older version of this tool used to write into the saved state
     # automatically, so it is residue rather than an instruction.
     pinned = plan.zodan_sql or ""
-    other_majors = {
-        filename for major, filename in ZODAN_BY_SPOCK_MAJOR.items()
-        if str(major) != str(spock_major)
-    }
-    if pinned and (str(spock_major) != str(plan.spock_major)
-                   or pinned in other_majors):
-        if run_logger:
+    bundled_default = ZODAN_BY_SPOCK_MAJOR.get(str(spock_major), "")
+    is_default = pinned == bundled_default
+    wrong_major = (str(spock_major) != str(plan.spock_major)
+                   or pinned in {name for major, name in ZODAN_BY_SPOCK_MAJOR.items()
+                                 if str(major) != str(spock_major)})
+    if pinned and (wrong_major or is_default):
+        if run_logger and wrong_major:
             run_logger.warn(
                 f"{node.name}: ignoring the pinned {pinned}, which is not the "
                 f"zodan script for spock{spock_major}"
@@ -160,11 +167,20 @@ def stage_zodan(executor, plan, node, branch, run_logger=None):
     if not pinned:
         remote = f"{REMOTE_ZODAN_DIR}/zodan-{_safe_name(branch)}.sql"
         checkout = f"{source_build.BUILD_ROOT}/spock"
-        on_branch, current = executor.try_run(
-            f"git -C {shlex.quote(checkout)} rev-parse --abbrev-ref HEAD "
+        # Compare commits, not names: cloning a tag leaves a detached HEAD, so
+        # `rev-parse --abbrev-ref HEAD` says "HEAD" and a name comparison would
+        # miss the very checkout the extension was built from.
+        matched, current = executor.try_run(
+            f"git -C {shlex.quote(checkout)} rev-parse --verify -q HEAD "
             f"2>/dev/null", node=node.name,
         )
-        if on_branch and current.strip() == str(branch):
+        wanted_ok, wanted = executor.try_run(
+            f"git -C {shlex.quote(checkout)} rev-parse --verify -q "
+            f"{shlex.quote(str(branch))}^{{commit}} 2>/dev/null", node=node.name,
+        )
+        same_commit = (matched and wanted_ok
+                       and current.strip() and current.strip() == wanted.strip())
+        if same_commit:
             copied, _ = executor.try_run(
                 f"cp {shlex.quote(checkout)}/{ZODAN_REPO_PATH} "
                 f"{shlex.quote(remote)}", node=node.name,
