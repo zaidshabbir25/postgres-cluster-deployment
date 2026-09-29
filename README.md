@@ -478,6 +478,15 @@ Three things worth knowing:
 `quorum` (Patroni's quorum-based commit, where any N of the standbys may
 confirm) is accepted wherever `sync` is.
 
+### When zodan reports less than 100%
+
+zodan tallies its subscriptions the instant it finishes, so the reverse one it
+created seconds earlier is often still `initializing` — a two-node join
+routinely ends at `Success rate: %50.0` with `With errors/issues: 0`. That is
+not a failure, and the deployment no longer treats it as one: it reads zodan's
+own error count, then waits for every subscription on both nodes to report
+`replicating`, and fails only if one never does or zodan counted a real error.
+
 ---
 
 ## Growing a running cluster

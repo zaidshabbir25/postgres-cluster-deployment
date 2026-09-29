@@ -314,6 +314,20 @@ print("|".join([
 PYEOF
 }
 
+pg_major_of() {
+  # pg_major_of 19beta3 -> 19. Shares pg_server_management's parsing so the
+  # prompt and the deployment agree on what "the same major" means.
+  python3 - "$1" <<'PYEOF'
+import sys
+try:
+    from aspects.pg_server_management import major_of
+except Exception:
+    print(sys.argv[1].split(".")[0])
+else:
+    print(major_of(sys.argv[1]))
+PYEOF
+}
+
 default_spock_branch() {
   # The branch a Spock major is developed on, straight from source_build so the
   # prompt and the build cannot drift apart.
@@ -644,6 +658,18 @@ if [[ -n "$ADD_NODE" ]]; then
           BRANCH_DEFAULT="$(default_spock_branch "$NODE_SPOCK_MAJOR")"
         fi
         NODE_SPOCK_BRANCH="$(ask "   Spock branch or tag" "$BRANCH_DEFAULT")"
+        say ""
+      fi
+
+      # Spock is built into the PostgreSQL prefix. A different branch on the
+      # cluster's own major would rebuild it under the running nodes, which the
+      # deployment refuses — so say that here, while it is still a choice.
+      if [[ -n "$NODE_SPOCK_BRANCH" && "$NODE_SPOCK_BRANCH" != "$FACT_BRANCH" ]] \
+         && [[ "$(pg_major_of "${NODE_PG_VERSION:-$FACT_PG}")" == "$(pg_major_of "$FACT_PG")" ]]; then
+        warn "branch $NODE_SPOCK_BRANCH differs from the cluster's $FACT_BRANCH, and $ADD_NODE would share the PostgreSQL prefix the running nodes use."
+        say "   ${DIM}Spock lives inside that prefix, so building it there would replace"
+        say "   the Spock those nodes are running. Either keep $FACT_BRANCH, or give"
+        say "   $ADD_NODE its own prefix by choosing a different PostgreSQL version.${RESET}"
         say ""
       fi
       NODE_ARGS+=(--spock-branch "$NODE_SPOCK_BRANCH")

@@ -374,15 +374,26 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             )
             sharers = [n.name for n in existing_nodes if n.bin_dir == node.bin_dir]
             if spock_asked_for and sharers:
+                # Name the difference that triggered this, and the two ways
+                # out. "Use the cluster's spock50" reads as nonsense to someone
+                # who did choose spock50 and changed only the branch.
+                changed = (f"spock{wanted_spock}"
+                           if wanted_spock != str(plan.spock_major)
+                           else f"branch {wanted_branch}")
+                current = (f"spock{plan.spock_major}"
+                           if wanted_spock != str(plan.spock_major)
+                           else f"branch {cluster_branch}")
                 log.step_end("failed", "Spock is shared with running nodes")
                 raise AddNodeError(
-                    f"{', '.join(sharers)} already run from {node.bin_dir}, and "
-                    f"Spock lives inside that prefix — installing spock"
-                    f"{wanted_spock}"
-                    + (f" from {wanted_branch}" if spock_branch else "")
-                    + f" there would swap it under them mid-flight. Give {name} "
-                      f"its own PostgreSQL with a different --pg-version, or "
-                      f"add it with the cluster's spock{plan.spock_major}."
+                    f"{', '.join(sharers)} run from {node.bin_dir}, and Spock "
+                    f"lives inside that prefix: building {changed} there would "
+                    f"replace the Spock those nodes are running, while they "
+                    f"are running it.\n"
+                    f"  Either add {name} with the cluster's {current} — it "
+                    f"then reuses what is already built — or give it a prefix "
+                    f"of its own with a different PostgreSQL version "
+                    f"(--pg-version), which is what makes a different Spock "
+                    f"safe to build."
                 )
             if spock_asked_for and plan.deploy_mode == "source":
                 source_build.rebuild_spock(
@@ -614,6 +625,27 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             executor, plan, source, node, run_logger=log
         )
         log.node(node.name, output)
+
+        if joined is None:
+            # Not a verdict: zodan's tally is a snapshot, and the reverse
+            # subscription is usually still initializing when it is taken.
+            if spock_management.settled(output):
+                log.info("    zodan reported no errors — waiting for the "
+                         "subscriptions to start replicating")
+                joined, detail = spock_management.wait_for_subscriptions(
+                    lambda target: _executor_for(plan, target.host, executors, log),
+                    plan, [source, node], run_logger=log,
+                )
+                if not joined:
+                    log.step_end("failed", detail)
+                    raise AddNodeError(
+                        f"{name} joined but its subscriptions never started "
+                        f"replicating: {detail}. Full zodan output is in "
+                        f"{log.node_log_path(name)}"
+                    )
+            else:
+                joined = False
+
         if not joined:
             rate = spock_management.parse_success_rate(output)
             log.step_end("failed", f"zodan success rate {rate}%"

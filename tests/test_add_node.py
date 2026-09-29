@@ -218,6 +218,51 @@ def test_add_refuses_a_cluster_with_no_spock_nodes(monkeypatch):
     assert "no Spock nodes" in result["failure"]
 
 
+def test_the_shared_prefix_refusal_names_what_changed(monkeypatch):
+    """"Use the cluster's spock50" reads as nonsense to someone who chose
+    spock50 and changed only the branch."""
+    from aspects import platform_detect, pg_server_management, state
+    from deployment import topology
+
+    plan = plan_with(("n1", "n2"), spock_major="50", deploy_mode="source")
+    plan.source_build = {"spock_branch": "v5.0.5"}
+    for node in plan.nodes:
+        node.bin_dir = "/opt/pgedge/pg17/bin"
+
+    monkeypatch.setattr(state, "load", lambda name, db_password=None: (plan, {}))
+    monkeypatch.setattr(state, "resolve_password", lambda *a, **k: "postgres")
+    monkeypatch.setattr(state, "save", lambda *a, **k: None)
+    monkeypatch.setattr(platform_detect, "detect",
+                        lambda executor: {"family": "rhel", "pretty": "Rocky", "arch": "x86_64"})
+    monkeypatch.setattr(platform_detect, "advertise_for", lambda e, a: a)
+    monkeypatch.setattr(topology, "apply_platform", lambda *a, **k: "/opt/pgedge/pg17/bin")
+    monkeypatch.setattr(pg_server_management, "server_version", lambda *a, **k: "17.11")
+    monkeypatch.setattr(add_node, "_executor_for", lambda *a, **k: object())
+
+    result = add_node.add("pgedge", node_name="n3", spock_branch="v5_STABLE")
+
+    assert result["outcome"] == "failed"
+    failure = result["failure"]
+    assert "building branch v5_STABLE" in failure
+    assert "the cluster's branch v5.0.5" in failure     # not "spock50"
+    assert "--pg-version" in failure
+
+
+def test_the_same_branch_is_not_a_change(monkeypatch):
+    """Repeating the cluster's branch must not trip the shared-prefix guard."""
+    from aspects import source_build
+
+    plan = plan_with(("n1",), spock_major="50", deploy_mode="source")
+    plan.source_build = {"spock_branch": "v5.0.5"}
+    cluster_branch = ((plan.source_build or {}).get("spock_branch")
+                      or source_build.default_spock_branch(plan.spock_major))
+
+    for branch, expected in (("", False), ("v5.0.5", False), ("v5_STABLE", True)):
+        changing = ("50" != str(plan.spock_major)
+                    or (bool(branch) and branch != cluster_branch))
+        assert changing is expected, branch
+
+
 def test_a_failed_add_never_raises(monkeypatch):
     """Callers get a result dict; the CLI turns it into an exit code."""
     result = run_add(plan_with(), monkeypatch, node_name="n3", pg_version="1.0")

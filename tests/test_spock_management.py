@@ -237,14 +237,95 @@ def test_add_node_calls_spock_add_node_on_the_new_node(deployed_plan):
     assert f"port={new.pg_port}" in call
 
 
-def test_add_node_reports_a_partial_join_as_failure(deployed_plan):
+def test_a_failed_call_is_still_a_failure(deployed_plan):
+    """A non-zero psql exit is unambiguous — no waiting will help."""
     source, new = deployed_plan.node("n1"), deployed_plan.node("n2")
-    executor = FakeExecutor({"CALL spock.add_node": (True, "Success rate: %60")})
+    executor = FakeExecutor({"CALL spock.add_node": (False, "ERROR: boom")})
 
     ok, output = sm.add_node(executor, deployed_plan, source, new)
 
     assert ok is False
-    assert sm.parse_success_rate(output) == 60
+    assert "boom" in output
+
+
+ZODAN_TAIL = """
+NOTICE:  SUBSCRIPTION STATUS SUMMARY
+NOTICE:  ==========================
+NOTICE:  Total subscriptions: 2
+NOTICE:  Replicating: 1
+NOTICE:  With errors/issues: 0
+NOTICE:  Success rate: %50.0
+"""
+
+
+def test_a_partial_rate_with_no_errors_is_not_a_verdict(deployed_plan):
+    """zodan counts the instant it finishes: the reverse subscription it
+    created seconds earlier is still initializing. Its own report says whether
+    anything actually failed."""
+    source, new = deployed_plan.node("n1"), deployed_plan.node("n2")
+    executor = FakeExecutor({"CALL spock.add_node": (True, ZODAN_TAIL)})
+
+    verdict, output = sm.add_node(executor, deployed_plan, source, new)
+
+    assert verdict is None                      # "ask again", not "failed"
+    assert sm.settled(output) is True
+
+
+def test_a_reported_error_is_a_verdict(deployed_plan):
+    source, new = deployed_plan.node("n1"), deployed_plan.node("n2")
+    broken = ZODAN_TAIL.replace("With errors/issues: 0", "With errors/issues: 1")
+    executor = FakeExecutor({"CALL spock.add_node": (True, broken)})
+
+    verdict, output = sm.add_node(executor, deployed_plan, source, new)
+
+    assert verdict is None
+    assert sm.settled(output) is False
+
+
+def test_nothing_replicating_is_not_settled():
+    assert sm.settled(ZODAN_TAIL.replace("Replicating: 1", "Replicating: 0")) is False
+
+
+def test_an_unreadable_report_is_not_settled():
+    """Missing counters are "cannot tell", which is not "fine"."""
+    assert sm.settled("zodan said something else entirely") is False
+    assert sm.parse_subscription_summary("")["total"] is None
+
+
+def test_waiting_ends_when_every_subscription_replicates(deployed_plan, monkeypatch):
+    seen = {"polls": 0}
+
+    def status(executor, plan, node):
+        if node.name == "n2":
+            return [{"name": "sub_n1_n2", "status": "replicating", "provider": "n1"}]
+        seen["polls"] += 1
+        return [{"name": "sub_n1_n2",
+                 "status": "replicating" if seen["polls"] >= 3 else "initializing",
+                 "provider": "n2"}]
+
+    monkeypatch.setattr(sm, "subscription_status", status)
+
+    ok, detail = sm.wait_for_subscriptions(
+        lambda node: FakeExecutor(), deployed_plan,
+        [deployed_plan.node("n1"), deployed_plan.node("n2")],
+        timeout=10, interval=0.05,
+    )
+
+    assert ok is True
+    assert "every subscription is replicating" in detail
+
+
+def test_waiting_gives_up_and_names_what_is_stuck(deployed_plan, monkeypatch):
+    monkeypatch.setattr(sm, "subscription_status", lambda e, p, node: [
+        {"name": "sub_n1_n2", "status": "down", "provider": "n1"}])
+
+    ok, detail = sm.wait_for_subscriptions(
+        lambda node: FakeExecutor(), deployed_plan, [deployed_plan.node("n1")],
+        timeout=0.2, interval=0.05,
+    )
+
+    assert ok is False
+    assert "n1:sub_n1_n2=down" in detail
 
 
 def test_parse_success_rate():

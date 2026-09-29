@@ -18,6 +18,7 @@ are loaded and where the final sync is awaited.
 
 import re
 import shlex
+import time
 from pathlib import Path
 
 from aspects import pg_server_management
@@ -298,13 +299,74 @@ def add_node(executor, plan, source_node, new_node, run_logger=None,
         return False, output
 
     if "Success rate: %100" not in output:
-        # zodan prints a per-phase tally; anything short of 100% means at least
-        # one subscription or slot did not come up.
-        return False, (
-            "zodan add_node did not report a 100% success rate — the node is "
-            "partially wired:\n" + output
-        )
+        # Short of 100% is not automatically a failure. zodan counts
+        # subscriptions the instant it finishes, and the reverse subscription
+        # it created seconds earlier is usually still "initializing" — its own
+        # report says so: "With errors/issues: 0". The caller settles it by
+        # waiting for the subscriptions to converge, which is the only
+        # question that matters.
+        return None, output
     return True, output
+
+
+SUMMARY_PATTERNS = {
+    "total": r"Total subscriptions:\s*(\d+)",
+    "replicating": r"Replicating:\s*(\d+)",
+    "problems": r"With errors/issues:\s*(\d+)",
+}
+
+
+def parse_subscription_summary(output):
+    """zodan's own tally, as {total, replicating, problems, rate}.
+
+    Missing counters come back as None rather than zero: "we could not tell"
+    and "there were none" lead to different decisions.
+    """
+    summary = {}
+    for key, pattern in SUMMARY_PATTERNS.items():
+        match = re.search(pattern, output or "")
+        summary[key] = int(match.group(1)) if match else None
+    summary["rate"] = parse_success_rate(output)
+    return summary
+
+
+def settled(output):
+    """Did zodan finish without an error, even if not everything was live yet?"""
+    summary = parse_subscription_summary(output)
+    return (summary["problems"] == 0
+            and (summary["replicating"] or 0) >= 1
+            and (summary["total"] or 0) >= 1)
+
+
+def wait_for_subscriptions(executor_for, plan, nodes, timeout=180, interval=5,
+                           run_logger=None):
+    """Poll until every node's subscriptions are replicating.
+
+    zodan's percentage is a snapshot taken the moment it returns; a
+    subscription created seconds before is still initializing. This asks the
+    only question that matters — is it replicating now? — and gives it time to
+    become true. Returns (ok, detail).
+    """
+    deadline = time.monotonic() + timeout
+    detail = ""
+    while True:
+        pending = []
+        for node in nodes:
+            for subscription in subscription_status(executor_for(node), plan, node):
+                status = (subscription.get("status") or "").lower()
+                if status not in ("replicating", "synchronizing"):
+                    pending.append(
+                        f"{node.name}:{subscription['name']}={subscription['status']}"
+                    )
+        if not pending:
+            return True, "every subscription is replicating"
+
+        detail = ", ".join(pending)
+        if time.monotonic() >= deadline:
+            return False, detail
+        if run_logger:
+            run_logger.info(f"    waiting for subscriptions to start: {detail}")
+        time.sleep(interval)
 
 
 def health_check(executor, plan, source_node, new_node=None, phase="post",

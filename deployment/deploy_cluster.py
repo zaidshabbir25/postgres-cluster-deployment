@@ -519,6 +519,37 @@ class ClusterDeployer:
                 executor, self.plan, source, node, run_logger=self.log
             )
             self.log.node(node.name, output)
+
+            if ok is None:
+                # zodan counted its subscriptions the moment it finished, and
+                # the reverse one it had just created was still initializing.
+                # Its own report says whether anything actually failed; if not,
+                # the question is simply whether replication starts.
+                summary = spock_management.parse_subscription_summary(output)
+                if not spock_management.settled(output):
+                    raise RuntimeError(
+                        f"cross-wiring {node.name} via {source.name} failed "
+                        f"(zodan reported {summary['problems']} subscription(s) "
+                        f"with errors). Full zodan output is in "
+                        f"{self.log.node_log_path(node.name)}"
+                    )
+                self.log.info(
+                    f"    zodan reported {summary['replicating']}/"
+                    f"{summary['total']} subscriptions replicating and no "
+                    f"errors — waiting for the rest to start"
+                )
+                settled, detail = spock_management.wait_for_subscriptions(
+                    self.executor_for_node, self.plan, [source, node],
+                    run_logger=self.log,
+                )
+                if not settled:
+                    raise RuntimeError(
+                        f"{node.name} joined but its subscriptions never "
+                        f"started replicating: {detail}. Full zodan output is "
+                        f"in {self.log.node_log_path(node.name)}"
+                    )
+                ok = True
+
             if not ok:
                 rate = spock_management.parse_success_rate(output)
                 raise RuntimeError(
