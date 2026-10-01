@@ -220,10 +220,25 @@ def cmd_node_add(args):
 def cmd_node_remove(args):
     cluster = _resolve_cluster(args)
     if not args.yes:
+        # Say which of the two removals this is, because they carry different
+        # risks: un-wiring a Spock node is irreversible for its local writes,
+        # while dropping a standby only costs the scope its redundancy.
+        try:
+            plan, _ = _load(args)
+            kind = "Spock node" if plan.node(args.name).is_spock else "standby"
+        except Exception:
+            kind = "node"
+        if kind == "standby":
+            detail = (f"its scope's synchronous requirement is lowered first "
+                      f"so writes keep flowing, then it is stopped and its "
+                      f"replication slot is released.")
+        else:
+            detail = (f"its subscriptions and slots are dropped in both "
+                      f"directions with spock.remove_node and it is "
+                      f"deregistered from every peer.")
         print(
-            f"This removes Spock node '{args.name}' from cluster '{cluster}': "
-            f"its subscriptions are dropped in both directions and it is "
-            f"deregistered from every peer."
+            f"This removes {kind} '{args.name}' from cluster '{cluster}': "
+            + detail
             + ("  Its data directory will be DELETED." if args.wipe_data else
                "  Its data directory will be left in place.")
         )
@@ -989,9 +1004,13 @@ def _register_node(subparsers, add_common):
     adding.add_argument("--skip-verify", action="store_true")
     adding.set_defaults(func=cmd_node_add)
 
-    removing = actions.add_parser("remove", help="remove a Spock node")
+    removing = actions.add_parser(
+        "remove", help="remove a Spock node or a standby from a live cluster"
+    )
     add_common(removing)
-    removing.add_argument("name", help="node to remove")
+    removing.add_argument("name", help="node to remove; a Spock node is "
+                                       "un-wired from the mesh, a standby is "
+                                       "dropped from its scope")
     removing.add_argument("--wipe-data", action="store_true",
                           help="also delete its data directory")
     removing.add_argument("--drain-timeout", type=int, default=300,

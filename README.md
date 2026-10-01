@@ -498,6 +498,20 @@ own error count, then waits for every subscription on both nodes to report
 ./pg_deploy_cluster.sh --add-node n3 --host node-d --source n2
 ```
 
+## Shrinking a running cluster
+
+```bash
+./pg_deploy_cluster.sh --remove-node n3                     # asks to confirm by name
+./pg_deploy_cluster.sh --remove-node n3 --wipe-data --yes
+./pg_deploy_cluster.sh --remove-node n1s1                   # a standby
+```
+
+It tells you which of the two removals this is before asking, because they are
+not the same operation — `node remove` below describes what each one does. The
+rest of the cluster keeps serving throughout: survivors are reloaded, never restarted, and no step touches
+a peer's PostgreSQL. Removing the last Spock node is refused — that is a
+teardown, and `--cleanup` does it properly.
+
 It asks two questions, unless the flags answer them:
 
 **What should the node be?** A *Spock node* (`--role leader`) is a multi-master
@@ -624,7 +638,8 @@ one is the default) and `--json` to any read-only command for machine output.
 ```bash
 ./pg_cluster_ctl.sh node list
 ./pg_cluster_ctl.sh node add --host node-d          # a new multi-master peer
-./pg_cluster_ctl.sh node remove n3 --wipe-data
+./pg_cluster_ctl.sh node remove n3 --wipe-data       # un-wire a multi-master peer
+./pg_cluster_ctl.sh node remove n1s1                # drop a standby from its scope
 ./pg_cluster_ctl.sh node command 'df -h /var' --on all
 ./pg_cluster_ctl.sh node command 'SELECT count(*) FROM orders' --sql --compare
 ./pg_cluster_ctl.sh node ssh n2                     # interactive shell
@@ -639,11 +654,26 @@ source-to-new subscription, which zodan creates with `synchronize_structure` and
 from the pgEdge CLI, which restored the new node from a pgBackRest physical
 backup: logical sync needs nothing extra but is slower on a large dataset.
 
-`node remove` detaches in both directions before deregistering — every peer
-drops its subscription *from* the node and the node drops its subscriptions *to*
-every peer. Dropping only one side leaves orphaned slots retaining WAL forever.
-It also waits for the node's outbound replication to drain first, so writes made
-on it are not lost; `--force` overrides that and says what it cost.
+`node remove` takes a node out of a cluster that stays up. For a Spock node it
+runs zodremove's `spock.remove_node` — the inverse of the `add_node` that wired
+it in — on the node being removed, which unwinds the mesh in the order that
+leaves nothing behind: subscriptions, which take their replication slots with
+them, then replication sets, then the registration on every peer. Dropping only
+one side of a subscription pair leaves an orphaned slot retaining WAL forever,
+so afterwards it checks each surviving peer and refuses to call the removal done
+while anything still references the node. It waits for the node's outbound
+replication to drain first, so writes made on it are not lost; `--force`
+overrides that, and falls back to dropping subscriptions by hand if zodremove
+cannot run at all.
+
+For a standby it is a different operation with a different hazard: no Spock
+state changes, but a scope told to wait for one synchronous standby, whose only
+standby is then stopped, blocks every write. So the scope's synchronous
+requirement is lowered *before* the standby goes, and the permanent replication
+slot its leader was holding is released afterwards — left behind, that slot
+retains WAL for a node that is never coming back. A standby Patroni has promoted
+is refused rather than stopped: it is the node taking writes, and stopping it is
+an outage.
 
 `node command --compare` groups nodes by identical output, which turns "run this
 on six nodes" into a one-line answer when they agree and an obvious split when

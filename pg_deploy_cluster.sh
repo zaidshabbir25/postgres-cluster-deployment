@@ -112,13 +112,25 @@ Growing a running cluster
   --source NODE             existing node to join through                [n1]
 
 Cleanup
+  --remove-node NAME        remove one node from a deployed cluster and exit.
+                            A Spock node is un-wired from the mesh with
+                            zodremove's spock.remove_node; a standby is dropped
+                            from its scope after its synchronous requirement is
+                            lowered. The rest of the cluster keeps serving.
+  --wipe-data               with --remove-node, also delete its data directory,
+                            Patroni config and systemd unit
+  --drain-timeout N         with --remove-node, seconds to wait for its
+                            outbound replication to catch up               [300]
+  --force                   with --remove-node, continue past an unreachable
+                            node, un-replicated WAL, or a failed un-wiring
+  --yes                     with --remove-node or --cleanup, skip the prompt
+
   --cleanup                 scrub every host in the inventory and exit: Patroni
                             units, etcd state, data directories, cluster config
                             and saved state. Works after a failed deployment,
                             when there is no cluster state to remove.
   --purge                   with --cleanup, also uninstall the pgEdge packages
                             and repository
-  --yes                     with --cleanup, skip the confirmation prompt
 
 Other commands
   ./pg_cluster_ctl.sh       operate a deployed cluster:
@@ -462,6 +474,9 @@ DRY_RUN=false
 CLEANUP=false
 CLEANUP_ARGS=()
 ADD_NODE=""
+REMOVE_NODE=""
+REMOVE_ARGS=()
+ASSUME_YES=false
 NODE_ARGS=()
 NODE_ROLE=""
 NODE_LEADER=""
@@ -479,10 +494,19 @@ while [[ $# -gt 0 ]]; do
     --inventory) INVENTORY="$2"; ARGS+=("--inventory" "$2"); INTERACTIVE=false; shift 2 ;;
     --dry-run) DRY_RUN=true; ARGS+=("--dry-run"); INTERACTIVE=false; shift ;;
     --cleanup) CLEANUP=true; INTERACTIVE=false; shift ;;
-    --purge|--yes) CLEANUP_ARGS+=("$1"); shift ;;
+    --purge) CLEANUP_ARGS+=("$1"); shift ;;
+    --yes) CLEANUP_ARGS+=("$1"); ASSUME_YES=true; shift ;;
     --add-node)
       [[ $# -ge 2 ]] || die "--add-node needs a node name (e.g. --add-node n3)"
       ADD_NODE="$2"; INTERACTIVE=false; shift 2 ;;
+    --remove-node)
+      [[ $# -ge 2 ]] || die "--remove-node needs a node name (e.g. --remove-node n3)"
+      REMOVE_NODE="$2"; INTERACTIVE=false; shift 2 ;;
+    --wipe-data|--force)
+      REMOVE_ARGS+=("$1"); shift ;;
+    --drain-timeout)
+      [[ $# -ge 2 ]] || die "--drain-timeout needs a value in seconds"
+      REMOVE_ARGS+=("$1" "$2"); shift 2 ;;
     --host|--source|--role|--leader)
       [[ $# -ge 2 ]] || die "$1 needs a value"
       [[ "$1" == "--role" ]]   && NODE_ROLE="$2"
@@ -515,6 +539,60 @@ ensure_venv
 # ---------------------------------------------------------------------------
 # Cleanup — a mode of its own, not a deployment
 # ---------------------------------------------------------------------------
+
+if [[ -n "$REMOVE_NODE" ]]; then
+  [[ -z "$ADD_NODE" ]] || die "--add-node and --remove-node do the opposite of each other; pick one"
+  [[ "$CLEANUP" == false ]] || die "--remove-node takes one node out; --cleanup scrubs every host. Pick one"
+  FACTS="$(cluster_facts "$CLUSTER_NAME")"
+  [[ -n "$FACTS" ]] || die "no deployed cluster found - there is nothing to remove a node from"
+  IFS='|' read -r FACT_CLUSTER FACT_PG FACT_SPOCK FACT_ALL FACT_MODE \
+    FACT_SPOCK_MAJOR FACT_BRANCH <<<"$FACTS"
+
+  # Which kind of node this is decides what the removal actually does, so say
+  # it up front rather than letting the Python side discover it.
+  [[ ",$FACT_ALL," == *",$REMOVE_NODE,"* ]] \
+    || die "'$REMOVE_NODE' is not a node in cluster '$FACT_CLUSTER'. Nodes: ${FACT_ALL:-none}"
+  if [[ ",$FACT_SPOCK," == *",$REMOVE_NODE,"* ]]; then
+    REMOVE_KIND="spock"
+  else
+    REMOVE_KIND="standby"
+  fi
+
+  say ""
+  say "${BOLD}Removing $REMOVE_KIND node $REMOVE_NODE from cluster '$FACT_CLUSTER'${RESET}"
+  rule
+  say "   Spock nodes: ${FACT_SPOCK:-none}"
+  say "   All nodes  : ${FACT_ALL:-none}"
+  rule
+  say ""
+
+  if [[ "$REMOVE_KIND" == "spock" ]]; then
+    SPOCK_COUNT="$(awk -F, '{print NF}' <<<"$FACT_SPOCK")"
+    (( SPOCK_COUNT > 1 )) \
+      || die "$REMOVE_NODE is the only Spock node in '$FACT_CLUSTER'. Removing it leaves no cluster - use --cleanup to tear the whole thing down"
+    say "${DIM}$REMOVE_NODE is un-wired with spock.remove_node from branch"
+    say "$FACT_BRANCH: its subscriptions and their replication slots are dropped in"
+    say "both directions, then it is deregistered from every peer. Any standby of"
+    say "$REMOVE_NODE goes with it. The remaining nodes keep serving throughout.${RESET}"
+  else
+    say "${DIM}$REMOVE_NODE is a physical replica. Its scope's synchronous"
+    say "requirement is lowered first - so its leader never waits for a standby"
+    say "that is gone - then Patroni is stopped and the replication slot the"
+    say "leader was holding for it is released. No Spock state changes.${RESET}"
+  fi
+  say ""
+
+  if [[ "$ASSUME_YES" == false ]]; then
+    CONFIRM="$(ask "Type '$REMOVE_NODE' to confirm" "")"
+    [[ "$CONFIRM" == "$REMOVE_NODE" ]] || die "aborted - nothing was changed"
+  fi
+  REMOVE_ARGS+=("--yes")
+
+  exec python3 -m deployment.cli node remove "$REMOVE_NODE" \
+    --inventory "$INVENTORY" \
+    ${CLUSTER_NAME:+--cluster "$CLUSTER_NAME"} \
+    "${REMOVE_ARGS[@]+"${REMOVE_ARGS[@]}"}"
+fi
 
 if [[ -n "$ADD_NODE" ]]; then
   [[ "$ADD_NODE" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] \

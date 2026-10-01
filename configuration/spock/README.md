@@ -34,11 +34,36 @@ is selected by `--spock-major`. Override it for one run with
 `--zodan-sql zodan-600.sql`, or pin it per PostgreSQL version with
 `ZODAN_SQL_SPOCK<major>` in `configuration/config<major>.env`.
 
-## Other files
+## Removing a node
 
-`zodremove-504.sql` provides the inverse operation — removing a node from a
-cross-wired cluster. The deployment does not call it; it is here for manual use
-when you want to detach a node without tearing the whole cluster down.
+`zodremove.sql` is the inverse operation, and `node remove` calls it. It
+installs `spock.remove_node(target_node_name, target_node_dsn, verbose)`, which
+unwinds the mesh in the order that leaves nothing behind: subscriptions first —
+which take their replication slots with them — then replication sets, then the
+node registration on every peer. Dropping only one side of a subscription pair
+leaves a slot retaining WAL on a healthy node forever, which is the failure this
+ordering exists to prevent.
+
+It must run **on the node being removed**: its first act is to compare
+`spock.node_info()` with the name it was given and refuse if they differ.
+Everything it touches on the peers it reaches through dblink. That is the mirror
+of `spock.add_node`, which also runs on the node that is joining.
+
+The file is read from the same branch as `zodan.sql` — the source-build
+checkout when it is on that commit, otherwise the branch on GitHub — because
+the procedures read Spock's catalogs directly and a revision from the wrong
+branch fails at runtime rather than at load time.
+
+| Spock major | Bundled fallback     |
+|-------------|----------------------|
+| `spock50`   | `zodremove-504.sql`  |
+| `spock60`   | none — fetched from the branch |
+
+The bundled copy is only a fallback for a host with no network and no checkout.
+There is no spock60 one on purpose: a 5.0.x removal script reads catalog columns
+spock60 renamed, so an air-gapped spock60 host is told to supply the script
+rather than given one that will fail halfway through a removal. The mapping is
+`ZODREMOVE_BY_SPOCK_MAJOR` in `aspects/spock_management.py`.
 
 ## Updating
 

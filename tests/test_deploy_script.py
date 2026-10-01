@@ -34,6 +34,8 @@ def script(tmp_path):
                         'echo "DEPLOY: ${ARGS[@]}"', 1)
     text = text.replace('exec python3 -m deployment.cli node add',
                         'exit_after echo "ADD: node add"', 1)
+    text = text.replace('exec python3 -m deployment.cli node remove',
+                        'exit_after echo "REMOVE: node remove"', 1)
     text = text.replace('exec python3 -m deployment.cli cleanup',
                         'exit_after echo "CLEANUP: cleanup"', 1)
     # `exec` would have replaced the process; the stub has to stop by itself.
@@ -60,8 +62,11 @@ def inventory(tmp_path):
 def run(script, inventory, *args, answers="", facts=None):
     """Run the stubbed script with piped answers. Returns (code, output)."""
     if facts is not None:
+        # Both the add-node and remove-node blocks read the facts; stub every
+        # occurrence, not the first, or the one under test keeps calling out
+        # to a cluster that does not exist.
         text = script.read_text(encoding="utf-8").replace(
-            '  FACTS="$(cluster_facts "$CLUSTER_NAME")"', f'  FACTS="{facts}"', 1)
+            '  FACTS="$(cluster_facts "$CLUSTER_NAME")"', f'  FACTS="{facts}"')
         script.write_text(text, encoding="utf-8")
 
     env = dict(os.environ, PG_CLUSTER_INVENTORY=str(inventory))
@@ -412,3 +417,71 @@ def test_cleanup_passes_purge_and_yes_through(script, inventory):
 
     assert code == 0
     assert "CLEANUP:" in output
+
+
+# ---------------------------------------------------------------------------
+# --remove-node
+# ---------------------------------------------------------------------------
+
+WITH_STANDBY = "pgedge|17.11|n1,n2|n1,n2,n1s1|source|50|v5_STABLE"
+
+
+def test_remove_node_confirms_by_name_before_touching_anything(script, inventory):
+    code, output = run(script, inventory, "--remove-node", "n2",
+                       answers="no\n", facts=SOURCE_50)
+
+    assert code != 0
+    assert "nothing was changed" in output
+
+
+def test_remove_node_forwards_the_name_once_confirmed(script, inventory):
+    code, output = run(script, inventory, "--remove-node", "n2",
+                       answers="n2\n", facts=SOURCE_50)
+
+    assert code == 0
+    assert "REMOVE: node remove" in output
+
+
+def test_remove_node_says_which_kind_of_removal_this_is(script, inventory):
+    spock = run(script, inventory, "--remove-node", "n2", answers="n2\n",
+                facts=WITH_STANDBY)[1]
+    standby = run(script, inventory, "--remove-node", "n1s1", answers="n1s1\n",
+                  facts=WITH_STANDBY)[1]
+
+    assert "spock.remove_node from branch" in spock
+    assert "v5_STABLE" in spock
+    assert "synchronous" in standby
+    assert "No Spock state changes" in standby
+
+
+def test_removing_the_last_spock_node_is_refused_before_the_prompt(script, inventory):
+    code, output = run(script, inventory, "--remove-node", "n1",
+                       facts="pgedge|17.11|n1|n1|source|50|v5_STABLE")
+
+    assert code != 0
+    assert "only Spock node" in output
+    assert "--cleanup" in output
+
+
+def test_removing_a_node_that_is_not_in_the_cluster_is_refused(script, inventory):
+    code, output = run(script, inventory, "--remove-node", "n9",
+                       facts=SOURCE_50)
+
+    assert code != 0
+    assert "is not a node in cluster" in output
+
+
+def test_remove_node_and_add_node_are_mutually_exclusive(script, inventory):
+    code, output = run(script, inventory, "--add-node", "n3",
+                       "--remove-node", "n2", facts=SOURCE_50)
+
+    assert code != 0
+    assert "opposite of each other" in output
+
+
+def test_yes_skips_the_prompt_and_the_flags_are_forwarded(script, inventory):
+    code, output = run(script, inventory, "--remove-node", "n2", "--yes",
+                       "--wipe-data", "--force", facts=SOURCE_50)
+
+    assert code == 0
+    assert "REMOVE: node remove" in output
