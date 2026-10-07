@@ -489,6 +489,90 @@ own error count, then waits for every subscription on both nodes to report
 
 ---
 
+## Optional add-ons
+
+Three pgEdge add-ons can be installed with the cluster. None is on by default —
+`--pg-extensions` is `none` unless you say otherwise, and a cluster that asks
+for none never touches any of this.
+
+```bash
+./pg_deploy_cluster.sh --pg-extensions pgedge-lolor,pgedge-snowflake,pgedge-ace
+./pg_deploy_cluster.sh --pg-extensions pgedge-lolor:source@v1.2.0
+./pg_deploy_cluster.sh                      # the prompts ask, one at a time
+```
+
+**lolor** stores large objects in its own schema instead of the catalog, so
+Spock can replicate them; it needs PostgreSQL 16 or newer. **snowflake** gives
+`int8` sequences that embed a node id, so multi-master nodes cannot generate
+colliding keys. **ACE**, the Active Consistency Engine, compares nodes and
+repairs the differences.
+
+Each entry is `name[:mode[@ref]]`. The mode is `packages` or `source` and
+defaults to the cluster's own `--mode`, which is almost always what is meant: a
+source-built cluster has no pgEdge repository to install a package from. A
+`@ref` picks the branch or tag to build and only applies to a source build —
+a package arrives at whatever version the channel carries, so a ref there is
+refused rather than silently ignored.
+
+### Two different kinds of thing
+
+lolor and snowflake are PGXS extensions: compiled against one PostgreSQL,
+installed into its prefix, and created inside a database. ACE is a Go
+command-line tool that talks to the cluster from outside it, so it is
+independent of the server version — one package name for every PostgreSQL and
+both families, no `CREATE EXTENSION`, and no node identity.
+
+| | RHEL | Debian/Ubuntu |
+|---|---|---|
+| lolor | `pgedge-lolor_<major>` | `pgedge-postgresql-<major>-lolor` |
+| snowflake | `pgedge-snowflake_<major>` | `pgedge-postgresql-<major>-snowflake` |
+| ace | `pgedge-ace` | `pgedge-ace` |
+
+Building an extension is what both repositories document: clone at the ref, put
+`pg_config` on `PATH`, then `make USE_PGXS=1` and `make USE_PGXS=1 install`.
+Against a packaged server that also installs the `-devel`/`-dev` package, for
+the headers. Neither extension needs `shared_preload_libraries`, so neither
+costs a restart.
+
+Building ACE is what its README documents: `go build -o ace ./cmd/ace/`, with
+the binary installed to `/usr/local/bin/ace`. It needs Go 1.26 or newer, which
+no distribution ships yet, so the official release tarball is unpacked into
+`/usr/local/go` when the host has no new enough Go of its own — and a host that
+already has one keeps it. An ACE-only build installs git and little else: it
+compiles against nothing of PostgreSQL's, so the C toolchain and the server
+headers would be a lot of installing for no reason.
+
+### The node identity
+
+Both carry a GUC naming the node — `lolor.node` (1 to 2^28) and
+`snowflake.node` (1 to 1023) — and in a multi-master cluster those values must
+differ. snowflake's default is invalid on purpose: a node with the extension
+but not the setting raises on the first `nextval()`. So the deployment sets the
+GUC *before* creating the extension, takes the value from the number in the
+node's name rather than its position in the cluster — remove `n2` and `n3`
+would otherwise slide into a number another node is already generating ids
+under — and then reads the GUC back from every server and fails the deployment
+if two of them match. A standby deliberately inherits its leader's number: it
+is a byte-for-byte copy, and a promotion must not change the number the ids
+issued before it were generated under.
+
+For lolor, `lolor.pg_largeobject` and `lolor.pg_largeobject_metadata` are added
+to the default replication set after cross-wiring. Without that step lolor is
+installed and inert — large objects land in its schema and replicate nowhere,
+which is the one thing it exists to fix.
+
+Neither applies to ACE: it has no GUC and no tables of its own.
+
+A node added later with `--add-node` picks up whatever the cluster asked for,
+from the same source and the same ref, and is given its own node number.
+
+ACE is installed but not configured — it needs a `pg_service.conf` with a
+`[cluster]` section and one `[cluster.node]` section per node, which it
+generates itself with `ace cluster init` and `ace config init`. See its
+[configuration docs](https://github.com/pgEdge/ace/blob/main/docs/configuration.md).
+
+---
+
 ## Growing a running cluster
 
 ```bash

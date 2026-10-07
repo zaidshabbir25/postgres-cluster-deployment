@@ -28,6 +28,7 @@ from aspects import (
     inventory,
     package_management,
     patroni_management,
+    pg_extensions,
     pg_server_management,
     platform_detect,
     prereq_setup,
@@ -284,6 +285,121 @@ class ClusterDeployer:
 
         self.results["source_build"] = details
         return f"built PostgreSQL {self.plan.pg_version} and Spock from source"
+
+    def step_pg_extensions(self):
+        """Install the optional extensions on every host.
+
+        Packaged ones come from the same pgEdge channel as the server; source
+        ones are cloned at the branch or tag asked for and built with PGXS
+        against whichever PostgreSQL this host ended up with. Nothing is
+        created in a database yet — the servers are not running at this point.
+        """
+        selections = self.plan.pg_extensions
+        details = {}
+        for host in self.plan.hosts:
+            executor = self.executor_for_host(host.name)
+            installed = pg_extensions.install_packages(
+                executor, host.family, selections, self.plan.pg_major,
+                node=host.name, run_logger=self.log,
+            )
+            built = pg_extensions.build_on_host(
+                executor, self.plan, host, selections, run_logger=self.log
+            )
+            tools = pg_extensions.tool_versions(
+                executor, selections=selections, node=host.name
+            )
+            for name, version in tools.items():
+                self.log.info(f"    {host.name}: {name} {version or 'installed'}")
+            details[host.name] = {"packages": installed, "built": built,
+                                  "tools": tools}
+
+        self.results["pg_extensions"] = details
+        self._record_package_inventory()
+        return ", ".join(
+            f"{item['name']} ({item['mode']}"
+            + (f"@{item['ref']}" if item.get("ref") else "") + ")"
+            for item in selections
+        )
+
+    def step_create_pg_extensions(self):
+        """Set each node's identity GUC, then CREATE EXTENSION.
+
+        After the Spock extensions, so a failure here cannot block the
+        replication the cluster exists for, and before cross-wiring, so the
+        schema these extensions create is in place on every node before zodan
+        synchronises structure between them.
+        """
+        created = {}
+        for node in self.plan.spock_nodes:
+            executor = self.executor_for_node(node)
+            created[node.name] = pg_extensions.create_on_node(
+                executor, self.plan, node, run_logger=self.log
+            )
+            versions = pg_extensions.installed_versions(executor, self.plan, node)
+            self.log.info(
+                f"    {node.name}: "
+                + ", ".join(f"{name} {version or 'unknown'}"
+                            for name, version in versions.items())
+            )
+
+        # Two nodes sharing an identity generate colliding ids with nothing to
+        # detect it, so confirm the servers really report distinct values
+        # rather than trusting that the ALTER SYSTEM landed.
+        identities = {}
+        for node in self.plan.spock_nodes:
+            identities[node.name] = pg_extensions.node_identities(
+                self.executor_for_node(node), self.plan, node
+            )
+        for guc in {key for values in identities.values() for key in values}:
+            seen = {}
+            for name, values in identities.items():
+                seen.setdefault(values.get(guc), []).append(name)
+            clashes = {value: names for value, names in seen.items()
+                       if value and len(names) > 1}
+            if clashes:
+                raise RuntimeError(
+                    f"{guc} is not unique across the cluster: "
+                    + "; ".join(f"{value} on {', '.join(names)}"
+                                for value, names in clashes.items())
+                    + " — ids generated on those nodes would collide"
+                )
+        self.results["pg_extension_identities"] = identities
+
+        self.results["pg_extension_versions"] = created
+        names = ", ".join(sorted({n for names in created.values() for n in names}))
+        return f"{names} created on {len(self.plan.spock_nodes)} node(s)"
+
+    def _in_database_extensions(self):
+        """The selections that are created inside a database.
+
+        ACE is a tool beside the cluster, not an extension in it: a cluster
+        that asked only for ACE has nothing to create and no node identity to
+        assign, so that whole step does not apply.
+        """
+        return [item for item in self.plan.pg_extensions
+                if not pg_extensions.CATALOG[item["name"]].is_tool]
+
+    def step_replicate_extension_tables(self):
+        """Put lolor's tables into a replication set.
+
+        Only meaningful after cross-wiring, because that is when a replication
+        set exists. Without it lolor is installed and inert: large objects land
+        in lolor.pg_largeobject and go nowhere, which is the one thing lolor
+        exists to fix.
+        """
+        added, problems = [], []
+        for node in self.plan.spock_nodes:
+            executor = self.executor_for_node(node)
+            node_added, node_problems = pg_extensions.replicate_tables(
+                executor, self.plan, node, run_logger=self.log
+            )
+            added += node_added
+            problems += node_problems
+        if problems:
+            self.log.warn("; ".join(problems))
+        if not added:
+            return "no extension tables need replicating"
+        return f"{len(added)} table(s) added to the default replication set"
 
     def step_auth(self):
         """Passwordless psql everywhere: .pgpass, pg_service.conf, PATH."""
@@ -653,6 +769,13 @@ class ClusterDeployer:
                            "high availability and the DCS behind it",
                            self.step_install_patroni)
 
+            if self.plan.pg_extensions:
+                self._step(
+                    "Install optional extensions",
+                    ", ".join(f"pgedge-{item['name']}"
+                              for item in self.plan.pg_extensions),
+                    self.step_pg_extensions)
+
             self._step("Set up passwordless psql",
                        ".pgpass, pg_service.conf and pg_hba for every node",
                        self.step_auth)
@@ -686,6 +809,12 @@ class ClusterDeployer:
                        "spock and dblink on every Spock node",
                        self.step_spock_extensions)
 
+            if self._in_database_extensions():
+                self._step(
+                    "Create optional extensions",
+                    "node identity GUCs, then CREATE EXTENSION on every node",
+                    self.step_create_pg_extensions)
+
             self._step("Load zodan procedures",
                        "the cross-wiring library used by spock.add_node",
                        self.step_load_zodan)
@@ -693,6 +822,14 @@ class ClusterDeployer:
             self._step("Cross-wire Spock nodes",
                        "spock.add_node joins each node to every peer, both ways",
                        self.step_crosswire)
+
+            if any(item["name"] in pg_extensions.REPLICATED_TABLES
+                   for item in self.plan.pg_extensions):
+                self._step(
+                    "Replicate extension tables",
+                    "lolor's large-object tables join the default repset",
+                    self.step_replicate_extension_tables,
+                    required=False)
 
             self._step("Enable DDL replication",
                        "schema changes propagate automatically",
@@ -831,6 +968,7 @@ def deploy(options):
         extra_hba_cidrs=options.get("hba_cidrs") or defaults.get("hba_cidrs", []),
         source_build=options.get("source_build") or defaults.get("source_build", {}),
         zodan_sql=options.get("zodan_sql") or pins.get("zodan_sql", ""),
+        pg_extensions=options.get("pg_extensions") or [],
         synchronous_mode=options.get("synchronous_mode")
         or defaults.get("synchronous_mode", "off"),
         synchronous_node_count=int(

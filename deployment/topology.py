@@ -56,7 +56,7 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
                  data_root=DEFAULT_DATA_ROOT, extra_hba_cidrs=None,
                  source_build=None, zodan_sql="", run_id="",
                  synchronous_mode="off", synchronous_node_count=1,
-                 synchronous_mode_strict=False):
+                 synchronous_mode_strict=False, pg_extensions=None):
     """Build the ClusterPlan. Returns (plan, warnings)."""
     if not hosts:
         raise TopologyError("no hosts available — check the inventory")
@@ -215,6 +215,7 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
         hosts=list(hosts),
         nodes=nodes,
         source_build=source_build or {},
+        pg_extensions=list(pg_extensions or []),
         run_id=run_id,
     )
 

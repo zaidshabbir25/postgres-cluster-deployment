@@ -141,6 +141,12 @@ class ClusterPlan:
     nodes: List[Node] = field(default_factory=list)
 
     source_build: Dict[str, Any] = field(default_factory=dict)
+
+    # Optional extensions, as [{"name", "mode", "ref"}, ...]. Empty is the
+    # default and means the deployment never touches them. See
+    # aspects/pg_extensions.py for what the entries mean.
+    pg_extensions: List[Dict[str, Any]] = field(default_factory=list)
+
     run_id: str = ""
 
     # ------------------------------------------------------------------
@@ -208,6 +214,19 @@ class ClusterPlan:
         plan.nodes = nodes
         return plan
 
+    def _extensions_line(self):
+        """The optional extensions, as the --pg-extensions value that asked
+        for them. Kept here rather than imported so the model stays leaf."""
+        if not self.pg_extensions:
+            return "none"
+        parts = []
+        for item in self.pg_extensions:
+            text = f"pgedge-{item.get('name')}:{item.get('mode')}"
+            if item.get("ref"):
+                text += f"@{item['ref']}"
+            parts.append(text)
+        return ", ".join(parts)
+
     def summary_lines(self):
         """Human-readable plan, printed before the deployment starts."""
         lines = [
@@ -217,6 +236,7 @@ class ClusterPlan:
             f"PostgreSQL     : {self.pg_major}"
             + (f" ({self.pg_version})" if self.pg_version else ""),
             f"Spock          : spock{self.spock_major}",
+            f"Extensions     : {self._extensions_line()}",
             f"Database       : {self.db_name} as {self.db_user}",
             f"Hosts          : {len(self.hosts)}",
             f"Spock nodes    : {len(self.spock_nodes)}",

@@ -86,6 +86,9 @@ def line(output, prefix):
 def deployment_answers(hosts="1", method="1", nodes="2", pg_major="17",
                        pg_version=None, standby="n", standby_list=None,
                        sync="n", sync_count=None, sync_strict=None,
+                       lolor="n", lolor_mode=None, lolor_ref=None,
+                       snowflake="n", snowflake_mode=None, snowflake_ref=None,
+                       ace="n", ace_mode=None, ace_ref=None,
                        cluster="", spock_major="", channel_or_branch="",
                        db_name="", db_user="", base_port="", base_restapi="",
                        clean="n", proceed="yes"):
@@ -105,6 +108,15 @@ def deployment_answers(hosts="1", method="1", nodes="2", pg_major="17",
             if sync_count is not None:          # asked only for several
                 answers.append(sync_count)
             answers.append(sync_strict or "n")
+    # Each extension is one yes/no; saying yes opens two more questions.
+    for wanted, mode, ref in ((lolor, lolor_mode, lolor_ref),
+                              (snowflake, snowflake_mode, snowflake_ref),
+                              (ace, ace_mode, ace_ref)):
+        answers.append(wanted)
+        if wanted == "y":
+            answers.append(mode or "")
+            if mode == "source":
+                answers.append(ref or "")
     answers += [cluster, spock_major, channel_or_branch, db_name, db_user,
                 base_port, base_restapi, clean, proceed]
     return "\n".join(answers) + "\n"
@@ -485,3 +497,92 @@ def test_yes_skips_the_prompt_and_the_flags_are_forwarded(script, inventory):
 
     assert code == 0
     assert "REMOVE: node remove" in output
+
+
+# ---------------------------------------------------------------------------
+# --pg-extensions
+# ---------------------------------------------------------------------------
+
+
+def test_no_extensions_is_the_default_the_prompts_produce(script, inventory):
+    code, output = run(script, inventory, answers=deployment_answers())
+
+    assert code == 0
+    assert "--pg-extensions none" in line(output, "DEPLOY:")
+
+
+def test_the_prompts_offer_each_extension_and_how_to_get_it(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(lolor="y", lolor_mode="packages",
+                                                  snowflake="n"))
+
+    assert code == 0
+    assert "--pg-extensions pgedge-lolor:packages" in line(output, "DEPLOY:")
+
+
+def test_choosing_a_source_build_asks_which_ref_to_build(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(lolor="y", lolor_mode="source",
+                                                  lolor_ref="v1.2.0",
+                                                  snowflake="n"))
+
+    assert code == 0
+    assert "--pg-extensions pgedge-lolor:source@v1.2.0" in line(output, "DEPLOY:")
+
+
+def test_both_extensions_can_be_chosen_with_different_origins(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(lolor="y", lolor_mode="source",
+                                                  lolor_ref="main",
+                                                  snowflake="y",
+                                                  snowflake_mode="packages"))
+
+    assert code == 0
+    assert ("--pg-extensions pgedge-lolor:source@main,pgedge-snowflake:packages"
+            in line(output, "DEPLOY:"))
+
+
+def test_the_flag_skips_the_prompts_entirely(script, inventory):
+    code, output = run(script, inventory, "--pg-extensions",
+                       "pgedge-lolor,pgedge-snowflake")
+
+    assert code == 0
+    deploy = line(output, "DEPLOY:")
+    assert "--pg-extensions pgedge-lolor,pgedge-snowflake" in deploy
+
+
+def test_the_flag_needs_a_value(script, inventory):
+    code, output = run(script, inventory, "--pg-extensions")
+
+    assert code != 0
+    assert "needs a value" in output
+
+
+def test_ace_is_offered_alongside_the_extensions(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(ace="y", ace_mode="packages"))
+
+    assert code == 0
+    assert "--pg-extensions pgedge-ace:packages" in line(output, "DEPLOY:")
+
+
+def test_building_ace_asks_for_a_ref_and_warns_it_needs_go(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(ace="y", ace_mode="source",
+                                                  ace_ref="v1.0.0"))
+
+    assert code == 0
+    assert "written in Go" in output
+    assert "--pg-extensions pgedge-ace:source@v1.0.0" in line(output, "DEPLOY:")
+
+
+def test_all_three_can_be_chosen_at_once(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(
+                           lolor="y", lolor_mode="packages",
+                           snowflake="y", snowflake_mode="packages",
+                           ace="y", ace_mode="packages"))
+
+    assert code == 0
+    assert ("--pg-extensions pgedge-lolor:packages,pgedge-snowflake:packages,"
+            "pgedge-ace:packages" in line(output, "DEPLOY:"))
