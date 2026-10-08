@@ -4,3 +4,4 @@
 #   pytest
 
 pytest>=8.0.0
+pyflakes>=3.2.0   # catches names used but never imported

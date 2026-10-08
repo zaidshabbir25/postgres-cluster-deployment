@@ -10,6 +10,7 @@ tests.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -86,6 +87,9 @@ def line(output, prefix):
 def deployment_answers(hosts="1", method="1", nodes="2", pg_major="17",
                        pg_version=None, standby="n", standby_list=None,
                        sync="n", sync_count=None, sync_strict=None,
+                       lolor="n", lolor_mode=None, lolor_ref=None,
+                       snowflake="n", snowflake_mode=None, snowflake_ref=None,
+                       ace="n", ace_mode=None, ace_ref=None,
                        cluster="", spock_major="", channel_or_branch="",
                        db_name="", db_user="", base_port="", base_restapi="",
                        clean="n", proceed="yes"):
@@ -105,8 +109,20 @@ def deployment_answers(hosts="1", method="1", nodes="2", pg_major="17",
             if sync_count is not None:          # asked only for several
                 answers.append(sync_count)
             answers.append(sync_strict or "n")
+    # The general options come first: the channel an extension package is
+    # fetched from is one of them.
     answers += [cluster, spock_major, channel_or_branch, db_name, db_user,
-                base_port, base_restapi, clean, proceed]
+                base_port, base_restapi, clean]
+    # Then each add-on: one yes/no, and saying yes opens one or two more.
+    for wanted, mode, ref in ((lolor, lolor_mode, lolor_ref),
+                              (snowflake, snowflake_mode, snowflake_ref),
+                              (ace, ace_mode, ace_ref)):
+        answers.append(wanted)
+        if wanted == "y":
+            answers.append(mode or "")
+            if mode == "source":
+                answers.append(ref or "")
+    answers.append(proceed)
     return "\n".join(answers) + "\n"
 
 
@@ -485,3 +501,208 @@ def test_yes_skips_the_prompt_and_the_flags_are_forwarded(script, inventory):
 
     assert code == 0
     assert "REMOVE: node remove" in output
+
+
+# ---------------------------------------------------------------------------
+# --pg-extensions
+# ---------------------------------------------------------------------------
+
+
+def test_no_extensions_is_the_default_the_prompts_produce(script, inventory):
+    code, output = run(script, inventory, answers=deployment_answers())
+
+    assert code == 0
+    assert "--pg-extensions none" in line(output, "DEPLOY:")
+
+
+def test_the_prompts_offer_each_extension_and_how_to_get_it(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(lolor="y", lolor_mode="packages",
+                                                  snowflake="n"))
+
+    assert code == 0
+    assert "--pg-extensions pgedge-lolor:packages" in line(output, "DEPLOY:")
+
+
+def test_choosing_a_source_build_asks_which_ref_to_build(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(lolor="y", lolor_mode="source",
+                                                  lolor_ref="v1.2.0",
+                                                  snowflake="n"))
+
+    assert code == 0
+    assert "--pg-extensions pgedge-lolor:source@v1.2.0" in line(output, "DEPLOY:")
+
+
+def test_both_extensions_can_be_chosen_with_different_origins(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(lolor="y", lolor_mode="source",
+                                                  lolor_ref="main",
+                                                  snowflake="y",
+                                                  snowflake_mode="packages"))
+
+    assert code == 0
+    assert ("--pg-extensions pgedge-lolor:source@main,pgedge-snowflake:packages"
+            in line(output, "DEPLOY:"))
+
+
+def test_the_flag_skips_the_prompts_entirely(script, inventory):
+    code, output = run(script, inventory, "--pg-extensions",
+                       "pgedge-lolor,pgedge-snowflake")
+
+    assert code == 0
+    deploy = line(output, "DEPLOY:")
+    assert "--pg-extensions pgedge-lolor,pgedge-snowflake" in deploy
+
+
+def test_the_flag_needs_a_value(script, inventory):
+    code, output = run(script, inventory, "--pg-extensions")
+
+    assert code != 0
+    assert "needs a value" in output
+
+
+def test_ace_is_offered_alongside_the_extensions(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(ace="y", ace_mode="packages"))
+
+    assert code == 0
+    assert "--pg-extensions pgedge-ace:packages" in line(output, "DEPLOY:")
+
+
+def test_building_ace_asks_for_a_ref_and_warns_it_needs_go(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(ace="y", ace_mode="source",
+                                                  ace_ref="v1.0.0"))
+
+    assert code == 0
+    assert "written in Go" in output
+    assert "--pg-extensions pgedge-ace:source@v1.0.0" in line(output, "DEPLOY:")
+
+
+def test_all_three_can_be_chosen_at_once(script, inventory):
+    code, output = run(script, inventory,
+                       answers=deployment_answers(
+                           lolor="y", lolor_mode="packages",
+                           snowflake="y", snowflake_mode="packages",
+                           ace="y", ace_mode="packages"))
+
+    assert code == 0
+    assert ("--pg-extensions pgedge-lolor:packages,pgedge-snowflake:packages,"
+            "pgedge-ace:packages" in line(output, "DEPLOY:"))
+
+
+def test_the_general_options_are_asked_before_the_add_ons(script, inventory):
+    """The channel an extension package comes from is one of them, so asking
+    it after the add-on questions was the wrong way round."""
+    code, output = run(script, inventory,
+                       answers=deployment_answers(channel_or_branch="staging",
+                                                  lolor="y",
+                                                  lolor_mode="packages"))
+
+    assert code == 0
+    assert output.index("6) Anything else") < output.index("7) Any optional")
+    assert "from the staging channel" in output
+    deploy = line(output, "DEPLOY:")
+    assert "--channel staging" in deploy
+    assert "--pg-extensions pgedge-lolor:packages" in deploy
+
+
+def test_the_shell_does_not_make_the_deploy_command_ask_twice(script, inventory):
+    """It has just asked "Start the deployment?" itself."""
+    code, output = run(script, inventory, answers=deployment_answers())
+
+    assert code == 0
+    assert "--yes" in line(output, "DEPLOY:")
+
+
+def test_a_flag_driven_run_leaves_the_question_to_the_deploy_command(script, inventory):
+    """Nothing asked here, so the summary the deploy command prints is the
+    first and only chance to stop."""
+    code, output = run(script, inventory, "--nodes", "2")
+
+    assert code == 0
+    assert "--yes" not in line(output, "DEPLOY:")
+
+
+# ---------------------------------------------------------------------------
+# version prompts
+# ---------------------------------------------------------------------------
+
+PRERELEASE = "pgedge|19.0beta3|n1,n2|n1,n2|packages|50|main"
+
+
+def test_add_node_accepts_the_clusters_own_prerelease_version(script, inventory):
+    """A cluster on 19.0beta3 offers it as the default; a pattern that treats
+    the minor and the pre-release as alternatives rejects its own default and
+    the prompt becomes unanswerable."""
+    code, output = run(script, inventory, "--add-node", "n3", "--role", "leader",
+                       answers="\n\n", facts=PRERELEASE)
+
+    assert code == 0
+    assert "Enter a version like" not in output
+    assert "--pg-version 19.0beta3" in line(output, "ADD:")
+
+
+def test_add_node_accepts_every_shape_a_postgres_version_takes(script, inventory):
+    for version in ("19", "19.0", "19beta3", "19.0beta3", "19.0rc1"):
+        code, output = run(script, inventory, "--add-node", "n3",
+                           "--role", "leader", answers=f"{version}\n\n",
+                           facts=PRERELEASE)
+
+        assert code == 0, version
+        assert "Enter a version like" not in output, version
+
+
+def test_add_node_still_refuses_something_that_is_not_a_version(script, inventory):
+    code, output = run(script, inventory, "--add-node", "n3", "--role", "leader",
+                       answers="19.0xyz\n19.0beta3\n\n", facts=PRERELEASE)
+
+    assert "Enter a version like" in output
+    assert "--pg-version 19.0beta3" in line(output, "ADD:")
+
+
+def _version_pattern(label):
+    """Pull a version regex out of the script, so the test checks the real one.
+
+    The source-build prompt also asks the PostgreSQL mirror which versions
+    exist, so driving it end to end makes the test depend on what is published
+    today. The shape check is a separate question and this asks only that.
+    """
+    text = SCRIPT.read_text(encoding="utf-8")
+    patterns = re.findall(r'=~ (\^[^\s]*?)\s*\]\]', text)
+    matches = [p for p in patterns if label in p]
+    assert matches, f"no version pattern containing {label!r} in the script"
+    return matches[0]
+
+
+def _matches(pattern, value, variables=""):
+    """Does bash consider `value` to match `pattern`?"""
+    script = f'{variables}\n[[ "{value}" =~ {pattern} ]]'
+    return subprocess.run(["bash", "-c", script]).returncode == 0
+
+
+@pytest.mark.parametrize("version,allowed", [
+    ("19", True), ("19.0", True), ("19beta3", True),
+    ("19.0beta3", True), ("19.0rc1", True),
+    ("19.0xyz", False), ("", False), ("beta3", False),
+])
+def test_the_add_node_version_pattern_accepts_every_real_shape(version, allowed):
+    """The minor and the pre-release are independent. Treating them as
+    alternatives rejects 19.0beta3 — which is what a cluster on a pre-release
+    reports, and therefore what the prompt offers as its own default."""
+    pattern = _version_pattern("beta[0-9]+|rc[0-9]+)?$")
+
+    assert _matches(pattern, version) is allowed
+
+
+@pytest.mark.parametrize("version,allowed", [
+    ("19.0", True), ("19beta3", True), ("19.0beta3", True), ("19.0rc1", True),
+    ("19", False),          # a source build needs an exact version to fetch
+    ("18.5", False),        # a different major
+    ("19.0xyz", False),     # anchored, so no trailing junk
+])
+def test_the_source_build_version_pattern_demands_an_exact_version(version, allowed):
+    pattern = _version_pattern("${PG_MAJOR}")
+
+    assert _matches(pattern, version, variables="PG_MAJOR=19") is allowed

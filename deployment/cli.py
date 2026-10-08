@@ -28,7 +28,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from aspects import health, inventory, patroni_management, spock_management, state
+from aspects import (health, inventory, patroni_management, pg_extensions,
+                     spock_management, state)
 from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
 from deployment import add_standby, cleanup, deploy_cluster, ops_cli, topology
@@ -93,6 +94,47 @@ def _close(cache):
 # ---------------------------------------------------------------------------
 
 
+def _confirm_for(args):
+    """Ask before touching anything — unless there is nobody to ask.
+
+    None rather than a function that always says yes: the deployer uses that to
+    mean "do not prompt at all", which is what --yes and a piped stdin both
+    want. A prompt with no terminal behind it would hang a scripted run.
+    """
+    if getattr(args, "yes", False) or not sys.stdin.isatty():
+        return None
+
+    def ask(plan):
+        answer = input(
+            f"\nStart the deployment of '{plan.cluster_name}'? [yes/no]: "
+        ).strip().lower()
+        return answer in ("y", "yes")
+
+    return ask
+
+
+def _extensions(args):
+    """Read --pg-extensions, defaulting each entry to the cluster's own mode.
+
+    A source-built cluster has no pgEdge repository configured, so "build the
+    server from source but fetch the extension as a package" is a combination
+    nobody asks for by accident — the mode follows --mode unless the entry
+    overrides it.
+    """
+    try:
+        selections = pg_extensions.parse(
+            getattr(args, "pg_extensions", "") or "", default_mode=args.mode
+        )
+        pg_extensions.validate(selections, args.pg_version or args.pg_major,
+                               node_count=int(getattr(args, "nodes", 0) or 0))
+    except ValueError as exc:
+        # A bad --pg-extensions is a usage mistake, not a crash: say what is
+        # wrong with it and stop before anything is touched.
+        print(f"--pg-extensions: {exc}", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
+    return selections
+
+
 def cmd_deploy(args):
     options = {
         "inventory": args.inventory,
@@ -114,6 +156,7 @@ def cmd_deploy(args):
         "clean": args.clean,
         "skip_verify": args.skip_verify,
         "zodan_sql": args.zodan_sql,
+        "pg_extensions": _extensions(args),
         "synchronous_mode": args.sync_mode,
         "synchronous_node_count": args.sync_count,
         "synchronous_mode_strict": args.sync_strict,
@@ -137,7 +180,10 @@ def cmd_deploy(args):
     if args.dry_run:
         return _cmd_plan(args)
 
-    result = deploy_cluster.deploy(options)
+    result = deploy_cluster.deploy(options, confirm=_confirm_for(args))
+
+    if result["outcome"] == "cancelled":
+        return EXIT_OK
 
     directory = report_generator.generate(result, kind="deployment")
     print(f"\nReport: {directory / 'report.html'}")
@@ -174,6 +220,7 @@ def _cmd_plan(args):
         synchronous_mode=args.sync_mode,
         synchronous_node_count=args.sync_count,
         synchronous_mode_strict=args.sync_strict,
+        pg_extensions=_extensions(args),
     )
 
     if getattr(args, "json", False):
@@ -524,6 +571,16 @@ def build_parser():
     deploy.add_argument("--sync-strict", action="store_true",
                         help="block writes when no standby is available, "
                              "instead of falling back to asynchronous")
+    deploy.add_argument("--yes", action="store_true",
+                        help="skip the confirmation prompt shown after the "
+                             "plan summary")
+    deploy.add_argument(
+        "--pg-extensions", default="none",
+        help="optional pgEdge add-ons, comma-separated: pgedge-lolor, "
+             "pgedge-snowflake, pgedge-ace, or none [none]. Each entry may "
+             "pick how it arrives and what to build: "
+             "pgedge-lolor:source@v1.2.0. The mode defaults to --mode. "
+             "pgedge-ace is a command-line tool, not an in-database extension")
     deploy.add_argument("--zodan-sql", default="",
                         help="override the zodan script (default: chosen by "
                              "--spock-major)")
@@ -561,6 +618,7 @@ def build_parser():
     plan_parser.add_argument("--base-restapi-port", type=int, default=8008)
     plan_parser.add_argument("--data-root", default=topology.DEFAULT_DATA_ROOT)
     plan_parser.add_argument("--hba-cidr", action="append")
+    plan_parser.add_argument("--pg-extensions", default="none")
     plan_parser.add_argument("--sync-mode", default="off",
                              choices=("off", "on", "quorum", "async", "sync"))
     plan_parser.add_argument("--sync-count", type=int, default=1)

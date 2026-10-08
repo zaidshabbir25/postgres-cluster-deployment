@@ -31,6 +31,7 @@ from aspects import (
     inventory,
     package_management,
     patroni_management,
+    pg_extensions,
     pg_server_management,
     platform_detect,
     prereq_setup,
@@ -502,6 +503,28 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                              f"{info['pretty']} — PostgreSQL {node.pg_version} "
                              f"installed at {node.bin_dir}")
 
+        # --- 1b. the cluster's optional extensions --------------------
+        # A node joining a cluster that uses lolor or snowflake has to have
+        # them too, from the same source and ref: zodan synchronises the schema
+        # these extensions create, and a node missing the extension cannot
+        # apply it.
+        selections = pg_extensions.selections_of(plan)
+        if selections:
+            log.step_start(
+                "Install the cluster's optional extensions",
+                ", ".join(f"pgedge-{item['name']}" for item in selections),
+            )
+            pg_extensions.validate(selections, node.pg_version or wanted_major)
+            pg_extensions.install_packages(
+                executor, target_host.family, selections, wanted_major,
+                node=node.name, run_logger=log,
+            )
+            pg_extensions.build_on_host(executor, plan, target_host, selections,
+                                        run_logger=log)
+            log.step_end("passed",
+                         ", ".join(pg_extensions.unparse([item])
+                                   for item in selections))
+
         # --- 2. auth everywhere ---------------------------------------
         log.step_start("Refresh passwordless psql",
                        "teach every host about the new node")
@@ -658,6 +681,25 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             )
         peers = ", ".join(n.name for n in plan.spock_nodes)
         log.step_end("passed", f"cluster is now a full mesh of {peers}")
+
+        # --- 6b. the cluster's optional extensions --------------------
+        # Only now: zodan refuses to join a node whose database already carries
+        # lolor, so the extension is installed on the host before the join and
+        # created in the database after it. The identity GUC has to be distinct
+        # from every existing node's, which is what node_id gives a node that
+        # was not in plan.spock_nodes when the cluster was first numbered.
+        if selections:
+            log.step_start("Create the cluster's optional extensions",
+                           ", ".join(f"pgedge-{item['name']}"
+                                     for item in selections))
+            created = pg_extensions.create_on_node(
+                executor, plan, node, selections=selections, run_logger=log,
+                strict=False,
+            )
+            pg_extensions.replicate_tables(executor, plan, node,
+                                           selections=selections,
+                                           run_logger=log)
+            log.step_end("passed", ", ".join(created) or "nothing to create")
 
         # --- 7. DDL replication ---------------------------------------
         log.step_start("Enable DDL replication", "on the new node")

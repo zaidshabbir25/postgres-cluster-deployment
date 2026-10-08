@@ -489,6 +489,220 @@ own error count, then waits for every subscription on both nodes to report
 
 ---
 
+## What the plan says it will install
+
+`--dry-run`, and the preview every deployment prints before it starts, list
+every component with its version and where it lands:
+
+```
+COMPONENT   VERSION                    SOURCE                             INSTALLS TO
+----------  -------------------------  ---------------------------------  ------------------------
+PostgreSQL  18.6 (exact)               ftp.postgresql.org source tarball  /opt/pgedge/pg18
+spock50     v5_STABLE (branch or tag)  github.com/pgEdge/spock            /opt/pgedge/pg18
+Patroni     latest on PyPI             pip                                /opt/pgedge/patroni-venv
+etcd        3.5.17                     github.com/etcd-io/etcd release    /usr/bin/etcd
+lolor       v1.2.3 (branch or tag)     github.com/pgEdge/lolor            /opt/pgedge/pg18
+ace         main (branch or tag)       github.com/pgEdge/ace              /usr/local/bin/ace [1]
+
+  [1] Go toolchain in /usr/local/go
+
+  Sources are cloned and compiled under /opt/pgedge/build; only the results are installed.
+```
+
+The version column says where its number came from, because the difference
+matters. `expected` is a pin from `configuration/config<major>.env` — a
+reference point, not a gate: the deployment installs what the channel offers
+and records the result, and comparing the two afterwards is what the pin is
+for. `exact` was asked for explicitly and the deployment fails without it. A
+branch or tag is a git ref. `channel decides` means it is genuinely not
+knowable until the package manager runs, which is the honest answer for a
+packaged extension — a confident number there would be a guess.
+
+Before the hosts are probed, a packaged install could land in either family's
+prefix, and the two disagree about every path and half the package names.
+Printing both in every cell turns the table into a wall, so one family is shown
+and the assumption is stated in a line above it — never left implicit. Once the
+hosts are probed, that line disappears and the real names appear. A source
+build never gets the caveat at all: it installs to `/opt/pgedge` whatever the
+distribution is.
+
+Anything too long for its column becomes a numbered note under the table rather
+than stretching it past the width of a terminal.
+
+Then you are asked whether to go ahead:
+
+```
+Start the deployment of 'pgedge'? [yes/no]:
+```
+
+Only `yes` or `y` starts it; anything else stops with nothing changed. The
+question is skipped by `--yes`, and when stdin is not a terminal — a prompt
+nobody can answer would hang a scripted run. `pg_deploy_cluster.sh` asks its
+own version of this after the plan preview and passes `--yes` through, so you
+are never asked twice; a flag-driven run of the script has no prompt of its
+own, and gets this one.
+
+---
+
+## What it reports when it finishes
+
+The deployment ends with the counterpart of the plan summary — the same rows,
+with what actually landed:
+
+```
+PostgreSQL Cluster Setup Summary
+
+COMPONENT   VERSION           BUILT / INSTALLED FROM             RESULT
+----------  ----------------  ---------------------------------  ----------
+PostgreSQL  18.6              ftp.postgresql.org source tarball  OK
+spock50     5.0.11            github.com/pgEdge/spock@v5_STABLE  OK
+Patroni     latest on PyPI    pip                                OK
+etcd        3.5.17 (planned)  github.com/etcd-io/etcd release    OK
+lolor       v1.2.3 (planned)  github.com/pgEdge/lolor@v1.2.3     FAILED [1]
+snowflake   2.0               github.com/pgEdge/snowflake@main   OK
+ace         1.0.3             github.com/pgEdge/ace@main         OK
+
+Replication
+
+WHAT           DETAIL                                   RESULT
+-------------  ---------------------------------------  ------
+Cross-wiring   2 Spock nodes, 2 subscriptions (n1, n2)  OK
+Standby nodes  1 across 1 scope(s)                      OK
+  n1 -> n1s1   synchronous, Sync Standby/streaming      OK
+
+  [1] Create optional extensions: ERROR: could not open extension control file "lolor.control"
+
+  Full output for every step: /root/.../logs/<run>/deploy.log
+  Per-node output: /root/.../logs/<run>/<node>.log
+```
+
+A version with no qualifier is what the component reported about itself once it
+was running. `(planned)` means nothing confirmed it — the row shows what was
+asked for, not what is there.
+
+The result column distinguishes three things that are easy to conflate. `OK` is
+done. `FAILED` carries a numbered note naming the step and its error, and the
+footer points at the log to read. `not reached` means an earlier failure
+stopped the run before this was attempted — a build that dies compiling
+PostgreSQL has one problem, not six, and marking the rest as failures would
+bury it.
+
+Attribution is per component rather than per step, because one step installs
+several things. If `Create optional extensions` fails on lolor but snowflake
+has already reported its version, snowflake is `OK` and only lolor is `FAILED`.
+The exception is PostgreSQL in a source build: `--pg-version` puts a number in
+the plan before anything is compiled, so that number is never treated as
+evidence the build succeeded.
+
+---
+
+## Optional add-ons
+
+Three pgEdge add-ons can be installed with the cluster. None is on by default —
+`--pg-extensions` is `none` unless you say otherwise, and a cluster that asks
+for none never touches any of this.
+
+```bash
+./pg_deploy_cluster.sh --pg-extensions pgedge-lolor,pgedge-snowflake,pgedge-ace
+./pg_deploy_cluster.sh --pg-extensions pgedge-lolor:source@v1.2.0
+./pg_deploy_cluster.sh                      # the prompts ask, one at a time
+```
+
+**lolor** stores large objects in its own schema instead of the catalog, so
+Spock can replicate them; it needs PostgreSQL 16 or newer. **snowflake** gives
+`int8` sequences that embed a node id, so multi-master nodes cannot generate
+colliding keys. **ACE**, the Active Consistency Engine, compares nodes and
+repairs the differences.
+
+Each entry is `name[:mode[@ref]]`. The mode is `packages` or `source` and
+defaults to the cluster's own `--mode`, which is almost always what is meant: a
+source-built cluster has no pgEdge repository to install a package from. A
+`@ref` picks the branch or tag to build and only applies to a source build —
+a package arrives at whatever version the channel carries, so a ref there is
+refused rather than silently ignored.
+
+### Two different kinds of thing
+
+lolor and snowflake are PGXS extensions: compiled against one PostgreSQL,
+installed into its prefix, and created inside a database. ACE is a Go
+command-line tool that talks to the cluster from outside it, so it is
+independent of the server version — one package name for every PostgreSQL and
+both families, no `CREATE EXTENSION`, and no node identity.
+
+| | RHEL | Debian/Ubuntu |
+|---|---|---|
+| lolor | `pgedge-lolor_<major>` | `pgedge-postgresql-<major>-lolor` |
+| snowflake | `pgedge-snowflake_<major>` | `pgedge-postgresql-<major>-snowflake` |
+| ace | `pgedge-ace` | `pgedge-ace` |
+
+Building an extension is what both repositories document: clone at the ref, put
+`pg_config` on `PATH`, then `make USE_PGXS=1` and `make USE_PGXS=1 install`.
+Against a packaged server that also installs the `-devel`/`-dev` package, for
+the headers. Neither extension needs `shared_preload_libraries`, so neither
+costs a restart.
+
+Building ACE is what its README documents: `go build -o ace ./cmd/ace/`, with
+the binary installed to `/usr/local/bin/ace`. It needs Go 1.26 or newer, which
+no distribution ships yet, so the official release tarball is unpacked into
+`/usr/local/go` when the host has no new enough Go of its own — and a host that
+already has one keeps it. An ACE-only build installs git and little else: it
+compiles against nothing of PostgreSQL's, so the C toolchain and the server
+headers would be a lot of installing for no reason.
+
+### When they are created
+
+Installing and creating happen at opposite ends of the deployment, and the gap
+between them is not incidental. zodan's `add_node` verifies that the node it is
+joining is clean: a database carrying the lolor schema — or in fact any user
+table at all — is refused outright. So the packages and binaries go onto the
+hosts early, and `CREATE EXTENSION` runs only after every node has been
+cross-wired. The same applies to `--add-node`: a joining node is installed,
+wired in, and only then given the extensions, which is also why that path
+tolerates finding the tables already there, arrived through zodan's structure
+sync.
+
+### The node identity
+
+Both carry a GUC naming the node — `lolor.node` (1 to 2^28) and
+`snowflake.node` (1 to 1023) — and in a multi-master cluster those values must
+differ. snowflake's default is invalid on purpose: a node with the extension
+but not the setting raises on the first `nextval()`.
+
+Setting one is less direct than it looks. `lolor.node` does not exist until
+lolor's shared library has run its `_PG_init`, and `ALTER SYSTEM` validates
+against the GUCs the *current session* knows — so setting it before the
+extension exists fails with `unrecognized configuration parameter`, and
+creating the extension first is not enough either, because `CREATE EXTENSION`
+does not load the library into the session. The deployment therefore creates
+the extension, then issues `LOAD` and `ALTER SYSTEM` as two statements of one
+psql session, where the second can see what the first defined. The value lands
+in `postgresql.auto.conf`, which later backends read as a custom placeholder
+whether or not the library is loaded.
+
+The value is the number in the node's name rather than its position in the
+cluster — remove `n2` and `n3` would otherwise slide into a number another node
+is already generating ids under. Afterwards the GUC is read back from every
+server and the deployment fails if two of them match. A standby deliberately
+inherits its leader's number: it is a byte-for-byte copy, and a promotion must
+not change the number the ids issued before it were generated under.
+
+For lolor, `lolor.pg_largeobject` and `lolor.pg_largeobject_metadata` are added
+to the default replication set once the extension exists. Without that step
+lolor is installed and inert — large objects land in its schema and replicate
+nowhere, which is the one thing it exists to fix.
+
+Neither applies to ACE: it has no GUC and no tables of its own.
+
+A node added later with `--add-node` picks up whatever the cluster asked for,
+from the same source and the same ref, and is given its own node number.
+
+ACE is installed but not configured — it needs a `pg_service.conf` with a
+`[cluster]` section and one `[cluster.node]` section per node, which it
+generates itself with `ace cluster init` and `ace config init`. See its
+[configuration docs](https://github.com/pgEdge/ace/blob/main/docs/configuration.md).
+
+---
+
 ## Growing a running cluster
 
 ```bash

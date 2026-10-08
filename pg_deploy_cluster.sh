@@ -67,6 +67,12 @@ Versions
   --pg-major N              PostgreSQL major version                       [17]
   --pg-version X.Y          exact version; required for --mode source
   --spock-major 50|60       Spock major version                            [50]
+  --pg-extensions LIST      optional pgEdge add-ons, comma-separated       [none]
+                            pgedge-lolor, pgedge-snowflake, pgedge-ace, or none.
+                            Each entry may say how it arrives and what to build,
+                            as name:mode[@ref] — pgedge-lolor:source@v1.2.0. The
+                            mode defaults to --mode. ace is a command-line tool
+                            rather than an in-database extension.
 
 Database
   --db-name NAME                                                           [postgres]
@@ -474,6 +480,7 @@ DRY_RUN=false
 CLEANUP=false
 CLEANUP_ARGS=()
 ADD_NODE=""
+PG_EXTENSIONS=""
 REMOVE_NODE=""
 REMOVE_ARGS=()
 ASSUME_YES=false
@@ -520,6 +527,9 @@ while [[ $# -gt 0 ]]; do
     --sync-strict) SYNC_STRICT=true; shift ;;
     --clean|--skip-verify|--json)
       ARGS+=("$1"); INTERACTIVE=false; shift ;;
+    --pg-extensions)
+      [[ $# -ge 2 ]] || die "--pg-extensions needs a value (e.g. pgedge-lolor,pgedge-snowflake, or none)"
+      PG_EXTENSIONS="$2"; ARGS+=("$1" "$2"); INTERACTIVE=false; shift 2 ;;
     --nodes|--standby|--cluster|--mode|--channel|--spock-branch|--etcd-version|\
     --jobs|--pg-major|--pg-version|--spock-major|--db-name|--db-user|--db-password|\
     --base-port|--base-restapi-port|--data-root|--hba-cidr|--zodan-sql)
@@ -677,7 +687,11 @@ if [[ -n "$ADD_NODE" ]]; then
       say ""
       for _ in 1 2 3 4 5; do
         NODE_PG_VERSION="$(ask "   PostgreSQL version" "$FACT_PG")"
-        if [[ ! "$NODE_PG_VERSION" =~ ^[0-9]+(\.[0-9]+|beta[0-9]+|rc[0-9]+)?$ ]]; then
+        # The minor and the pre-release are independent: 19, 19.0, 19beta3 and
+        # 19.0beta3 are all real PostgreSQL versions, and the last is what a
+        # cluster on a pre-release actually reports — so an either/or pattern
+        # rejects this prompt's own default.
+        if [[ ! "$NODE_PG_VERSION" =~ ^[0-9]+(\.[0-9]+)?(beta[0-9]+|rc[0-9]+)?$ ]]; then
           warn "Enter a version like $FACT_PG."
           NODE_PG_VERSION=""
           continue
@@ -902,7 +916,9 @@ if [[ "$INTERACTIVE" == true ]]; then
     say ""
     for _ in 1 2 3 4 5; do
       PG_VERSION="$(ask "   Exact version to build" "${NEWEST:-}")"
-      if [[ ! "$PG_VERSION" =~ ^${PG_MAJOR}(\.[0-9]+|beta[0-9]+|rc[0-9]+) ]]; then
+      # Anchored, and a bare major is still refused: a source build needs an
+      # exact version to fetch. 19.0beta3 has to pass, though.
+      if [[ ! "$PG_VERSION" =~ ^${PG_MAJOR}(\.[0-9]+(beta[0-9]+|rc[0-9]+)?|beta[0-9]+|rc[0-9]+)$ ]]; then
         warn "That does not look like a $PG_MAJOR release (expected ${PG_MAJOR}.x, ${PG_MAJOR}betaN or ${PG_MAJOR}rcN)."
         PG_VERSION=""
         continue
@@ -991,6 +1007,45 @@ if [[ "$INTERACTIVE" == true ]]; then
   CLEAN="$(ask_choice "   Wipe any previous deployment on these hosts first? (y/n)" "n" y n)"
   say ""
 
+  # --- 7. optional add-ons --------------------------------------------
+  say "${BOLD}7) Any optional pgEdge add-ons?${RESET}"
+  say "   ${DIM}lolor      stores large objects in its own schema instead of the"
+  say "              catalog, so Spock can replicate them"
+  say "   snowflake  int8 sequences that embed a node id, so multi-master nodes"
+  say "              cannot generate colliding keys"
+  say "   ace        the Active Consistency Engine: a command-line tool that"
+  say "              compares nodes and repairs differences. Not an in-database"
+  say "              extension, and independent of the PostgreSQL version"
+  say "   All are optional and off by default.${RESET}"
+  say ""
+  PG_EXTENSIONS=""
+  for EXT in lolor snowflake ace; do
+    WANT="$(ask_choice "   Install pgedge-$EXT? (y/n)" "n" y n)"
+    [[ "$WANT" == "y" ]] || continue
+    # The same choice the cluster itself was given, defaulting to it: a
+    # source-built cluster has no pgEdge repository to install a package from.
+    EXT_MODE="$(ask_choice "     Install $EXT from packages or build from source?" \
+                           "$MODE" packages source)"
+    EXT_ENTRY="pgedge-$EXT:$EXT_MODE"
+    if [[ "$EXT_MODE" == "packages" ]]; then
+      # The channel was settled a moment ago, and it is the channel this
+      # package comes from too — say so rather than leaving it implied.
+      say "     ${DIM}from the ${CHANNEL:-release} channel, like the server itself.${RESET}"
+    fi
+    if [[ "$EXT_MODE" == "source" ]]; then
+      [[ "$EXT" == "ace" ]] && \
+        say "     ${DIM}ace is written in Go; the toolchain is installed if the host has none.${RESET}"
+      EXT_REF="$(ask "     Which $EXT branch or tag should be built?" "main")"
+      EXT_ENTRY="$EXT_ENTRY@$EXT_REF"
+    fi
+    PG_EXTENSIONS="${PG_EXTENSIONS:+$PG_EXTENSIONS,}$EXT_ENTRY"
+  done
+  if [[ -z "$PG_EXTENSIONS" ]]; then
+    PG_EXTENSIONS="none"
+    say "   ${DIM}No optional extensions.${RESET}"
+  fi
+  say ""
+
   # --- assemble ------------------------------------------------------
   # PLAN_ARGS holds only the flags the `plan` subcommand accepts; ARGS adds the
   # ones that are meaningful only to an actual deployment.
@@ -1001,6 +1056,7 @@ if [[ "$INTERACTIVE" == true ]]; then
   [[ -n "$PG_VERSION" ]] && PLAN_ARGS+=(--pg-version "$PG_VERSION")
   [[ -n "$STANDBY" ]]    && PLAN_ARGS+=(--standby "$STANDBY")
   [[ -n "$CHANNEL" ]]    && PLAN_ARGS+=(--channel "$CHANNEL")
+  [[ -n "$PG_EXTENSIONS" ]] && PLAN_ARGS+=(--pg-extensions "$PG_EXTENSIONS")
   [[ -n "$BASE_PORT" ]]  && PLAN_ARGS+=(--base-port "$BASE_PORT")
   [[ -n "$BASE_RESTAPI_PORT" ]] && PLAN_ARGS+=(--base-restapi-port "$BASE_RESTAPI_PORT")
   [[ -n "$SYNC_MODE" ]]  && PLAN_ARGS+=(--sync-mode "$SYNC_MODE")
@@ -1028,8 +1084,14 @@ if [[ "$INTERACTIVE" == true ]]; then
     say "Cancelled — nothing was changed."
     exit 0
   fi
+  # Asked and answered here, so the deploy command must not ask again.
+  ASSUME_YES=true
   say ""
 fi
+
+# A flag-driven run never reached the prompt above, so the deploy command asks
+# once the summary is on screen — unless there is nobody at a terminal to ask.
+[[ "$ASSUME_YES" == true ]] && ARGS+=(--yes)
 
 # ---------------------------------------------------------------------------
 # Run
