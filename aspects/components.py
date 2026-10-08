@@ -19,14 +19,18 @@ So each row says where its version came from:
   * `channel`    — not knowable before the package manager runs.
 """
 
-from aspects import inventory, pg_extensions, platform_detect, source_build
+from aspects import (inventory, pg_extensions, pg_server_management,
+                     platform_detect, source_build)
 
 # Where a packaged build puts things that are not tied to a PostgreSQL prefix.
 PACKAGE_BIN = "/usr/bin"
 
 # Said instead of repeating the prefix on every row that lives in it — which
 # before the hosts are probed is two paths, once per family.
-IN_PREFIX = "the PostgreSQL prefix above"
+IN_PREFIX = "the PostgreSQL prefix"
+
+
+ASSUMED_FAMILY = "rhel"
 
 
 def _family_of(plan):
@@ -37,21 +41,49 @@ def _family_of(plan):
     return ""
 
 
+def shown_family(plan):
+    """(family to render, whether that is an assumption).
+
+    Before the hosts are probed either family is still possible, and the two
+    disagree about every path and half the package names. Printing both in
+    every cell turns the table into a wall; printing one and saying so above it
+    keeps the table a table. The assumption is stated, never hidden.
+    """
+    family = _family_of(plan)
+    if family:
+        return family, False
+    return ASSUMED_FAMILY, True
+
+
+def built_major(plan):
+    """The major a source build will actually use.
+
+    Not plan.pg_major: build_major() takes it from the exact version it is
+    given, so `--pg-version 18.6` builds pg18 even when --pg-major still says
+    17. The prefix has to agree with that or the summary points at a directory
+    the deployment never creates.
+    """
+    spec = plan.source_build or {}
+    version = spec.get("pg_version") or plan.pg_version
+    return pg_server_management.major_of(version) if version else plan.pg_major
+
+
 def prefix_of(plan, family=""):
     """Where PostgreSQL lives: a build prefix, or the packaged server's."""
     if plan.deploy_mode == "source":
-        return source_build.install_dir(plan.pg_major)
-    if family:
-        return platform_detect.pg_bin_dir(family, plan.pg_major).rsplit("/", 1)[0]
-    # Before the hosts are probed, both are still possible and saying so beats
-    # guessing: the two families disagree about this path.
-    return (f"/usr/pgsql-{plan.pg_major} (RHEL) | "
-            f"/usr/lib/postgresql/{plan.pg_major} (Debian)")
+        return source_build.install_dir(built_major(plan))
+    return platform_detect.pg_bin_dir(family or ASSUMED_FAMILY,
+                                      plan.pg_major).rsplit("/", 1)[0]
+
+
+def _short(url):
+    """A git remote without the scheme — the column is long enough already."""
+    return str(url).replace("https://", "").replace(".git", "")
 
 
 def rows(plan):
     """One dict per component: {name, version, origin, location}."""
-    family = _family_of(plan)
+    family, _assumed = shown_family(plan)
     prefix = prefix_of(plan, family)
     source = plan.deploy_mode == "source"
     spec = plan.source_build or {}
@@ -92,7 +124,7 @@ def rows(plan):
         listing.append({
             "name": f"spock{plan.spock_major}",
             "version": f"{branch} (branch or tag)",
-            "origin": source_build.SPOCK_REPO,
+            "origin": _short(source_build.SPOCK_REPO),
             "location": IN_PREFIX,
         })
     else:
@@ -102,8 +134,7 @@ def rows(plan):
         listing.append({
             "name": f"spock{plan.spock_major}",
             "version": f"{pinned} (expected)" if pinned else "channel decides",
-            "origin": f"{channel} — {packages[0]}" if family
-                      else f"{channel} — the pgEdge spock{plan.spock_major} package",
+            "origin": f"{channel} — {packages[0]}",
             "location": IN_PREFIX,
         })
 
@@ -126,8 +157,7 @@ def rows(plan):
             "name": "Patroni",
             "version": f"{pins.get('patroni', '')} (expected)"
                        if pins.get("patroni") else "channel decides",
-            "origin": f"{channel} — {platform_detect.patroni_packages(family)[0]}"
-                      if family else f"{channel} — the pgEdge Patroni package",
+            "origin": f"{channel} — {platform_detect.patroni_packages(family)[0]}",
             "location": PACKAGE_BIN,
         })
         listing.append({
@@ -151,26 +181,14 @@ def _server_package(family, pg_major):
     named on the command line at all, and saying which package it comes from
     means saying that.
     """
-    if family == "rhel":
-        return f"pgedge-postgresql{pg_major} (pulled in by the spock package)"
-    if family == "deb":
-        return f"pgedge-postgresql-{pg_major}"
-    return "the pgEdge PostgreSQL package"
+    if (family or ASSUMED_FAMILY) == "rhel":
+        return f"pgedge-postgresql{pg_major}"
+    return f"pgedge-postgresql-{pg_major}"
 
 
 def _package_names(spec, family, pg_major):
-    """How to name this package when the family is not yet known.
-
-    A version-independent package is one name on both; an extension is two, and
-    printing them as a pair is the only honest answer before the probe.
-    """
-    if family:
-        return spec.package(family, pg_major)
-    rhel = spec.package("rhel", pg_major)
-    deb = spec.package("deb", pg_major)
-    if rhel == deb:
-        return rhel
-    return f"{rhel} (RHEL) | {deb} (Debian)"
+    """The package name for the family being rendered."""
+    return spec.package(family or ASSUMED_FAMILY, pg_major)
 
 
 def extension_rows(plan, family, prefix, channel):
@@ -182,7 +200,7 @@ def extension_rows(plan, family, prefix, channel):
 
         if from_source:
             version = f"{item.get('ref') or spec.default_ref} (branch or tag)"
-            origin = spec.repo
+            origin = _short(spec.repo)
         else:
             version = "channel decides"
             origin = f"{channel} — {_package_names(spec, family, plan.pg_major)}"
@@ -202,34 +220,107 @@ def extension_rows(plan, family, prefix, channel):
     return listing
 
 
+# Past this, a cell stops helping and starts pushing the table off the screen.
+# Wide enough for the longest real package name — Debian's
+# pgedge-postgresql-17-snowflake — so the common case stays in the table.
+MAX_CELL = 48
+
+
 def summary_lines(plan):
-    """The component table, as lines for the plan summary."""
+    """The component table, as lines for the plan summary.
+
+    Four columns rather than a wrapped sentence per row, so the three things
+    people scan for — what version, from where, to where — line up down the
+    page. Anything too long for a cell becomes a numbered note underneath
+    instead of stretching the table past a terminal's width; a table nobody can
+    read without wrapping has given up the only advantage it had.
+    """
     listing = rows(plan)
     if not listing:
         return []
 
-    name_width = max(len(row["name"]) for row in listing)
-    version_width = max(len(row["version"]) for row in listing)
-    lines = [
-        f"{'COMPONENT':<{name_width}}  {'VERSION':<{version_width}}  "
-        f"ORIGIN / INSTALLS TO"
-    ]
-    for row in listing:
-        lines.append(
-            f"{row['name']:<{name_width}}  {row['version']:<{version_width}}  "
-            f"{row['origin']}"
-        )
-        lines.append(
-            f"{'':<{name_width}}  {'':<{version_width}}  -> {row['location']}"
-        )
+    family, assumed = shown_family(plan)
+    prefix = prefix_of(plan, family)
+    notes = []
 
+    def note(text):
+        """Park an over-long value below the table and return its marker."""
+        if text not in notes:
+            notes.append(text)
+        return f"[{notes.index(text) + 1}]"
+
+    def fit(value, keep=""):
+        """Shorten a cell to a stub plus a note, when it is too long.
+
+        `keep` is the part worth seeing in the column itself — the path, say,
+        with the parenthetical moved out of the way.
+        """
+        if len(value) <= MAX_CELL:
+            return value
+        head, _, tail = value.partition(" (")
+        if tail and len(head) <= MAX_CELL - 4:
+            return f"{head} {note(tail.rstrip(')'))}"
+        head, _, tail = value.partition(" — ")
+        if tail and len(head) <= MAX_CELL - 4:
+            return f"{head} {note(tail)}"
+        return f"{keep or value[:MAX_CELL - 4].rstrip()} {note(value)}"
+
+    table = []
+    for row in listing:
+        location = prefix if row["location"] == IN_PREFIX else row["location"]
+        table.append((row["name"], row["version"], fit(row["origin"]),
+                      fit(location)))
+
+    lines = _render_table(("COMPONENT", "VERSION", "SOURCE", "INSTALLS TO"),
+                          table)
+    if assumed and _family_matters(plan):
+        lines.insert(0, f"  Paths and package names below are the "
+                        f"{ASSUMED_FAMILY.upper()} ones; the hosts have not "
+                        f"been probed yet, and Debian spells both differently.")
+        lines.insert(1, "")
+
+    if notes:
+        lines.append("")
+        lines += [f"  [{index + 1}] {text}" for index, text in enumerate(notes)]
     if builds_from_source(plan):
         lines.append("")
         lines.append(
-            f"Sources are cloned and compiled under {source_build.BUILD_ROOT}; "
-            f"only the results are installed to the paths above."
+            f"  Sources are cloned and compiled under {source_build.BUILD_ROOT}; "
+            f"only the results are installed."
         )
     return lines
+
+
+def _render_table(headers, table):
+    """Aligned columns with a rule under the header, sized to the content."""
+    widths = [
+        max(len(str(row[index])) for row in (headers, *table))
+        for index in range(len(headers))
+    ]
+
+    def line(cells):
+        return "  ".join(
+            f"{str(cell):<{widths[i]}}" for i, cell in enumerate(cells)
+        ).rstrip()
+
+    rendered = [line(headers)] + [line(row) for row in table]
+    # The rule spans what is actually printed, not the padded column widths:
+    # a rule running past the last value looks like a mistake.
+    rule = "  ".join("-" * width for width in widths)
+    return [rendered[0], rule[:max(len(text) for text in rendered)], *rendered[1:]]
+
+
+def _family_matters(plan):
+    """Would knowing the platform change anything in this table?
+
+    Not for a build: it installs to /opt/pgedge whatever the distribution is,
+    and names no packages. Saying "these are the RHEL paths" there would be a
+    caveat about nothing.
+    """
+    if plan.deploy_mode != "source":
+        return True
+    return any(item["mode"] != pg_extensions.MODE_SOURCE
+               for item in pg_extensions.selections_of(plan))
 
 
 def builds_from_source(plan):

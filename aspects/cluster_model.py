@@ -250,10 +250,12 @@ class ClusterPlan:
         from aspects import components
 
         lines += components.summary_lines(self)
+        widths = (10, 9, 16, 16, 7, 6, 18, 7)
         lines += [
             "",
             f"{'NODE':<10} {'ROLE':<9} {'HOST':<16} {'ADDRESS':<16} "
             f"{'PG':<7} {'API':<6} {'SCOPE':<18} FOLLOWS",
+            " ".join("-" * width for width in widths),
         ]
         for node in self.nodes:
             lines.append(

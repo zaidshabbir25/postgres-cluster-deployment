@@ -605,3 +605,20 @@ def test_the_general_options_are_asked_before_the_add_ons(script, inventory):
     deploy = line(output, "DEPLOY:")
     assert "--channel staging" in deploy
     assert "--pg-extensions pgedge-lolor:packages" in deploy
+
+
+def test_the_shell_does_not_make_the_deploy_command_ask_twice(script, inventory):
+    """It has just asked "Start the deployment?" itself."""
+    code, output = run(script, inventory, answers=deployment_answers())
+
+    assert code == 0
+    assert "--yes" in line(output, "DEPLOY:")
+
+
+def test_a_flag_driven_run_leaves_the_question_to_the_deploy_command(script, inventory):
+    """Nothing asked here, so the summary the deploy command prints is the
+    first and only chance to stop."""
+    code, output = run(script, inventory, "--nodes", "2")
+
+    assert code == 0
+    assert "--yes" not in line(output, "DEPLOY:")

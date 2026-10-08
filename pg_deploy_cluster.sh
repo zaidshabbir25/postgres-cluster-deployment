@@ -1078,8 +1078,14 @@ if [[ "$INTERACTIVE" == true ]]; then
     say "Cancelled — nothing was changed."
     exit 0
   fi
+  # Asked and answered here, so the deploy command must not ask again.
+  ASSUME_YES=true
   say ""
 fi
+
+# A flag-driven run never reached the prompt above, so the deploy command asks
+# once the summary is on screen — unless there is nobody at a terminal to ask.
+[[ "$ASSUME_YES" == true ]] && ARGS+=(--yes)
 
 # ---------------------------------------------------------------------------
 # Run

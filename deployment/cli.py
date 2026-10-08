@@ -94,6 +94,25 @@ def _close(cache):
 # ---------------------------------------------------------------------------
 
 
+def _confirm_for(args):
+    """Ask before touching anything — unless there is nobody to ask.
+
+    None rather than a function that always says yes: the deployer uses that to
+    mean "do not prompt at all", which is what --yes and a piped stdin both
+    want. A prompt with no terminal behind it would hang a scripted run.
+    """
+    if getattr(args, "yes", False) or not sys.stdin.isatty():
+        return None
+
+    def ask(plan):
+        answer = input(
+            f"\nStart the deployment of '{plan.cluster_name}'? [yes/no]: "
+        ).strip().lower()
+        return answer in ("y", "yes")
+
+    return ask
+
+
 def _extensions(args):
     """Read --pg-extensions, defaulting each entry to the cluster's own mode.
 
@@ -161,7 +180,10 @@ def cmd_deploy(args):
     if args.dry_run:
         return _cmd_plan(args)
 
-    result = deploy_cluster.deploy(options)
+    result = deploy_cluster.deploy(options, confirm=_confirm_for(args))
+
+    if result["outcome"] == "cancelled":
+        return EXIT_OK
 
     directory = report_generator.generate(result, kind="deployment")
     print(f"\nReport: {directory / 'report.html'}")
@@ -549,6 +571,9 @@ def build_parser():
     deploy.add_argument("--sync-strict", action="store_true",
                         help="block writes when no standby is available, "
                              "instead of falling back to asynchronous")
+    deploy.add_argument("--yes", action="store_true",
+                        help="skip the confirmation prompt shown after the "
+                             "plan summary")
     deploy.add_argument(
         "--pg-extensions", default="none",
         help="optional pgEdge add-ons, comma-separated: pgedge-lolor, "

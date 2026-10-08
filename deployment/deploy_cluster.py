@@ -32,6 +32,7 @@ from aspects import (
     pg_server_management,
     platform_detect,
     prereq_setup,
+    setup_report,
     source_build,
     spock_management,
     state,
@@ -45,13 +46,21 @@ class DeploymentFailed(RuntimeError):
     """Raised when a step that the rest of the deployment depends on fails."""
 
 
+class Cancelled(RuntimeError):
+    """The operator declined at the confirmation prompt."""
+
+
 class ClusterDeployer:
-    def __init__(self, plan, run_logger=None, clean=False, skip_verify=False):
+    def __init__(self, plan, run_logger=None, clean=False, skip_verify=False,
+                 confirm=None):
         self.plan = plan
         self.log = run_logger or RunLogger(new_run_id(plan.cluster_name))
         self.plan.run_id = self.log.run_id
         self.clean = clean
         self.skip_verify = skip_verify
+        # Asked after the summary is on screen, so the answer is given with
+        # the whole plan visible rather than from memory of a flag.
+        self.confirm = confirm
 
         self.executors = {}
         self.results = {}
@@ -338,6 +347,9 @@ class ClusterDeployer:
                 executor, self.plan, node, run_logger=self.log
             )
             versions = pg_extensions.installed_versions(executor, self.plan, node)
+            for name, value in versions.items():
+                self.results.setdefault("extension_versions", {}).setdefault(
+                    name, value)
             self.log.info(
                 f"    {node.name}: "
                 + ", ".join(f"{name} {version or 'unknown'}"
@@ -593,6 +605,7 @@ class ClusterDeployer:
                 executor, self.plan, node, run_logger=self.log
             )
             version = spock_management.spock_version(executor, self.plan, node)
+            self.results.setdefault("spock_versions", {})[node.name] = version
             self.log.info(
                 f"    {node.name}: spock {version or 'unknown'} "
                 f"({', '.join(extensions)})"
@@ -739,6 +752,18 @@ class ClusterDeployer:
         self.log.banner(f"Deploying cluster '{self.plan.cluster_name}'")
         for line in self.plan.summary_lines():
             self.log.info(line)
+
+        if self.confirm is not None and not self.confirm(self.plan):
+            self.log.info("")
+            self.log.info("Cancelled — nothing was changed.")
+            return {
+                "outcome": "cancelled",
+                "cluster": self.plan.cluster_name,
+                "steps": [],
+                "warnings": [],
+                "log_dir": str(self.log.root),
+                "plan": self.plan,
+            }
 
         try:
             self._step("Connect to hosts",
@@ -903,6 +928,9 @@ class ClusterDeployer:
 
     def _print_summary(self, result):
         self.log.banner(f"Deployment {result['outcome']} in {result['duration']}s")
+        for line in setup_report.lines(result):
+            self.log.info(line)
+        self.log.info("")
         counts = result["counts"]
         self.log.info(
             f"Steps: {counts.get('passed', 0)} passed, "
@@ -935,11 +963,12 @@ class ClusterDeployer:
 # ---------------------------------------------------------------------------
 
 
-def deploy(options):
+def deploy(options, confirm=None):
     """Build a plan from resolved options and deploy it.
 
     `options` is the dict pg_deploy_cluster.sh's Python side assembles from
-    flags and interactive answers.
+    flags and interactive answers. `confirm` is called with the plan once the
+    summary has been printed; returning False stops before anything is touched.
     """
     hosts, defaults = inventory.load(options.get("inventory"))
 
@@ -998,6 +1027,7 @@ def deploy(options):
         run_logger=run_logger,
         clean=bool(options.get("clean")),
         skip_verify=bool(options.get("skip_verify")),
+        confirm=confirm,
     )
     deployer.warnings.extend(warnings)
 

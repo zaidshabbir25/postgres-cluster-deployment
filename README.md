@@ -495,15 +495,18 @@ own error count, then waits for every subscription on both nodes to report
 every component with its version and where it lands:
 
 ```
-COMPONENT   VERSION            ORIGIN / INSTALLS TO
-PostgreSQL  17.11 (expected)   staging channel — the pgEdge PostgreSQL package
-                               -> /usr/pgsql-17 (RHEL) | /usr/lib/postgresql/17 (Debian)
-spock50     5.0.11 (expected)  staging channel — the pgEdge spock50 package
-                               -> the PostgreSQL prefix above
-lolor       channel decides    staging channel — pgedge-lolor_17 (RHEL) | ...
-                               -> the PostgreSQL prefix above
-ace         main (branch/tag)  https://github.com/pgEdge/ace.git
-                               -> /usr/local/bin/ace (Go toolchain in /usr/local/go)
+COMPONENT   VERSION                    SOURCE                             INSTALLS TO
+----------  -------------------------  ---------------------------------  ------------------------
+PostgreSQL  18.6 (exact)               ftp.postgresql.org source tarball  /opt/pgedge/pg18
+spock50     v5_STABLE (branch or tag)  github.com/pgEdge/spock            /opt/pgedge/pg18
+Patroni     latest on PyPI             pip                                /opt/pgedge/patroni-venv
+etcd        3.5.17                     github.com/etcd-io/etcd release    /usr/bin/etcd
+lolor       v1.2.3 (branch or tag)     github.com/pgEdge/lolor            /opt/pgedge/pg18
+ace         main (branch or tag)       github.com/pgEdge/ace              /usr/local/bin/ace [1]
+
+  [1] Go toolchain in /usr/local/go
+
+  Sources are cloned and compiled under /opt/pgedge/build; only the results are installed.
 ```
 
 The version column says where its number came from, because the difference
@@ -515,11 +518,81 @@ branch or tag is a git ref. `channel decides` means it is genuinely not
 knowable until the package manager runs, which is the honest answer for a
 packaged extension — a confident number there would be a guess.
 
-Paths are shown the same way. Before the hosts are probed, a packaged install
-could land in either family's prefix, so both are named rather than one
-guessed; in the preview printed by a real deployment, the platform is known and
-only the path that applies is shown. Anything compiled on the hosts says so,
-and names `/opt/pgedge/build` as where that happens.
+Before the hosts are probed, a packaged install could land in either family's
+prefix, and the two disagree about every path and half the package names.
+Printing both in every cell turns the table into a wall, so one family is shown
+and the assumption is stated in a line above it — never left implicit. Once the
+hosts are probed, that line disappears and the real names appear. A source
+build never gets the caveat at all: it installs to `/opt/pgedge` whatever the
+distribution is.
+
+Anything too long for its column becomes a numbered note under the table rather
+than stretching it past the width of a terminal.
+
+Then you are asked whether to go ahead:
+
+```
+Start the deployment of 'pgedge'? [yes/no]:
+```
+
+Only `yes` or `y` starts it; anything else stops with nothing changed. The
+question is skipped by `--yes`, and when stdin is not a terminal — a prompt
+nobody can answer would hang a scripted run. `pg_deploy_cluster.sh` asks its
+own version of this after the plan preview and passes `--yes` through, so you
+are never asked twice; a flag-driven run of the script has no prompt of its
+own, and gets this one.
+
+---
+
+## What it reports when it finishes
+
+The deployment ends with the counterpart of the plan summary — the same rows,
+with what actually landed:
+
+```
+PostgreSQL Cluster Setup Summary
+
+COMPONENT   VERSION           BUILT / INSTALLED FROM             RESULT
+----------  ----------------  ---------------------------------  ----------
+PostgreSQL  18.6              ftp.postgresql.org source tarball  OK
+spock50     5.0.11            github.com/pgEdge/spock@v5_STABLE  OK
+Patroni     latest on PyPI    pip                                OK
+etcd        3.5.17 (planned)  github.com/etcd-io/etcd release    OK
+lolor       v1.2.3 (planned)  github.com/pgEdge/lolor@v1.2.3     FAILED [1]
+snowflake   2.0               github.com/pgEdge/snowflake@main   OK
+ace         1.0.3             github.com/pgEdge/ace@main         OK
+
+Replication
+
+WHAT           DETAIL                                   RESULT
+-------------  ---------------------------------------  ------
+Cross-wiring   2 Spock nodes, 2 subscriptions (n1, n2)  OK
+Standby nodes  1 across 1 scope(s)                      OK
+  n1 -> n1s1   synchronous, Sync Standby/streaming      OK
+
+  [1] Create optional extensions: ERROR: could not open extension control file "lolor.control"
+
+  Full output for every step: /root/.../logs/<run>/deploy.log
+  Per-node output: /root/.../logs/<run>/<node>.log
+```
+
+A version with no qualifier is what the component reported about itself once it
+was running. `(planned)` means nothing confirmed it — the row shows what was
+asked for, not what is there.
+
+The result column distinguishes three things that are easy to conflate. `OK` is
+done. `FAILED` carries a numbered note naming the step and its error, and the
+footer points at the log to read. `not reached` means an earlier failure
+stopped the run before this was attempted — a build that dies compiling
+PostgreSQL has one problem, not six, and marking the rest as failures would
+bury it.
+
+Attribution is per component rather than per step, because one step installs
+several things. If `Create optional extensions` fails on lolor but snowflake
+has already reported its version, snowflake is `OK` and only lolor is `FAILED`.
+The exception is PostgreSQL in a source build: `--pg-version` puts a number in
+the plan before anything is compiled, so that number is never treated as
+evidence the build succeeded.
 
 ---
 
