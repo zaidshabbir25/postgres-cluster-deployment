@@ -542,6 +542,18 @@ already has one keeps it. An ACE-only build installs git and little else: it
 compiles against nothing of PostgreSQL's, so the C toolchain and the server
 headers would be a lot of installing for no reason.
 
+### When they are created
+
+Installing and creating happen at opposite ends of the deployment, and the gap
+between them is not incidental. zodan's `add_node` verifies that the node it is
+joining is clean: a database carrying the lolor schema — or in fact any user
+table at all — is refused outright. So the packages and binaries go onto the
+hosts early, and `CREATE EXTENSION` runs only after every node has been
+cross-wired. The same applies to `--add-node`: a joining node is installed,
+wired in, and only then given the extensions, which is also why that path
+tolerates finding the tables already there, arrived through zodan's structure
+sync.
+
 ### The node identity
 
 Both carry a GUC naming the node — `lolor.node` (1 to 2^28) and
@@ -568,9 +580,9 @@ inherits its leader's number: it is a byte-for-byte copy, and a promotion must
 not change the number the ids issued before it were generated under.
 
 For lolor, `lolor.pg_largeobject` and `lolor.pg_largeobject_metadata` are added
-to the default replication set after cross-wiring. Without that step lolor is
-installed and inert — large objects land in its schema and replicate nowhere,
-which is the one thing it exists to fix.
+to the default replication set once the extension exists. Without that step
+lolor is installed and inert — large objects land in its schema and replicate
+nowhere, which is the one thing it exists to fix.
 
 Neither applies to ACE: it has no GUC and no tables of its own.
 

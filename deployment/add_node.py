@@ -629,13 +629,6 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             node=node.name,
         )
         spock_management.create_extensions(executor, plan, node, run_logger=log)
-        if selections:
-            # The identity GUC has to be distinct from every existing node's,
-            # which is what node_id gives a node not yet in plan.spock_nodes.
-            created = pg_extensions.create_on_node(executor, plan, node,
-                                                   selections=selections,
-                                                   run_logger=log)
-            log.info(f"    {name}: {', '.join(created)} created")
         # The branch this node's Spock came from, so zodan matches the
         # extension rather than just its major.
         script = spock_management.load_zodan(executor, plan, node,
@@ -687,6 +680,25 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
             )
         peers = ", ".join(n.name for n in plan.spock_nodes)
         log.step_end("passed", f"cluster is now a full mesh of {peers}")
+
+        # --- 6b. the cluster's optional extensions --------------------
+        # Only now: zodan refuses to join a node whose database already carries
+        # lolor, so the extension is installed on the host before the join and
+        # created in the database after it. The identity GUC has to be distinct
+        # from every existing node's, which is what node_id gives a node that
+        # was not in plan.spock_nodes when the cluster was first numbered.
+        if selections:
+            log.step_start("Create the cluster's optional extensions",
+                           ", ".join(f"pgedge-{item['name']}"
+                                     for item in selections))
+            created = pg_extensions.create_on_node(
+                executor, plan, node, selections=selections, run_logger=log,
+                strict=False,
+            )
+            pg_extensions.replicate_tables(executor, plan, node,
+                                           selections=selections,
+                                           run_logger=log)
+            log.step_end("passed", ", ".join(created) or "nothing to create")
 
         # --- 7. DDL replication ---------------------------------------
         log.step_start("Enable DDL replication", "on the new node")

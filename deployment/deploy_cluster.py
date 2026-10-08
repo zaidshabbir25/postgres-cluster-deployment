@@ -322,12 +322,14 @@ class ClusterDeployer:
         )
 
     def step_create_pg_extensions(self):
-        """Set each node's identity GUC, then CREATE EXTENSION.
+        """CREATE EXTENSION on every node, then set each node's identity GUC.
 
-        After the Spock extensions, so a failure here cannot block the
-        replication the cluster exists for, and before cross-wiring, so the
-        schema these extensions create is in place on every node before zodan
-        synchronises structure between them.
+        After cross-wiring, not before. zodan's add_node verifies the node it
+        is joining is clean: a database carrying the lolor schema — or any user
+        table at all — is refused outright, so creating these first makes the
+        cluster impossible to wire together. Replication then carries the
+        extension's own DDL between nodes, and CREATE EXTENSION IF NOT EXISTS
+        is what makes that harmless here.
         """
         created = {}
         for node in self.plan.spock_nodes:
@@ -809,12 +811,6 @@ class ClusterDeployer:
                        "spock and dblink on every Spock node",
                        self.step_spock_extensions)
 
-            if self._in_database_extensions():
-                self._step(
-                    "Create optional extensions",
-                    "node identity GUCs, then CREATE EXTENSION on every node",
-                    self.step_create_pg_extensions)
-
             self._step("Load zodan procedures",
                        "the cross-wiring library used by spock.add_node",
                        self.step_load_zodan)
@@ -822,6 +818,17 @@ class ClusterDeployer:
             self._step("Cross-wire Spock nodes",
                        "spock.add_node joins each node to every peer, both ways",
                        self.step_crosswire)
+
+            # Only now. zodan's prerequisite check refuses to cross-wire a
+            # node whose database already carries lolor — it rejects the lolor
+            # schema outright, and in fact any user table at all on the joining
+            # node. So the extensions are installed on the hosts before this
+            # and created in the databases after it.
+            if self._in_database_extensions():
+                self._step(
+                    "Create optional extensions",
+                    "node identity GUCs, then CREATE EXTENSION on every node",
+                    self.step_create_pg_extensions)
 
             if any(item["name"] in pg_extensions.REPLICATED_TABLES
                    for item in self.plan.pg_extensions):

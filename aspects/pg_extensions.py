@@ -545,7 +545,18 @@ def build_on_host(executor, plan, host, selections, run_logger=None):
 # ---------------------------------------------------------------------------
 
 
-def create_on_node(executor, plan, node, selections=None, run_logger=None):
+def is_created(executor, plan, node, spec):
+    """Is this extension already registered in the node's database?"""
+    found = pg_server_management.scalar(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        f"SELECT 1 FROM pg_extension WHERE extname = '{spec.name}';",
+        dbname=plan.db_name, node=node.name, default="",
+    )
+    return bool((found or "").strip())
+
+
+def create_on_node(executor, plan, node, selections=None, run_logger=None,
+                   strict=True):
     """Create each extension and give this node its identity. Returns names.
 
     The order is forced by how PostgreSQL handles a GUC that an extension
@@ -559,6 +570,12 @@ def create_on_node(executor, plan, node, selections=None, run_logger=None):
     session, where the second statement can see what the first defined. The
     value lands in postgresql.auto.conf, which every later backend reads as a
     custom placeholder whether or not the library is loaded.
+
+    `strict` is False for a node joining an existing cluster. There, zodan's
+    structure sync may already have copied the extension's own tables across
+    before this runs, and CREATE EXTENSION would collide with them — the node
+    still needs its identity GUC, which is the part that cannot be recovered
+    by hand later without knowing what every other node holds.
     """
     selections = selections if selections is not None else selections_of(plan)
     if not selections:
@@ -573,11 +590,29 @@ def create_on_node(executor, plan, node, selections=None, run_logger=None):
             # to create in a database and no node identity to give it.
             continue
 
-        pg_server_management.psql(
-            executor, node.bin_dir, node.pg_port, plan.db_user,
-            f"CREATE EXTENSION IF NOT EXISTS {spec.name};",
-            dbname=plan.db_name, node=node.name,
-        )
+        if not is_created(executor, plan, node, spec):
+            statement = f"CREATE EXTENSION IF NOT EXISTS {spec.name};"
+            if strict:
+                pg_server_management.psql(
+                    executor, node.bin_dir, node.pg_port, plan.db_user,
+                    statement, dbname=plan.db_name, node=node.name,
+                )
+            else:
+                code, output = pg_server_management.psql(
+                    executor, node.bin_dir, node.pg_port, plan.db_user,
+                    statement, dbname=plan.db_name, node=node.name, check=False,
+                )
+                if code != 0:
+                    if run_logger:
+                        run_logger.warn(
+                            f"{node.name}: could not create {spec.name} "
+                            f"({output.strip()[-200:]}). Its tables may have "
+                            f"arrived through replication already; the node "
+                            f"identity is still being set."
+                        )
+        elif run_logger:
+            run_logger.node(node.name,
+                            f"{spec.name} is already present — leaving it")
 
         if spec.guc:
             set_node_identity(executor, plan, node, spec, identity,

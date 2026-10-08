@@ -535,3 +535,70 @@ def test_a_mixed_build_still_installs_the_postgres_toolchain():
 
     assert any("pgedge-postgresql17-devel" in c for c in executor.commands)
     assert any("go build" in c for c in executor.commands)
+
+
+# ---------------------------------------------------------------------------
+# when they are created
+# ---------------------------------------------------------------------------
+
+
+def test_extensions_are_created_after_the_cross_wire_not_before():
+    """zodan's add_node verifies the joining node's database is clean: it
+    refuses one carrying the lolor schema, or in fact any user table. Creating
+    these before cross-wiring makes the cluster impossible to wire together,
+    which is what a real deployment hit. This reads the registration order
+    because that order is the whole fix."""
+    from pathlib import Path
+
+    source = Path("deployment/deploy_cluster.py").read_text()
+    crosswire = source.index('self.step_crosswire)')
+    creating = source.index('self.step_create_pg_extensions)')
+    repsets = source.index('self.step_replicate_extension_tables,')
+
+    assert crosswire < creating, \
+        "CREATE EXTENSION must come after spock.add_node has joined the nodes"
+    assert creating < repsets, \
+        "the tables cannot join a repset before the extension creates them"
+
+
+def test_an_extension_already_present_is_left_alone():
+    """A node joining an existing cluster receives the extension's tables
+    through zodan's structure sync before this runs."""
+    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
+    executor = FakeExecutor(replies={"FROM pg_extension WHERE extname": (True, "1\n")})
+
+    created = pg_extensions.create_on_node(executor, plan, plan.node("n1"))
+
+    assert created == ["lolor"]
+    assert not any("CREATE EXTENSION" in c for c in executor.commands)
+    # The identity still gets set: that is the part nobody can reconstruct by
+    # hand without knowing what every other node holds.
+    assert any("ALTER SYSTEM SET lolor.node" in c for c in executor.commands)
+
+
+def test_a_joining_node_still_gets_its_identity_when_creation_collides(logger):
+    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
+    executor = FakeExecutor(replies={
+        "FROM pg_extension WHERE extname": (True, ""),
+        "CREATE EXTENSION": (False, 'ERROR:  relation "pg_largeobject" already exists'),
+    })
+
+    created = pg_extensions.create_on_node(executor, plan, plan.node("n1"),
+                                           run_logger=logger, strict=False)
+
+    assert created == ["lolor"]
+    assert logger.said("could not create lolor")
+    assert any("ALTER SYSTEM SET lolor.node" in c for c in executor.commands)
+
+
+def test_a_fresh_deployment_still_fails_loudly_on_a_bad_create():
+    """Strict is the default: on a fresh cluster there is no replicated
+    structure to collide with, so a failure there is a real one."""
+    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
+    executor = FakeExecutor(replies={
+        "FROM pg_extension WHERE extname": (True, ""),
+        "CREATE EXTENSION": (False, "ERROR:  could not open extension control file"),
+    })
+
+    with pytest.raises(Exception):
+        pg_extensions.create_on_node(executor, plan, plan.node("n1"))
