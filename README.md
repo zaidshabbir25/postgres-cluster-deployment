@@ -489,6 +489,40 @@ own error count, then waits for every subscription on both nodes to report
 
 ---
 
+## What the plan says it will install
+
+`--dry-run`, and the preview every deployment prints before it starts, list
+every component with its version and where it lands:
+
+```
+COMPONENT   VERSION            ORIGIN / INSTALLS TO
+PostgreSQL  17.11 (expected)   staging channel — the pgEdge PostgreSQL package
+                               -> /usr/pgsql-17 (RHEL) | /usr/lib/postgresql/17 (Debian)
+spock50     5.0.11 (expected)  staging channel — the pgEdge spock50 package
+                               -> the PostgreSQL prefix above
+lolor       channel decides    staging channel — pgedge-lolor_17 (RHEL) | ...
+                               -> the PostgreSQL prefix above
+ace         main (branch/tag)  https://github.com/pgEdge/ace.git
+                               -> /usr/local/bin/ace (Go toolchain in /usr/local/go)
+```
+
+The version column says where its number came from, because the difference
+matters. `expected` is a pin from `configuration/config<major>.env` — a
+reference point, not a gate: the deployment installs what the channel offers
+and records the result, and comparing the two afterwards is what the pin is
+for. `exact` was asked for explicitly and the deployment fails without it. A
+branch or tag is a git ref. `channel decides` means it is genuinely not
+knowable until the package manager runs, which is the honest answer for a
+packaged extension — a confident number there would be a guess.
+
+Paths are shown the same way. Before the hosts are probed, a packaged install
+could land in either family's prefix, so both are named rather than one
+guessed; in the preview printed by a real deployment, the platform is known and
+only the path that applies is shown. Anything compiled on the hosts says so,
+and names `/opt/pgedge/build` as where that happens.
+
+---
+
 ## Optional add-ons
 
 Three pgEdge add-ons can be installed with the cluster. None is on by default —

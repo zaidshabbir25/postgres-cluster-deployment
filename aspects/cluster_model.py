@@ -243,6 +243,15 @@ class ClusterPlan:
             f"Standby nodes  : {len(self.standby_nodes)}",
             f"etcd           : {', '.join(self.etcd_endpoints) or 'not planned yet'}",
             "",
+        ]
+        # Imported here, not at module scope: the model is a leaf that
+        # everything else builds on, and this reaches back into the aspects
+        # that know about packages, prefixes and version pins.
+        from aspects import components
+
+        lines += components.summary_lines(self)
+        lines += [
+            "",
             f"{'NODE':<10} {'ROLE':<9} {'HOST':<16} {'ADDRESS':<16} "
             f"{'PG':<7} {'API':<6} {'SCOPE':<18} FOLLOWS",
         ]
