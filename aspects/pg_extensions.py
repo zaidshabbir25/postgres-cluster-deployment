@@ -73,6 +73,7 @@ class ExtensionSpec:
     package_name: str = ""         # fixed name, for something version-independent
     build_command: str = ""        # for a tool: what produces the binary
     binary: str = ""               # for a tool: the file it produces
+    module: str = ""               # shared library defining the GUC; default: name
     guc: str = ""                  # per-node identity GUC, if it has one
     guc_max: int = 0
     min_pg_major: int = 0
@@ -81,6 +82,11 @@ class ExtensionSpec:
     @property
     def is_tool(self):
         return self.kind == KIND_TOOL
+
+    @property
+    def library(self):
+        """The shared library to LOAD before its GUC can be set."""
+        return self.module or self.name
 
     def package(self, family, pg_major):
         """The pgEdge package providing this, for one PostgreSQL major.
@@ -540,12 +546,19 @@ def build_on_host(executor, plan, host, selections, run_logger=None):
 
 
 def create_on_node(executor, plan, node, selections=None, run_logger=None):
-    """Set each extension's node GUC, then CREATE EXTENSION. Returns names.
+    """Create each extension and give this node its identity. Returns names.
 
-    The GUC comes first on purpose. snowflake's default is invalid by design,
-    so a node that has the extension but not the setting raises on the first
-    nextval() — which would be discovered by an application, not by the
-    deployment.
+    The order is forced by how PostgreSQL handles a GUC that an extension
+    defines. `lolor.node` does not exist until lolor's shared library has run
+    its _PG_init, and ALTER SYSTEM validates against the GUCs the *current
+    session* knows — so setting it first fails with "unrecognized configuration
+    parameter", and creating the extension is not enough either, because
+    CREATE EXTENSION does not load the library into the session.
+
+    So: create the extension, then LOAD the library and ALTER SYSTEM in one
+    session, where the second statement can see what the first defined. The
+    value lands in postgresql.auto.conf, which every later backend reads as a
+    custom placeholder whether or not the library is loaded.
     """
     selections = selections if selections is not None else selections_of(plan)
     if not selections:
@@ -559,22 +572,17 @@ def create_on_node(executor, plan, node, selections=None, run_logger=None):
             # A tool runs beside the cluster, not inside it. There is nothing
             # to create in a database and no node identity to give it.
             continue
-        if spec.guc:
-            pg_server_management.psql(
-                executor, node.bin_dir, node.pg_port, plan.db_user,
-                f"ALTER SYSTEM SET {spec.guc} = {identity};",
-                dbname=plan.db_name, node=node.name,
-            )
-        pg_server_management.psql(
-            executor, node.bin_dir, node.pg_port, plan.db_user,
-            "SELECT pg_reload_conf();",
-            dbname=plan.db_name, node=node.name,
-        )
+
         pg_server_management.psql(
             executor, node.bin_dir, node.pg_port, plan.db_user,
             f"CREATE EXTENSION IF NOT EXISTS {spec.name};",
             dbname=plan.db_name, node=node.name,
         )
+
+        if spec.guc:
+            set_node_identity(executor, plan, node, spec, identity,
+                              run_logger=run_logger)
+
         created.append(spec.name)
         if run_logger:
             run_logger.node(
@@ -583,6 +591,42 @@ def create_on_node(executor, plan, node, selections=None, run_logger=None):
                 + (f", {spec.guc} = {identity}" if spec.guc else "")
             )
     return created
+
+
+def set_node_identity(executor, plan, node, spec, identity, run_logger=None):
+    """LOAD the library, then ALTER SYSTEM its node GUC, in one session.
+
+    Falls back to ALTER SYSTEM alone when the LOAD is refused — a packaged
+    build may name its library something other than the extension, and the GUC
+    is recognised anyway if the library happens to be preloaded.
+    """
+    statements = [
+        f"LOAD '{spec.library}';",
+        f"ALTER SYSTEM SET {spec.guc} = {identity};",
+        "SELECT pg_reload_conf();",
+    ]
+    code, output = pg_server_management.psql_session(
+        executor, node.bin_dir, node.pg_port, plan.db_user, statements,
+        dbname=plan.db_name, node=node.name, check=False,
+    )
+    if code == 0:
+        return True
+
+    if run_logger:
+        run_logger.warn(
+            f"{node.name}: could not set {spec.guc} after LOAD "
+            f"'{spec.library}' ({output.strip()[-200:]}); trying without it"
+        )
+    pg_server_management.psql(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        f"ALTER SYSTEM SET {spec.guc} = {identity};",
+        dbname=plan.db_name, node=node.name,
+    )
+    pg_server_management.psql(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        "SELECT pg_reload_conf();", dbname=plan.db_name, node=node.name,
+    )
+    return True
 
 
 # Tables lolor creates and Spock must carry, or large objects replicate

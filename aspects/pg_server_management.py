@@ -189,6 +189,28 @@ def psql(executor, bin_dir, port, user, sql, dbname="postgres",
     return executor.exec_run(command, user=user, node=node, timeout=timeout)
 
 
+def psql_session(executor, bin_dir, port, user, statements, dbname="postgres",
+                 host="127.0.0.1", node=None, check=True, timeout=300):
+    """Run several statements in one psql session. Returns (exit_code, output).
+
+    Each statement gets its own -c, so each is sent as a separate simple query
+    — which is what ALTER SYSTEM requires, since the server rejects it inside a
+    multi-statement batch. What they share is the session, and that is the
+    point: a LOAD in the first statement is still in effect for the second.
+    """
+    flags = "-X -q -v ON_ERROR_STOP=1"
+    rendered = " ".join(f"-c {shlex.quote(sql)}" for sql in statements)
+    command = (
+        f"{bin_dir}/psql {flags} -h {host} -p {port} -U {user} -d {dbname} "
+        f"{rendered}"
+    )
+    if check:
+        output = executor.run(command, user=user, node=node, timeout=timeout,
+                              message=f"psql :{port} {statements[0][:80]}")
+        return 0, output
+    return executor.exec_run(command, user=user, node=node, timeout=timeout)
+
+
 def psql_file(executor, bin_dir, port, user, remote_path, dbname="postgres",
               host="127.0.0.1", node=None, check=True, timeout=1800):
     """Run a SQL file with psql."""

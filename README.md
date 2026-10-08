@@ -547,14 +547,25 @@ headers would be a lot of installing for no reason.
 Both carry a GUC naming the node — `lolor.node` (1 to 2^28) and
 `snowflake.node` (1 to 1023) — and in a multi-master cluster those values must
 differ. snowflake's default is invalid on purpose: a node with the extension
-but not the setting raises on the first `nextval()`. So the deployment sets the
-GUC *before* creating the extension, takes the value from the number in the
-node's name rather than its position in the cluster — remove `n2` and `n3`
-would otherwise slide into a number another node is already generating ids
-under — and then reads the GUC back from every server and fails the deployment
-if two of them match. A standby deliberately inherits its leader's number: it
-is a byte-for-byte copy, and a promotion must not change the number the ids
-issued before it were generated under.
+but not the setting raises on the first `nextval()`.
+
+Setting one is less direct than it looks. `lolor.node` does not exist until
+lolor's shared library has run its `_PG_init`, and `ALTER SYSTEM` validates
+against the GUCs the *current session* knows — so setting it before the
+extension exists fails with `unrecognized configuration parameter`, and
+creating the extension first is not enough either, because `CREATE EXTENSION`
+does not load the library into the session. The deployment therefore creates
+the extension, then issues `LOAD` and `ALTER SYSTEM` as two statements of one
+psql session, where the second can see what the first defined. The value lands
+in `postgresql.auto.conf`, which later backends read as a custom placeholder
+whether or not the library is loaded.
+
+The value is the number in the node's name rather than its position in the
+cluster — remove `n2` and `n3` would otherwise slide into a number another node
+is already generating ids under. Afterwards the GUC is read back from every
+server and the deployment fails if two of them match. A standby deliberately
+inherits its leader's number: it is a byte-for-byte copy, and a promotion must
+not change the number the ids issued before it were generated under.
 
 For lolor, `lolor.pg_largeobject` and `lolor.pg_largeobject_metadata` are added
 to the default replication set after cross-wiring. Without that step lolor is

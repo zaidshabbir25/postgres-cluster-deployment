@@ -969,42 +969,8 @@ if [[ "$INTERACTIVE" == true ]]; then
   fi
   say ""
 
-  # --- 6. optional extensions -----------------------------------------
-  say "${BOLD}6) Any optional pgEdge add-ons?${RESET}"
-  say "   ${DIM}lolor      stores large objects in its own schema instead of the"
-  say "              catalog, so Spock can replicate them"
-  say "   snowflake  int8 sequences that embed a node id, so multi-master nodes"
-  say "              cannot generate colliding keys"
-  say "   ace        the Active Consistency Engine: a command-line tool that"
-  say "              compares nodes and repairs differences. Not an in-database"
-  say "              extension, and independent of the PostgreSQL version"
-  say "   All are optional and off by default.${RESET}"
-  say ""
-  PG_EXTENSIONS=""
-  for EXT in lolor snowflake ace; do
-    WANT="$(ask_choice "   Install pgedge-$EXT? (y/n)" "n" y n)"
-    [[ "$WANT" == "y" ]] || continue
-    # The same choice the cluster itself was given, defaulting to it: a
-    # source-built cluster has no pgEdge repository to install a package from.
-    EXT_MODE="$(ask_choice "     Install $EXT from packages or build from source?" \
-                           "$MODE" packages source)"
-    EXT_ENTRY="pgedge-$EXT:$EXT_MODE"
-    if [[ "$EXT_MODE" == "source" ]]; then
-      [[ "$EXT" == "ace" ]] && \
-        say "     ${DIM}ace is written in Go; the toolchain is installed if the host has none.${RESET}"
-      EXT_REF="$(ask "     Which $EXT branch or tag should be built?" "main")"
-      EXT_ENTRY="$EXT_ENTRY@$EXT_REF"
-    fi
-    PG_EXTENSIONS="${PG_EXTENSIONS:+$PG_EXTENSIONS,}$EXT_ENTRY"
-  done
-  if [[ -z "$PG_EXTENSIONS" ]]; then
-    PG_EXTENSIONS="none"
-    say "   ${DIM}No optional extensions.${RESET}"
-  fi
-  say ""
-
-  # --- 7. remaining options ------------------------------------------
-  say "${BOLD}7) Anything else${RESET} ${DIM}(press Enter to accept each default)${RESET}"
+  # --- 6. remaining options ------------------------------------------
+  say "${BOLD}6) Anything else${RESET} ${DIM}(press Enter to accept each default)${RESET}"
   CLUSTER="$(ask "   Cluster name" "pgedge")"
   SPOCK_MAJOR="$(ask_choice "   Spock major version (50 or 60)" "50" 50 60)"
   if [[ "$MODE" == "packages" ]]; then
@@ -1033,6 +999,45 @@ if [[ "$INTERACTIVE" == true ]]; then
     BASE_RESTAPI_PORT="$(ask_int "   First Patroni REST port on each machine" "8008" 1024 65000)"
   fi
   CLEAN="$(ask_choice "   Wipe any previous deployment on these hosts first? (y/n)" "n" y n)"
+  say ""
+
+  # --- 7. optional add-ons --------------------------------------------
+  say "${BOLD}7) Any optional pgEdge add-ons?${RESET}"
+  say "   ${DIM}lolor      stores large objects in its own schema instead of the"
+  say "              catalog, so Spock can replicate them"
+  say "   snowflake  int8 sequences that embed a node id, so multi-master nodes"
+  say "              cannot generate colliding keys"
+  say "   ace        the Active Consistency Engine: a command-line tool that"
+  say "              compares nodes and repairs differences. Not an in-database"
+  say "              extension, and independent of the PostgreSQL version"
+  say "   All are optional and off by default.${RESET}"
+  say ""
+  PG_EXTENSIONS=""
+  for EXT in lolor snowflake ace; do
+    WANT="$(ask_choice "   Install pgedge-$EXT? (y/n)" "n" y n)"
+    [[ "$WANT" == "y" ]] || continue
+    # The same choice the cluster itself was given, defaulting to it: a
+    # source-built cluster has no pgEdge repository to install a package from.
+    EXT_MODE="$(ask_choice "     Install $EXT from packages or build from source?" \
+                           "$MODE" packages source)"
+    EXT_ENTRY="pgedge-$EXT:$EXT_MODE"
+    if [[ "$EXT_MODE" == "packages" ]]; then
+      # The channel was settled a moment ago, and it is the channel this
+      # package comes from too — say so rather than leaving it implied.
+      say "     ${DIM}from the ${CHANNEL:-release} channel, like the server itself.${RESET}"
+    fi
+    if [[ "$EXT_MODE" == "source" ]]; then
+      [[ "$EXT" == "ace" ]] && \
+        say "     ${DIM}ace is written in Go; the toolchain is installed if the host has none.${RESET}"
+      EXT_REF="$(ask "     Which $EXT branch or tag should be built?" "main")"
+      EXT_ENTRY="$EXT_ENTRY@$EXT_REF"
+    fi
+    PG_EXTENSIONS="${PG_EXTENSIONS:+$PG_EXTENSIONS,}$EXT_ENTRY"
+  done
+  if [[ -z "$PG_EXTENSIONS" ]]; then
+    PG_EXTENSIONS="none"
+    say "   ${DIM}No optional extensions.${RESET}"
+  fi
   say ""
 
   # --- assemble ------------------------------------------------------

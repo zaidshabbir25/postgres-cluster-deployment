@@ -259,21 +259,52 @@ def test_nothing_is_built_when_every_entry_is_a_package():
 # ---------------------------------------------------------------------------
 
 
-def test_the_identity_guc_is_set_before_the_extension_is_created():
-    """snowflake's default is invalid by design: an extension created without
-    its GUC raises on the first nextval(), which an application discovers
-    rather than the deployment."""
+def test_the_guc_is_set_in_the_same_session_as_the_load_that_defines_it():
+    """snowflake.node does not exist until snowflake's library has run its
+    _PG_init, and ALTER SYSTEM validates against the GUCs the current session
+    knows. Setting it on its own fails with "unrecognized configuration
+    parameter" — which is exactly what a real deployment hit."""
     plan = plan_with(("n1", "n2"), pg_extensions=pg_extensions.parse("pgedge-snowflake"))
     executor = FakeExecutor()
 
     created = pg_extensions.create_on_node(executor, plan, plan.node("n2"))
 
     assert created == ["snowflake"]
-    guc = next(i for i, c in enumerate(executor.commands)
-               if "ALTER SYSTEM SET snowflake.node" in c)
+    setting = next(c for c in executor.commands
+                   if "ALTER SYSTEM SET snowflake.node" in c)
+    assert "LOAD" in setting and "snowflake" in setting, \
+        "the LOAD has to share the session with the ALTER SYSTEM"
+    assert setting.index("LOAD") < setting.index("ALTER SYSTEM")
+
+
+def test_the_extension_is_created_before_its_guc_is_set():
+    """CREATE EXTENSION does not load the library, but it does put it in place
+    for the LOAD that follows."""
+    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
+    executor = FakeExecutor()
+
+    pg_extensions.create_on_node(executor, plan, plan.node("n1"))
+
     extension = next(i for i, c in enumerate(executor.commands)
-                     if "CREATE EXTENSION IF NOT EXISTS snowflake" in c)
-    assert guc < extension
+                     if "CREATE EXTENSION IF NOT EXISTS lolor" in c)
+    guc = next(i for i, c in enumerate(executor.commands)
+               if "ALTER SYSTEM SET lolor.node" in c)
+    assert extension < guc
+
+
+def test_a_refused_load_falls_back_to_setting_the_guc_alone(logger):
+    """A packaged build may name its library something else; the GUC can still
+    be recognised if that library happens to be preloaded."""
+    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
+    executor = FakeExecutor(replies={"LOAD": (False, "could not access file")})
+
+    created = pg_extensions.create_on_node(executor, plan, plan.node("n1"),
+                                           run_logger=logger)
+
+    assert created == ["lolor"]
+    assert any("ALTER SYSTEM SET lolor.node" in c and "LOAD" not in c
+               for c in executor.commands)
+    assert logger.said("trying without it")
 
 
 def test_each_node_is_given_its_own_number():
@@ -285,6 +316,7 @@ def test_each_node_is_given_its_own_number():
         pg_extensions.create_on_node(executor, plan, target)
         seen.append(next(c for c in executor.commands
                          if "ALTER SYSTEM SET lolor.node" in c))
+        assert "CREATE EXTENSION IF NOT EXISTS lolor" in " ".join(executor.commands)
 
     assert "lolor.node = 1" in seen[0]
     assert "lolor.node = 2" in seen[1]

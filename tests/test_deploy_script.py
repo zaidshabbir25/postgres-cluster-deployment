@@ -108,7 +108,11 @@ def deployment_answers(hosts="1", method="1", nodes="2", pg_major="17",
             if sync_count is not None:          # asked only for several
                 answers.append(sync_count)
             answers.append(sync_strict or "n")
-    # Each extension is one yes/no; saying yes opens two more questions.
+    # The general options come first: the channel an extension package is
+    # fetched from is one of them.
+    answers += [cluster, spock_major, channel_or_branch, db_name, db_user,
+                base_port, base_restapi, clean]
+    # Then each add-on: one yes/no, and saying yes opens one or two more.
     for wanted, mode, ref in ((lolor, lolor_mode, lolor_ref),
                               (snowflake, snowflake_mode, snowflake_ref),
                               (ace, ace_mode, ace_ref)):
@@ -117,8 +121,7 @@ def deployment_answers(hosts="1", method="1", nodes="2", pg_major="17",
             answers.append(mode or "")
             if mode == "source":
                 answers.append(ref or "")
-    answers += [cluster, spock_major, channel_or_branch, db_name, db_user,
-                base_port, base_restapi, clean, proceed]
+    answers.append(proceed)
     return "\n".join(answers) + "\n"
 
 
@@ -586,3 +589,19 @@ def test_all_three_can_be_chosen_at_once(script, inventory):
     assert code == 0
     assert ("--pg-extensions pgedge-lolor:packages,pgedge-snowflake:packages,"
             "pgedge-ace:packages" in line(output, "DEPLOY:"))
+
+
+def test_the_general_options_are_asked_before_the_add_ons(script, inventory):
+    """The channel an extension package comes from is one of them, so asking
+    it after the add-on questions was the wrong way round."""
+    code, output = run(script, inventory,
+                       answers=deployment_answers(channel_or_branch="staging",
+                                                  lolor="y",
+                                                  lolor_mode="packages"))
+
+    assert code == 0
+    assert output.index("6) Anything else") < output.index("7) Any optional")
+    assert "from the staging channel" in output
+    deploy = line(output, "DEPLOY:")
+    assert "--channel staging" in deploy
+    assert "--pg-extensions pgedge-lolor:packages" in deploy
