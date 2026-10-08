@@ -687,7 +687,11 @@ if [[ -n "$ADD_NODE" ]]; then
       say ""
       for _ in 1 2 3 4 5; do
         NODE_PG_VERSION="$(ask "   PostgreSQL version" "$FACT_PG")"
-        if [[ ! "$NODE_PG_VERSION" =~ ^[0-9]+(\.[0-9]+|beta[0-9]+|rc[0-9]+)?$ ]]; then
+        # The minor and the pre-release are independent: 19, 19.0, 19beta3 and
+        # 19.0beta3 are all real PostgreSQL versions, and the last is what a
+        # cluster on a pre-release actually reports — so an either/or pattern
+        # rejects this prompt's own default.
+        if [[ ! "$NODE_PG_VERSION" =~ ^[0-9]+(\.[0-9]+)?(beta[0-9]+|rc[0-9]+)?$ ]]; then
           warn "Enter a version like $FACT_PG."
           NODE_PG_VERSION=""
           continue
@@ -912,7 +916,9 @@ if [[ "$INTERACTIVE" == true ]]; then
     say ""
     for _ in 1 2 3 4 5; do
       PG_VERSION="$(ask "   Exact version to build" "${NEWEST:-}")"
-      if [[ ! "$PG_VERSION" =~ ^${PG_MAJOR}(\.[0-9]+|beta[0-9]+|rc[0-9]+) ]]; then
+      # Anchored, and a bare major is still refused: a source build needs an
+      # exact version to fetch. 19.0beta3 has to pass, though.
+      if [[ ! "$PG_VERSION" =~ ^${PG_MAJOR}(\.[0-9]+(beta[0-9]+|rc[0-9]+)?|beta[0-9]+|rc[0-9]+)$ ]]; then
         warn "That does not look like a $PG_MAJOR release (expected ${PG_MAJOR}.x, ${PG_MAJOR}betaN or ${PG_MAJOR}rcN)."
         PG_VERSION=""
         continue

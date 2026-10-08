@@ -31,6 +31,7 @@ from aspects import (
     inventory,
     package_management,
     patroni_management,
+    pg_extensions,
     pg_server_management,
     platform_detect,
     prereq_setup,

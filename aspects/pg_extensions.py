@@ -37,8 +37,7 @@ Neither extension needs shared_preload_libraries, so neither costs a restart.
 
 import re
 import shlex
-from dataclasses import dataclass, field
-from typing import Tuple
+from dataclasses import dataclass
 
 from aspects import package_management, pg_server_management, platform_detect
 

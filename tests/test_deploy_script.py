@@ -10,6 +10,7 @@ tests.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -622,3 +623,86 @@ def test_a_flag_driven_run_leaves_the_question_to_the_deploy_command(script, inv
 
     assert code == 0
     assert "--yes" not in line(output, "DEPLOY:")
+
+
+# ---------------------------------------------------------------------------
+# version prompts
+# ---------------------------------------------------------------------------
+
+PRERELEASE = "pgedge|19.0beta3|n1,n2|n1,n2|packages|50|main"
+
+
+def test_add_node_accepts_the_clusters_own_prerelease_version(script, inventory):
+    """A cluster on 19.0beta3 offers it as the default; a pattern that treats
+    the minor and the pre-release as alternatives rejects its own default and
+    the prompt becomes unanswerable."""
+    code, output = run(script, inventory, "--add-node", "n3", "--role", "leader",
+                       answers="\n\n", facts=PRERELEASE)
+
+    assert code == 0
+    assert "Enter a version like" not in output
+    assert "--pg-version 19.0beta3" in line(output, "ADD:")
+
+
+def test_add_node_accepts_every_shape_a_postgres_version_takes(script, inventory):
+    for version in ("19", "19.0", "19beta3", "19.0beta3", "19.0rc1"):
+        code, output = run(script, inventory, "--add-node", "n3",
+                           "--role", "leader", answers=f"{version}\n\n",
+                           facts=PRERELEASE)
+
+        assert code == 0, version
+        assert "Enter a version like" not in output, version
+
+
+def test_add_node_still_refuses_something_that_is_not_a_version(script, inventory):
+    code, output = run(script, inventory, "--add-node", "n3", "--role", "leader",
+                       answers="19.0xyz\n19.0beta3\n\n", facts=PRERELEASE)
+
+    assert "Enter a version like" in output
+    assert "--pg-version 19.0beta3" in line(output, "ADD:")
+
+
+def _version_pattern(label):
+    """Pull a version regex out of the script, so the test checks the real one.
+
+    The source-build prompt also asks the PostgreSQL mirror which versions
+    exist, so driving it end to end makes the test depend on what is published
+    today. The shape check is a separate question and this asks only that.
+    """
+    text = SCRIPT.read_text(encoding="utf-8")
+    patterns = re.findall(r'=~ (\^[^\s]*?)\s*\]\]', text)
+    matches = [p for p in patterns if label in p]
+    assert matches, f"no version pattern containing {label!r} in the script"
+    return matches[0]
+
+
+def _matches(pattern, value, variables=""):
+    """Does bash consider `value` to match `pattern`?"""
+    script = f'{variables}\n[[ "{value}" =~ {pattern} ]]'
+    return subprocess.run(["bash", "-c", script]).returncode == 0
+
+
+@pytest.mark.parametrize("version,allowed", [
+    ("19", True), ("19.0", True), ("19beta3", True),
+    ("19.0beta3", True), ("19.0rc1", True),
+    ("19.0xyz", False), ("", False), ("beta3", False),
+])
+def test_the_add_node_version_pattern_accepts_every_real_shape(version, allowed):
+    """The minor and the pre-release are independent. Treating them as
+    alternatives rejects 19.0beta3 — which is what a cluster on a pre-release
+    reports, and therefore what the prompt offers as its own default."""
+    pattern = _version_pattern("beta[0-9]+|rc[0-9]+)?$")
+
+    assert _matches(pattern, version) is allowed
+
+
+@pytest.mark.parametrize("version,allowed", [
+    ("19.0", True), ("19beta3", True), ("19.0beta3", True), ("19.0rc1", True),
+    ("19", False),          # a source build needs an exact version to fetch
+    ("18.5", False),        # a different major
+    ("19.0xyz", False),     # anchored, so no trailing junk
+])
+def test_the_source_build_version_pattern_demands_an_exact_version(version, allowed):
+    pattern = _version_pattern("${PG_MAJOR}")
+
+    assert _matches(pattern, version, variables="PG_MAJOR=19") is allowed
