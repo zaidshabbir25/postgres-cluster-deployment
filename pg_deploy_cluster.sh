@@ -131,6 +131,17 @@ Cleanup
                             node, un-replicated WAL, or a failed un-wiring
   --yes                     with --remove-node or --cleanup, skip the prompt
 
+  --health_check LIST       after a cluster is deployed, run each component's own
+                            regression suite against it and exit. Comma-separated:
+                            spock, lolor, snowflake, ace, or all. Each component
+                            works in its own directory under
+                            /opt/pgedge/regression and is reported separately.
+                            Note: ace's suite starts its own containers and does
+                            not read the deployed cluster.
+  --node NAME               with --health_check, the Spock node to run against
+  --stop-on-failure         with --health_check, skip the remaining suites once
+                            one fails
+
   --cleanup                 scrub every host in the inventory and exit: Patroni
                             units, etcd state, data directories, cluster config
                             and saved state. Works after a failed deployment,
@@ -480,6 +491,8 @@ DRY_RUN=false
 CLEANUP=false
 CLEANUP_ARGS=()
 ADD_NODE=""
+HEALTH_CHECK=""
+HEALTH_ARGS=()
 PG_EXTENSIONS=""
 REMOVE_NODE=""
 REMOVE_ARGS=()
@@ -506,6 +519,16 @@ while [[ $# -gt 0 ]]; do
     --add-node)
       [[ $# -ge 2 ]] || die "--add-node needs a node name (e.g. --add-node n3)"
       ADD_NODE="$2"; INTERACTIVE=false; shift 2 ;;
+    --health_check|--health-check)
+      [[ $# -ge 2 ]] || die "--health_check needs a component list (e.g. spock,lolor,snowflake,ace, or all)"
+      HEALTH_CHECK="$2"; INTERACTIVE=false; shift 2 ;;
+    --node|--stop-on-failure)
+      if [[ "$1" == "--stop-on-failure" ]]; then
+        HEALTH_ARGS+=("$1"); shift
+      else
+        [[ $# -ge 2 ]] || die "--node needs a node name"
+        HEALTH_ARGS+=("$1" "$2"); shift 2
+      fi ;;
     --remove-node)
       [[ $# -ge 2 ]] || die "--remove-node needs a node name (e.g. --remove-node n3)"
       REMOVE_NODE="$2"; INTERACTIVE=false; shift 2 ;;
@@ -549,6 +572,41 @@ ensure_venv
 # ---------------------------------------------------------------------------
 # Cleanup — a mode of its own, not a deployment
 # ---------------------------------------------------------------------------
+
+if [[ -n "$HEALTH_CHECK" ]]; then
+  [[ -z "$ADD_NODE" && -z "$REMOVE_NODE" ]] \
+    || die "--health_check tests a deployed cluster; it does not change one. Run it on its own"
+  [[ "$CLEANUP" == false ]] || die "--health_check and --cleanup do opposite things; pick one"
+  FACTS="$(cluster_facts "$CLUSTER_NAME")"
+  [[ -n "$FACTS" ]] || die "no deployed cluster found — deploy one before running its regression suites"
+  IFS='|' read -r FACT_CLUSTER FACT_PG FACT_SPOCK FACT_ALL FACT_MODE \
+    FACT_SPOCK_MAJOR FACT_BRANCH <<<"$FACTS"
+
+  say ""
+  say "${BOLD}Regression suites for cluster '$FACT_CLUSTER'${RESET}"
+  rule
+  say "   PostgreSQL : $FACT_PG"
+  say "   Spock      : spock${FACT_SPOCK_MAJOR} (${FACT_BRANCH})"
+  say "   Spock nodes: ${FACT_SPOCK:-none}"
+  say "   Components : $HEALTH_CHECK"
+  rule
+  say ""
+  say "${DIM}Each component's suite is fetched at the ref this cluster was built"
+  say "from, into its own directory under /opt/pgedge/regression, and reported"
+  say "separately. A suite that cannot run here is skipped with the reason."
+  say ""
+  say "spock and lolor point pg_regress at a live node, so they test this"
+  say "cluster. snowflake's harness does too, through a small symlink shim."
+  say "ace starts its own containers: it tests the ACE binary, not this"
+  say "cluster — use 'ace table-diff' for that.${RESET}"
+  say ""
+
+  exec python3 -m deployment.cli health-check \
+    --components "$HEALTH_CHECK" \
+    --inventory "$INVENTORY" \
+    ${CLUSTER_NAME:+--cluster "$CLUSTER_NAME"} \
+    "${HEALTH_ARGS[@]+"${HEALTH_ARGS[@]}"}"
+fi
 
 if [[ -n "$REMOVE_NODE" ]]; then
   [[ -z "$ADD_NODE" ]] || die "--add-node and --remove-node do the opposite of each other; pick one"

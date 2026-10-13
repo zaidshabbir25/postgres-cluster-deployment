@@ -30,9 +30,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from aspects import (health, inventory, patroni_management, pg_extensions,
                      spock_management, state)
+from regression import runner as regression
 from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
-from deployment import add_standby, cleanup, deploy_cluster, ops_cli, topology
+from deployment import (add_standby, cleanup, deploy_cluster, health_check,
+                        ops_cli, topology)
 from reports import report_generator
 
 EXIT_OK = 0
@@ -441,6 +443,38 @@ def cmd_add_standby(args):
     return EXIT_FAIL
 
 
+def cmd_health_check(args):
+    """Run each named component's upstream regression suite."""
+    cluster = args.cluster or state.latest_cluster()
+    if not cluster:
+        print("No deployed clusters found. Deploy one before running its "
+              "regression suites.", file=sys.stderr)
+        return EXIT_FAIL
+    try:
+        components = regression.parse_components(args.components)
+    except ValueError as exc:
+        print(f"--health_check: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    if not components:
+        print("--health_check needs at least one component: "
+              f"{', '.join(regression.known_components())}, or 'all'",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    result = health_check.run(
+        cluster_name=cluster, components=components,
+        db_password=args.db_password, node_name=args.node,
+        keep_going=not args.stop_on_failure,
+    )
+    if getattr(args, "json", False):
+        printable = dict(result)
+        printable.pop("plan", None)
+        print(json.dumps(printable, indent=2, default=str))
+
+    print(f"\nLogs: {result.get('log_dir')}")
+    return EXIT_OK if result["outcome"] == "succeeded" else EXIT_FAIL
+
+
 def cmd_remove(args):
     cluster = args.cluster or state.latest_cluster()
     if not cluster:
@@ -654,6 +688,24 @@ def build_parser():
     standby.add_argument("--sync-strict", action="store_true",
                          help="block writes when no standby is available")
     standby.set_defaults(func=cmd_add_standby)
+
+    # --- health-check -------------------------------------------------
+    checking = subparsers.add_parser(
+        "health-check",
+        help="run each component's own regression suite against the cluster",
+    )
+    add_common(checking)
+    checking.add_argument(
+        "--components", "--health_check", "--health-check", default="all",
+        help="comma-separated: "
+             + ", ".join(regression.known_components())
+             + ", or all [all]")
+    checking.add_argument("--node", help="Spock node to run against "
+                                         "[the first one]")
+    checking.add_argument("--stop-on-failure", action="store_true",
+                          help="do not run the remaining suites after one fails")
+    checking.add_argument("--json", action="store_true")
+    checking.set_defaults(func=cmd_health_check)
 
     # --- remove -------------------------------------------------------
     remove = subparsers.add_parser("remove", help="tear a cluster down")

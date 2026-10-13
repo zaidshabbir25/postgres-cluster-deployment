@@ -809,6 +809,70 @@ the name default to the next free `nN`.
 
 ---
 
+## Component regression suites
+
+Once a cluster is up, each component's own upstream test suite can be run
+against it:
+
+```bash
+./pg_deploy_cluster.sh --health_check spock,lolor,snowflake,ace
+./pg_deploy_cluster.sh --health_check all --stop-on-failure
+./pg_cluster_ctl.sh ... # or: python3 -m deployment.cli health-check --components spock
+```
+
+Each component is fetched into its own directory under
+`/opt/pgedge/regression/<component>`, at the branch or tag **this cluster was
+built from** — a cluster on spock v5.0.5 is tested by v5.0.5's tests, because a
+newer suite tests behaviour the installed extension does not have. Each is
+reported separately, and one failing suite neither stops the next nor disturbs
+its artefacts.
+
+```
+COMPONENT  REF        RESULT   DETAIL
+---------  ---------  -------  ---------------------------------
+spock      v5.0.5     PASSED   23/23 passed
+lolor      v1.2.3     FAILED   1/1 passed, 1 failed
+snowflake  main       SKIPPED  needs the snowflake extension in postgres on n1
+ace        main       SKIPPED  needs a running Docker daemon (docker info failed)
+```
+
+### What each suite actually tests
+
+This differs per component and changes how a result should be read.
+
+| component | suite | runs against |
+|---|---|---|
+| spock | `tests/regress` via `make USE_PGXS=1 installcheck` | **the deployed cluster** |
+| lolor | `sql/` + `expected/` via the same | **the deployed cluster** |
+| snowflake | `test/runner.py`, driven by `EDGE_*` | **the deployed cluster**, through a shim |
+| ace | `tests/integration/*.go` via `go test` | **its own containers** |
+
+`make check` would build a temporary instance and tell you nothing about your
+cluster; `installcheck` points pg_regress at a live server, which is what these
+do.
+
+snowflake's harness takes everything from the environment except the path to
+`psql`, which it builds itself as
+`$EDGE_CLUSTER_DIR/n1/pgedge/$EDGE_COMPONENT/bin/psql`. Rather than patch a
+copy of the harness, a small tree of symlinks in its workspace makes that path
+resolve to this cluster's binaries. It also assumes the second node is on the
+first node's port + 1; where that is not true, the run says so rather than
+quietly testing one node twice.
+
+**ACE is the exception worth knowing about.** Its integration tests bring up
+their own three-node PostgreSQL cluster with testcontainers and
+`docker-compose.yaml`. They validate the ACE binary and its fixtures on this
+host; they never read the deployed cluster. The report labels this rather than
+letting a green row imply otherwise. To check *your* cluster's consistency with
+ACE, run `ace table-diff` against it — a different operation.
+
+A suite that cannot run here is **skipped with the reason**, not failed: no
+`-devel` package means no `pg_regress`, an extension that was never created has
+nothing to test, and Docker installed but not running fails deep inside
+testcontainers with an error that never mentions the daemon.
+
+---
+
 ## Tests
 
 [![Regression](https://github.com/zaidshabbir25/postgres-cluster-deployment/actions/workflows/regression.yml/badge.svg)](https://github.com/zaidshabbir25/postgres-cluster-deployment/actions/workflows/regression.yml)
