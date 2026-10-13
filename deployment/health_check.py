@@ -57,7 +57,7 @@ def ref_for(plan, component):
 
 
 def run(cluster_name, components, db_password=None, node_name=None,
-        run_logger=None, keep_going=True):
+        run_logger=None, keep_going=True, install_requirements=False):
     """Run the selected suites. Returns a result dict."""
     plan, metadata = state.load(cluster_name, db_password=db_password)
     plan.db_password = state.resolve_password(plan, explicit=db_password)
@@ -97,7 +97,8 @@ def run(cluster_name, components, db_password=None, node_name=None,
                 + ("" if suite.targets_cluster
                    else " — starts its own cluster, does not read this one"),
             )
-            result = suite.run(executor, plan, node, ref, run_logger=log)
+            result = suite.run(executor, plan, node, ref, run_logger=log,
+                               install_requirements=install_requirements)
             results.append(result)
 
             status = {"passed": "passed", "failed": "failed",
@@ -111,7 +112,12 @@ def run(cluster_name, components, db_password=None, node_name=None,
 
         duration = round(time.time() - started, 1)
         failed = [r for r in results if r.status == "failed"]
-        outcome = "failed" if failed else "succeeded"
+        ran = [r for r in results if r.status != "skipped"]
+        # Nothing failing is not the same as something passing. A run where
+        # every suite skipped tested nothing, and a banner saying "succeeded"
+        # would be read as evidence it did.
+        outcome = ("failed" if failed else
+                   "succeeded" if ran else "nothing ran")
 
         log.banner(f"Regression suites {outcome} in {duration}s")
         for line in summary_lines(results, log_dir=str(log.root)):
@@ -163,6 +169,10 @@ def summary_lines(results, log_dir=""):
 
     out = ["", line(headers), "  ".join("-" * w for w in widths)]
     out += [line(row) for row in rows]
+
+    if all(r.status == "skipped" for r in results):
+        out.append("")
+        out.append("  Every suite was skipped: nothing was tested.")
 
     detached = [r.component for r in results if not r.targets_cluster
                 and r.status != "skipped"]

@@ -141,6 +141,9 @@ Cleanup
   --node NAME               with --health_check, the Spock node to run against
   --stop-on-failure         with --health_check, skip the remaining suites once
                             one fails
+  --install-requirements    with --health_check, install what a suite needs and
+                            the host lacks, where it is a package this tool can
+                            name (the -devel/-dev files pg_regress comes with)
 
   --cleanup                 scrub every host in the inventory and exit: Patroni
                             units, etcd state, data directories, cluster config
@@ -324,6 +327,7 @@ cluster_facts() {
   python3 - "${1:-}" <<'PYEOF'
 import sys
 from aspects import state
+from aspects.source_build import default_spock_branch
 try:
     name = sys.argv[1] or state.latest_cluster()
     if not name:
@@ -338,7 +342,11 @@ print("|".join([
     ",".join(n.name for n in plan.nodes),
     plan.deploy_mode,
     str(plan.spock_major),
-    (plan.source_build or {}).get("spock_branch", "main"),
+    # A packaged cluster has no recorded branch, but it still has the one its
+    # Spock major defaults to -- which is the ref the regression suites use.
+    # Reporting a literal "main" here contradicted them.
+    ((plan.source_build or {}).get("spock_branch")
+     or default_spock_branch(str(plan.spock_major))),
 ]))
 PYEOF
 }
@@ -522,8 +530,8 @@ while [[ $# -gt 0 ]]; do
     --health_check|--health-check)
       [[ $# -ge 2 ]] || die "--health_check needs a component list (e.g. spock,lolor,snowflake,ace, or all)"
       HEALTH_CHECK="$2"; INTERACTIVE=false; shift 2 ;;
-    --node|--stop-on-failure)
-      if [[ "$1" == "--stop-on-failure" ]]; then
+    --node|--stop-on-failure|--install-requirements)
+      if [[ "$1" != "--node" ]]; then
         HEALTH_ARGS+=("$1"); shift
       else
         [[ $# -ge 2 ]] || die "--node needs a node name"

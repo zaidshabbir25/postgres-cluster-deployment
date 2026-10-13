@@ -465,6 +465,7 @@ def cmd_health_check(args):
         cluster_name=cluster, components=components,
         db_password=args.db_password, node_name=args.node,
         keep_going=not args.stop_on_failure,
+        install_requirements=args.install_requirements,
     )
     if getattr(args, "json", False):
         printable = dict(result)
@@ -702,6 +703,11 @@ def build_parser():
              + ", or all [all]")
     checking.add_argument("--node", help="Spock node to run against "
                                          "[the first one]")
+    checking.add_argument(
+        "--install-requirements", action="store_true",
+        help="install what a suite needs but the host lacks, where that is a "
+             "package this tool can name (the -devel/-dev files pg_regress "
+             "comes with). Go and Docker are left alone")
     checking.add_argument("--stop-on-failure", action="store_true",
                           help="do not run the remaining suites after one fails")
     checking.add_argument("--json", action="store_true")

@@ -866,10 +866,31 @@ host; they never read the deployed cluster. The report labels this rather than
 letting a green row imply otherwise. To check *your* cluster's consistency with
 ACE, run `ace table-diff` against it — a different operation.
 
-A suite that cannot run here is **skipped with the reason**, not failed: no
-`-devel` package means no `pg_regress`, an extension that was never created has
+A suite that cannot run here is **skipped with the reason**, not failed, and
+the reason names the fix where there is one:
+
+```
+spock  v5_STABLE  SKIPPED  needs pg_config --pgxs, from pgedge-postgresql17-devel
+                           — --install-requirements installs it
+```
+
+`pg_regress` ships with the server's development files, so a packaged host can
+have `psql` and the server and still not have it. `--install-requirements`
+installs that package and re-probes:
+
+```bash
+./pg_deploy_cluster.sh --health_check spock --install-requirements
+```
+
+It stops at packages this tool can name. Go and a Docker daemon — what ACE
+needs — are a larger decision than a `-devel` package and are left to you.
+
+The other skips have no automatic fix: an extension that was never created has
 nothing to test, and Docker installed but not running fails deep inside
 testcontainers with an error that never mentions the daemon.
+
+A run where every suite skipped reports `nothing ran` rather than `succeeded`.
+Nothing failing is not the same as something passing.
 
 ---
 

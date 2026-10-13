@@ -94,6 +94,11 @@ class Suite:
                 missing.append(f"{binary} ({why})")
         return missing
 
+    def install_requirements(self, executor, plan, node, run_logger=None):
+        """Try to satisfy what is missing. False when nothing can be done
+        automatically — Go and Docker are the operator's call, not ours."""
+        return False
+
     # --- 2. put the suite on the host --------------------------------
     def prepare(self, executor, plan, node, ref, run_logger=None):
         """Clone the component's repository at `ref`. Returns the source dir."""
@@ -123,16 +128,24 @@ class Suite:
         return []
 
     # --- the whole thing ----------------------------------------------
-    def run(self, executor, plan, node, ref, run_logger=None):
+    def run(self, executor, plan, node, ref, run_logger=None,
+            install_requirements=False):
         result = SuiteResult(component=self.name, ref=str(ref),
                              workspace=self.workspace(),
                              targets_cluster=self.targets_cluster)
         started = time.time()
 
         missing = self.missing_requirements(executor, plan, node)
+        if missing and install_requirements:
+            if self.install_requirements(executor, plan, node,
+                                         run_logger=run_logger):
+                missing = self.missing_requirements(executor, plan, node)
         if missing:
             result.status = SKIPPED
             result.detail = "needs " + ", ".join(missing)
+            if not install_requirements and self.install_requirements.__func__ \
+                    is not Suite.install_requirements:
+                result.detail += " — --install-requirements installs it"
             return result
 
         try:
@@ -172,6 +185,24 @@ def extension_present(executor, plan, node, name):
         dbname=plan.db_name, node=node.name, default="",
     )
     return bool((found or "").strip())
+
+
+def _family_of(plan, node):
+    try:
+        return plan.host(node.host).family or "rhel"
+    except KeyError:
+        return "rhel"
+
+
+def devel_packages_for(plan, node):
+    """The package carrying pg_config's makefile for this host and major."""
+    from aspects import platform_detect
+
+    major = getattr(node, "pg_version", "") or plan.pg_major
+    from aspects import pg_server_management
+
+    major = pg_server_management.major_of(str(major)) or plan.pg_major
+    return list(platform_detect.devel_packages(_family_of(plan, node), major))
 
 
 def pgxs_available(executor, node):
@@ -239,8 +270,31 @@ class PgRegressSuite(Suite):
     def missing_requirements(self, executor, plan, node):
         missing = super().missing_requirements(executor, plan, node)
         if not pgxs_available(executor, node):
-            missing.append("pg_config --pgxs (the -devel/-dev package)")
+            # Name the package rather than the symptom: "the -devel package"
+            # leaves the reader to work out which one, and the answer differs
+            # per family and per major.
+            packages = devel_packages_for(plan, node)
+            missing.append(
+                f"pg_config --pgxs, from {' or '.join(packages)}"
+                if packages else "pg_config --pgxs (the -devel/-dev package)"
+            )
         return missing
+
+    def install_requirements(self, executor, plan, node, run_logger=None):
+        """Install the development files pg_regress needs. Returns True if
+        anything was attempted."""
+        from aspects import package_management
+
+        packages = devel_packages_for(plan, node)
+        if not packages:
+            return False
+        family = _family_of(plan, node)
+        if run_logger:
+            run_logger.info(f"    {self.name}: installing "
+                            f"{', '.join(packages)}")
+        package_management.install(executor, family, packages, node=node.name,
+                                   allow_missing=True)
+        return True
     #: pg_regress creates this database and drops it again.
     regress_db = "regression"
 

@@ -351,3 +351,101 @@ def test_a_skipped_suite_is_not_claimed_to_have_tested_anything():
     )))
 
     assert "not against this cluster" not in text
+
+
+# ---------------------------------------------------------------------------
+# making a skip actionable
+# ---------------------------------------------------------------------------
+
+
+def test_a_missing_pgxs_names_the_package_to_install():
+    """"the -devel package" leaves the reader to work out which one, and the
+    answer differs per family and per major."""
+    plan = plan_with()
+    executor = FakeExecutor(replies={"pg_config --pgxs": (False, "")})
+
+    result = regression.suite_for("spock").run(executor, plan, plan.node("n1"),
+                                               "v5_STABLE")
+
+    assert "pgedge-postgresql17-devel" in result.detail
+    assert "--install-requirements" in result.detail
+
+
+def test_the_debian_package_is_named_on_a_debian_host():
+    plan = plan_with()
+    plan.hosts[0].family = "deb"
+    executor = FakeExecutor(replies={"pg_config --pgxs": (False, "")})
+
+    result = regression.suite_for("spock").run(executor, plan, plan.node("n1"),
+                                               "v5_STABLE")
+
+    assert "pgedge-postgresql-17-dev" in result.detail
+
+
+def test_install_requirements_installs_it_and_runs_the_suite():
+    plan = plan_with()
+    calls = {"probes": 0}
+
+    class Executor(FakeExecutor):
+        def try_run(self, command, **kwargs):
+            if "pg_config --pgxs" in command:
+                calls["probes"] += 1
+                # Absent until the package is installed.
+                if not any("devel" in c for c in self.commands):
+                    self.commands.append(command)
+                    return False, ""
+                self.commands.append(command)
+                return True, PGXS
+            return super().try_run(command, **kwargs)
+
+    executor = Executor(replies={
+        f"test -f {PGXS}": (True, ""),
+        "make installcheck": (True, "All 23 tests passed."),
+    })
+
+    result = regression.suite_for("spock").run(
+        executor, plan, plan.node("n1"), "v5_STABLE",
+        install_requirements=True, run_logger=RecordingLogger(),
+    )
+
+    assert any("pgedge-postgresql17-devel" in c for c in executor.commands)
+    assert result.status == regression.PASSED
+    assert calls["probes"] == 2, "probe, install, probe again"
+
+
+def test_go_and_docker_are_not_installed_behind_the_operators_back():
+    """A toolchain and a container runtime are a bigger decision than a
+    -devel package, and not one a health check should take."""
+    plan = plan_with()
+    executor = ready(**{"command -v go": (False, "")})
+
+    result = regression.suite_for("ace").run(executor, plan, plan.node("n1"),
+                                             "main", install_requirements=True)
+
+    assert result.status == regression.SKIPPED
+    assert not any("install" in c and "go" in c for c in executor.commands)
+    assert "--install-requirements" not in result.detail
+
+
+# ---------------------------------------------------------------------------
+# a run where nothing ran
+# ---------------------------------------------------------------------------
+
+
+def test_a_run_where_every_suite_skipped_does_not_claim_success():
+    """Nothing failing is not the same as something passing."""
+    text = "\n".join(health_check.summary_lines(results(
+        ("spock", regression.SKIPPED, {}, True),
+        ("ace", regression.SKIPPED, {}, False),
+    )))
+
+    assert "nothing was tested" in text
+
+
+def test_a_run_with_one_pass_does_not_say_nothing_was_tested():
+    text = "\n".join(health_check.summary_lines(results(
+        ("spock", regression.PASSED, {"total": 1, "passed": 1, "failed": 0}, True),
+        ("ace", regression.SKIPPED, {}, False),
+    )))
+
+    assert "nothing was tested" not in text
