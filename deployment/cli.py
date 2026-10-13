@@ -466,6 +466,7 @@ def cmd_health_check(args):
         db_password=args.db_password, node_name=args.node,
         keep_going=not args.stop_on_failure,
         install_requirements=args.install_requirements,
+        tests=_split_list(args.tests),
     )
     if getattr(args, "json", False):
         printable = dict(result)
@@ -708,6 +709,11 @@ def build_parser():
         help="install what a suite needs but the host lacks, where that is a "
              "package this tool can name (the -devel/-dev files pg_regress "
              "comes with). Go and Docker are left alone")
+    checking.add_argument(
+        "--tests", action="append",
+        help="run only these cases of a suite that has named ones "
+             "(spock: basic, copy, sequence, ...); repeatable or "
+             "comma-separated. Ignored by suites that run as one unit")
     checking.add_argument("--stop-on-failure", action="store_true",
                           help="do not run the remaining suites after one fails")
     checking.add_argument("--json", action="store_true")

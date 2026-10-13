@@ -842,14 +842,63 @@ This differs per component and changes how a result should be read.
 
 | component | suite | runs against |
 |---|---|---|
-| spock | `tests/regress` via `make USE_PGXS=1 installcheck` | **the deployed cluster** |
+| spock | `tests/regress/sql` driven with psql | **the deployed cluster**, in scratch databases |
 | lolor | `sql/` + `expected/` via the same | **the deployed cluster** |
 | snowflake | `test/runner.py`, driven by `EDGE_*` | **the deployed cluster**, through a shim |
 | ace | `tests/integration/*.go` via `go test` | **its own containers** |
 
-`make check` would build a temporary instance and tell you nothing about your
-cluster; `installcheck` points pg_regress at a live server, which is what these
-do.
+### spock: the SQL files, in databases of their own
+
+Upstream drives `tests/regress/sql` through `make installcheck`, which needs
+the server's development files. Running the same files directly with psql needs
+nothing a cluster does not already have, and gives the same comparison against
+`tests/regress/expected`.
+
+**These tests own the databases they run in.** `infofuncs.sql` ends with `DROP
+EXTENSION spock`, `init.sql` creates roles and replicates DDL, and everything
+from `init.sql` onwards builds its own Spock nodes and subscriptions. Pointed
+at the cluster's own database they would dismantle the cluster. So scratch
+databases are created on the real nodes — same servers, ports, binaries and
+Spock — and the tests own those. The cluster's database is never opened, and
+the scratch ones are dropped and recreated each run, because these tests leave
+state behind by design.
+
+Aligning the SQL needs no edits to any file, only four settings. Every test
+begins
+
+```sql
+SELECT * FROM spock_regress_variables()
+\gset
+\c :provider_dsn
+```
+
+and `preseed.sql` defines that function as a read of `spock.provider_dsn`,
+`spock.subscriber_dsn`, `spock.provider1_dsn` and `spock.orig_provider_dsn`.
+Upstream fills them with `dbname=regression` and `dbname=postgres` — two
+databases in one temporary instance. Here they become conninfo strings for the
+scratch databases on *different nodes*, which maps the same tests onto a real
+multi-node cluster. They are set with `ALTER DATABASE` rather than `SET`,
+because every `\c` would lose a session setting.
+
+The order comes from Spock's own Makefile and matters: `preseed` seeds data
+that `preseed_check` verifies after `init` has cloned it. `add_table` is left
+out because upstream disables it, and `conflict_stat` below PostgreSQL 18
+because it reads what 18 added. A case absent from the ref being tested is
+reported as absent rather than counted as a failure.
+
+`--tests` narrows it further:
+
+```bash
+./pg_deploy_cluster.sh --health_check spock          # the Makefile order
+python3 -m deployment.cli health-check --components spock --tests basic,copy
+```
+
+One caveat: upstream's `regress-postgresql.conf` turns on settings a deployed
+cluster may not have, `track_commit_timestamp` among them. Those need a
+restart, so the run warns about what will look wrong rather than silently
+producing diffs.
+
+lolor still uses `make installcheck`, which does need the `-devel` package.
 
 snowflake's harness takes everything from the environment except the path to
 `psql`, which it builds itself as

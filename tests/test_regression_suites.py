@@ -113,21 +113,166 @@ def test_a_packaged_extension_falls_back_to_the_default_branch():
 # ---------------------------------------------------------------------------
 
 
-def test_spock_runs_installcheck_against_the_running_node():
-    """`make check` builds a temporary instance, which says nothing about this
-    cluster. `installcheck` points pg_regress at a live server."""
-    plan = plan_with()
-    executor = ready(**{"make installcheck": (True, "All 23 tests passed.")})
+def spock_ready(**extra):
+    """An executor where every scratch database and every test file exists."""
+    replies = {"test -x /usr/pgsql-17/bin/psql": (True, ""),
+               "diff -u": (True, "")}
+    replies.update(extra)
+    return FakeExecutor(replies=replies)
 
-    result = regression.suite_for("spock").run(
-        executor, plan, plan.node("n1"), "v5_STABLE", run_logger=RecordingLogger()
-    )
+
+def test_spock_runs_the_sql_files_rather_than_make():
+    """Driving the files with psql needs nothing a cluster does not already
+    have; `make installcheck` needs the server's development files."""
+    plan = plan_with()
+    executor = spock_ready()
+
+    result = regression.suite_for("spock", tests=["basic"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE",
+        run_logger=RecordingLogger())
 
     assert result.status == regression.PASSED
-    command = next(c for c in executor.commands if "make installcheck" in c)
-    assert "USE_PGXS=1" in command
-    assert "PGPORT=5432" in command and "PGHOST=10.0.1.10" in command
-    assert "make check" not in command
+    assert not any("make" in c for c in executor.commands)
+    command = next(c for c in executor.commands
+                   if "/sql/basic.sql" in c and "psql" in c)
+    # pg_regress invokes psql exactly like this, which is why the expected
+    # files contain the statements as well as their output.
+    assert "-X -a -q" in command
+
+
+def test_spock_never_opens_the_clusters_own_database():
+    """infofuncs.sql ends with DROP EXTENSION spock, and init.sql builds its
+    own nodes. Pointed at the cluster's database they would dismantle it."""
+    plan = plan_with()
+    executor = spock_ready()
+
+    regression.suite_for("spock", tests=["infofuncs"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
+
+    running = [c for c in executor.commands if "/sql/infofuncs.sql" in c]
+    assert running, "the test should have run"
+    assert all(f"-d {plan.db_name}" not in c for c in running)
+    assert any("spockregress_provider" in c for c in running)
+
+
+def test_the_scratch_databases_are_recreated_every_run():
+    """These tests leave roles, tables and Spock nodes behind by design; a
+    second run against the first run's leftovers fails for reasons that say
+    nothing about the cluster."""
+    plan = plan_with()
+    executor = spock_ready()
+
+    regression.suite_for("spock", tests=["basic"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
+
+    for dbname in ("spockregress_provider", "spockregress_subscriber"):
+        assert any(f'DROP DATABASE IF EXISTS "{dbname}"' in c
+                   for c in executor.commands)
+        assert any(f'CREATE DATABASE "{dbname}"' in c
+                   for c in executor.commands)
+
+
+def test_the_dsn_gucs_are_set_on_the_database_not_the_session():
+    """Every test reconnects with \\c, which would lose a session setting."""
+    plan = plan_with()
+    executor = spock_ready()
+
+    regression.suite_for("spock", tests=["basic"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
+
+    altered = [c for c in executor.commands if "ALTER DATABASE" in c
+               and "spock.provider_dsn" in c]
+    assert altered
+    assert any("port=5432" in c and "spockregress_provider" in c
+               for c in altered)
+    assert any("spock.subscriber_dsn" in c and "port=5433" in c
+               for c in executor.commands)
+
+
+def test_provider_and_subscriber_land_on_different_nodes():
+    """Upstream runs them as two databases in one instance; a real cluster can
+    do better, and that is a stronger test."""
+    suite = regression.suite_for("spock")
+    placement = suite.placement(plan_with())
+
+    assert placement["provider_dsn"].name == "n1"
+    assert placement["subscriber_dsn"].name == "n2"
+
+
+def test_a_single_node_cluster_puts_them_all_on_that_node():
+    """Which is exactly what upstream does anyway."""
+    suite = regression.suite_for("spock")
+    placement = suite.placement(plan_with(names=("n1",), ports=(5432,)))
+
+    assert {node.name for node in placement.values()} == {"n1"}
+
+
+def test_the_makefile_order_is_followed_because_the_tests_depend_on_it():
+    """preseed seeds data that preseed_check verifies after init cloned it."""
+    chosen = regression.suite_for("spock").tests_for(plan_with(), node("n1"))
+
+    assert chosen[:5] == ["preseed", "infofuncs", "init_fail", "init",
+                          "preseed_check"]
+    assert "add_table" not in chosen, "upstream disables it in its own Makefile"
+
+
+def test_a_pg18_only_test_is_left_out_below_18():
+    suite = regression.suite_for("spock")
+    plan = plan_with()
+
+    on17 = suite.tests_for(plan, node("n1"))
+    n18 = node("n1")
+    n18.pg_version = "18.6"
+    on18 = suite.tests_for(plan, n18)
+
+    assert "conflict_stat" not in on17
+    assert "conflict_stat" in on18
+
+
+def test_a_test_absent_from_this_ref_is_reported_not_counted():
+    """An older tag has fewer files than the list from main's Makefile."""
+    plan = plan_with()
+    executor = spock_ready(**{"test -f": (False, "")})
+
+    result = regression.suite_for("spock", tests=["basic"]).run(
+        executor, plan, plan.node("n1"), "v5.0.5")
+
+    assert "absent from this ref" in result.output
+    assert result.tests == {}
+
+
+def test_a_differing_output_is_a_failure_and_the_diff_is_kept():
+    plan = plan_with()
+    executor = spock_ready(**{"diff -u": (False, "")})
+
+    result = regression.suite_for("spock", tests=["basic"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
+
+    assert result.status == regression.FAILED
+    assert result.tests == {"total": 1, "passed": 0, "failed": 1}
+    assert any("results" in path for path in result.artefacts)
+
+
+def test_spock_counts_its_own_run():
+    suite = regression.suite_for("spock")
+    output = ("test basic   ... ok\n"
+              "test copy    ... FAILED\n"
+              "1 of 2 tests failed.")
+
+    assert suite.parse(output) == {"total": 2, "passed": 1, "failed": 1}
+
+
+def test_a_cluster_whose_commit_timestamps_are_off_is_warned_about():
+    """Upstream's regression config turns it on; it needs a restart, so the
+    run says what will look wrong instead of producing silent diffs."""
+    plan = plan_with()
+    executor = spock_ready(**{"SHOW track_commit_timestamp": (True, "off\n")})
+    log = RecordingLogger()
+
+    regression.suite_for("spock", tests=["basic"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE", run_logger=log)
+
+    assert log.said("track_commit_timestamp")
 
 
 def test_the_suite_is_cloned_at_the_ref_into_its_own_workspace():
@@ -155,11 +300,11 @@ def test_a_failing_regression_keeps_the_diffs():
     plan = plan_with()
     executor = ready(**{
         "make installcheck": (False, "1 of 23 tests failed."),
-        "test -e /opt/pgedge/regression/spock/src/regression.diffs": (True, ""),
+        "test -e /opt/pgedge/regression/lolor/src/regression.diffs": (True, ""),
     })
 
-    result = regression.suite_for("spock").run(executor, plan, plan.node("n1"),
-                                               "v5_STABLE")
+    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
+                                               "main")
 
     assert result.status == regression.FAILED
     assert result.tests == {"total": 23, "passed": 22, "failed": 1}
@@ -172,8 +317,8 @@ def test_the_suites_own_tally_outranks_its_exit_status():
     plan = plan_with()
     executor = ready(**{"make installcheck": (False, "All 23 tests passed.")})
 
-    result = regression.suite_for("spock").run(executor, plan, plan.node("n1"),
-                                               "v5_STABLE")
+    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
+                                               "main")
 
     assert result.status == regression.PASSED
 
@@ -182,10 +327,13 @@ def test_a_host_without_the_devel_package_is_skipped_not_failed():
     """pg_regress ships with the development files, so a packaged host can
     have psql and the server and still not have it."""
     plan = plan_with()
-    executor = FakeExecutor(replies={"pg_config --pgxs": (False, "")})
+    executor = FakeExecutor(replies={
+        "pg_config --pgxs": (False, ""),
+        "FROM pg_extension WHERE extname": (True, "1\n"),
+    })
 
-    result = regression.suite_for("spock").run(executor, plan, plan.node("n1"),
-                                               "v5_STABLE")
+    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
+                                               "main")
 
     assert result.status == regression.SKIPPED
     assert "pgxs" in result.detail
@@ -362,10 +510,13 @@ def test_a_missing_pgxs_names_the_package_to_install():
     """"the -devel package" leaves the reader to work out which one, and the
     answer differs per family and per major."""
     plan = plan_with()
-    executor = FakeExecutor(replies={"pg_config --pgxs": (False, "")})
+    executor = FakeExecutor(replies={
+        "pg_config --pgxs": (False, ""),
+        "FROM pg_extension WHERE extname": (True, "1\n"),
+    })
 
-    result = regression.suite_for("spock").run(executor, plan, plan.node("n1"),
-                                               "v5_STABLE")
+    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
+                                               "main")
 
     assert "pgedge-postgresql17-devel" in result.detail
     assert "--install-requirements" in result.detail
@@ -374,10 +525,13 @@ def test_a_missing_pgxs_names_the_package_to_install():
 def test_the_debian_package_is_named_on_a_debian_host():
     plan = plan_with()
     plan.hosts[0].family = "deb"
-    executor = FakeExecutor(replies={"pg_config --pgxs": (False, "")})
+    executor = FakeExecutor(replies={
+        "pg_config --pgxs": (False, ""),
+        "FROM pg_extension WHERE extname": (True, "1\n"),
+    })
 
-    result = regression.suite_for("spock").run(executor, plan, plan.node("n1"),
-                                               "v5_STABLE")
+    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
+                                               "main")
 
     assert "pgedge-postgresql-17-dev" in result.detail
 
@@ -400,11 +554,12 @@ def test_install_requirements_installs_it_and_runs_the_suite():
 
     executor = Executor(replies={
         f"test -f {PGXS}": (True, ""),
+        "FROM pg_extension WHERE extname": (True, "1\n"),
         "make installcheck": (True, "All 23 tests passed."),
     })
 
-    result = regression.suite_for("spock").run(
-        executor, plan, plan.node("n1"), "v5_STABLE",
+    result = regression.suite_for("lolor").run(
+        executor, plan, plan.node("n1"), "main",
         install_requirements=True, run_logger=RecordingLogger(),
     )
 

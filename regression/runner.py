@@ -73,6 +73,11 @@ class Suite:
     #: Commands that must exist on the host, as {binary: why}.
     requires = {}
 
+    def __init__(self, tests=None):
+        #: A subset of the suite's own cases, for a suite that has named ones.
+        #: Suites that run as a single unit ignore it.
+        self.selected = list(tests) if tests else None
+
     def workspace(self):
         return f"{REGRESSION_ROOT}/{self.name}"
 
@@ -391,14 +396,14 @@ def known_components():
     return sorted(SUITES.keys())
 
 
-def suite_for(name):
+def suite_for(name, tests=None):
     key = ALIASES.get(str(name).strip().lower(), str(name).strip().lower())
     if key not in SUITES:
         raise ValueError(
             f"unknown component {name!r}. Available: "
             f"{', '.join(known_components())} (or 'all')"
         )
-    return SUITES[key]()
+    return SUITES[key](tests=tests)
 
 
 def parse_components(value):

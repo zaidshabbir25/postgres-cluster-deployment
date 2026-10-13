@@ -57,7 +57,8 @@ def ref_for(plan, component):
 
 
 def run(cluster_name, components, db_password=None, node_name=None,
-        run_logger=None, keep_going=True, install_requirements=False):
+        run_logger=None, keep_going=True, install_requirements=False,
+        tests=None):
     """Run the selected suites. Returns a result dict."""
     plan, metadata = state.load(cluster_name, db_password=db_password)
     plan.db_password = state.resolve_password(plan, explicit=db_password)
@@ -89,7 +90,7 @@ def run(cluster_name, components, db_password=None, node_name=None,
         executor = _executor_for(plan, node.host, executors, log)
 
         for component in components:
-            suite = regression_runner.suite_for(component)
+            suite = regression_runner.suite_for(component, tests=tests)
             ref = ref_for(plan, component)
             log.step_start(
                 f"{component} regression",
