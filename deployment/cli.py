@@ -467,6 +467,7 @@ def cmd_health_check(args):
         keep_going=not args.stop_on_failure,
         install_requirements=args.install_requirements,
         tests=_split_list(args.tests),
+        test_timeout=args.test_timeout,
     )
     if getattr(args, "json", False):
         printable = dict(result)
@@ -714,6 +715,11 @@ def build_parser():
         help="run only these cases of a suite that has named ones "
              "(spock: basic, copy, sequence, ...); repeatable or "
              "comma-separated. Ignored by suites that run as one unit")
+    checking.add_argument(
+        "--test-timeout", type=int, default=0,
+        help="seconds one case of a suite may take before it is called timed "
+             "out [300 for spock]. Some cases set up replication and wait for "
+             "it, so a slow host may need more")
     checking.add_argument("--stop-on-failure", action="store_true",
                           help="do not run the remaining suites after one fails")
     checking.add_argument("--json", action="store_true")

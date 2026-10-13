@@ -185,6 +185,11 @@ class SpockSuite(Suite):
                 )
 
     # --- running ------------------------------------------------------
+    #: Per test, not for the whole suite. Some of these set up replication and
+    #: wait for it; a case that never finishes is a result worth having, and
+    #: 30 minutes of silence is not.
+    test_timeout = 300
+
     def execute(self, executor, plan, node, run_logger=None):
         source = self.source_dir()
         results = f"{self.output_dir()}/results"
@@ -192,10 +197,17 @@ class SpockSuite(Suite):
 
         entry = self.placement(plan)["provider_dsn"]
         psql = f"{entry.bin_dir}/psql"
+        chosen = self.tests_for(plan, node)
         lines = []
         passed = failed = missing = 0
 
-        for test in self.tests_for(plan, node):
+        if run_logger:
+            run_logger.info(
+                f"    spock: {len(chosen)} case(s) against "
+                f"{SCRATCH['provider_dsn']}, {self.test_timeout}s each"
+            )
+
+        for index, test in enumerate(chosen, start=1):
             sql = f"{source}/tests/regress/sql/{test}.sql"
             expected = f"{source}/tests/regress/expected/{test}.out"
             actual = f"{results}/{test}.out"
@@ -203,32 +215,23 @@ class SpockSuite(Suite):
             exists, _ = executor.try_run(f"test -f {shlex.quote(sql)}",
                                          node=node.name)
             if not exists:
-                lines.append(f"test {test:<28} ... absent from this ref")
+                verdict = "absent from this ref"
                 missing += 1
-                continue
-
-            # pg_regress runs psql exactly like this, which is why the expected
-            # files contain the statements as well as their output.
-            executor.try_run(
-                f"cd {shlex.quote(source)}/tests/regress && "
-                f"{shlex.quote(psql)} -X -a -q "
-                f"-h {shlex.quote(entry.address)} -p {entry.pg_port} "
-                f"-U {shlex.quote(plan.db_user)} "
-                f"-d {shlex.quote(SCRATCH['provider_dsn'])} "
-                f"-f {shlex.quote(sql)} > {shlex.quote(actual)} 2>&1",
-                node=node.name, timeout=1800,
-            )
-            same, _ = executor.try_run(
-                f"diff -u {shlex.quote(expected)} {shlex.quote(actual)} "
-                f"> {shlex.quote(results)}/{test}.diff 2>&1",
-                node=node.name,
-            )
-            if same:
-                lines.append(f"test {test:<28} ... ok")
-                passed += 1
             else:
-                lines.append(f"test {test:<28} ... FAILED")
-                failed += 1
+                verdict = self._run_one(executor, node, entry, plan, psql, sql,
+                                        expected, actual, results, test)
+                if verdict == "ok":
+                    passed += 1
+                else:
+                    failed += 1
+
+            lines.append(f"test {test:<28} ... {verdict}")
+            # Said as it happens. Forty cases with nothing printed until the
+            # end is indistinguishable from a hang, which is how this looked
+            # the first time it ran for real.
+            if run_logger:
+                run_logger.info(f"      [{index}/{len(chosen)}] {test:<28} "
+                                f"{verdict}")
 
         total = passed + failed
         if failed:
@@ -237,16 +240,45 @@ class SpockSuite(Suite):
             lines.append(f"All {total} tests passed.")
         if missing:
             lines.append(f"({missing} not present at this ref)")
-
-        if run_logger:
-            run_logger.info(f"    spock: ran {total} test(s) from "
-                            f"tests/regress/sql against "
-                            f"{SCRATCH['provider_dsn']}")
         return failed == 0, "\n".join(lines)
+
+    def _run_one(self, executor, node, entry, plan, psql, sql, expected,
+                 actual, results, test):
+        """One case: run it, diff it, and survive it hanging.
+
+        A case that times out is this case's failure, not the suite's: the ones
+        already run have results worth keeping and the ones after it have not
+        been tried yet.
+        """
+        try:
+            # pg_regress invokes psql exactly like this, which is why the
+            # expected files hold the statements as well as their output.
+            executor.try_run(
+                f"cd {shlex.quote(self.source_dir())}/tests/regress && "
+                f"{shlex.quote(psql)} -X -a -q "
+                f"-h {shlex.quote(entry.address)} -p {entry.pg_port} "
+                f"-U {shlex.quote(plan.db_user)} "
+                f"-d {shlex.quote(SCRATCH['provider_dsn'])} "
+                f"-f {shlex.quote(sql)} > {shlex.quote(actual)} 2>&1",
+                node=node.name, timeout=self.test_timeout,
+            )
+        except Exception as exc:
+            name = type(exc).__name__
+            if "Timeout" in name or "timed out" in str(exc).lower():
+                return f"TIMED OUT after {self.test_timeout}s"
+            return f"FAILED ({name})"
+
+        same, _ = executor.try_run(
+            f"diff -u {shlex.quote(expected)} {shlex.quote(actual)} "
+            f"> {shlex.quote(results)}/{test}.diff 2>&1",
+            node=node.name,
+        )
+        return "ok" if same else "FAILED"
 
     def parse(self, output):
         passed = len(re.findall(r"\.\.\. ok$", output or "", re.MULTILINE))
-        failed = len(re.findall(r"\.\.\. FAILED$", output or "", re.MULTILINE))
+        failed = len(re.findall(r"\.\.\. (FAILED|TIMED OUT)", output or "",
+                                re.MULTILINE))
         if not (passed or failed):
             return {}
         return {"total": passed + failed, "passed": passed, "failed": failed}

@@ -604,3 +604,54 @@ def test_a_run_with_one_pass_does_not_say_nothing_was_tested():
     )))
 
     assert "nothing was tested" not in text
+
+
+# ---------------------------------------------------------------------------
+# a long run has to look like one
+# ---------------------------------------------------------------------------
+
+
+def test_each_case_is_reported_as_it_finishes():
+    """Forty cases with nothing printed until the end is indistinguishable
+    from a hang, which is how this looked the first time it ran for real."""
+    plan = plan_with()
+    executor = spock_ready()
+    log = RecordingLogger()
+
+    regression.suite_for("spock", tests=["basic", "copy"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE", run_logger=log)
+
+    assert log.said("[1/2] basic")
+    assert log.said("[2/2] copy")
+
+
+def test_a_case_that_hangs_is_that_cases_failure_not_the_suites():
+    """The cases already run have results worth keeping, and the ones after it
+    have not been tried."""
+    import subprocess
+
+    plan = plan_with()
+
+    class Executor(FakeExecutor):
+        def try_run(self, command, **kwargs):
+            if "/sql/init.sql" in command and "psql" in command:
+                raise subprocess.TimeoutExpired("psql", 300)
+            return super().try_run(command, **kwargs)
+
+    executor = Executor(replies={"test -x /usr/pgsql-17/bin/psql": (True, ""),
+                                 "diff -u": (True, "")})
+
+    result = regression.suite_for(
+        "spock", tests=["basic", "init", "copy"]
+    ).run(executor, plan, plan.node("n1"), "v5_STABLE")
+
+    assert "TIMED OUT after 300s" in result.output
+    assert result.tests == {"total": 3, "passed": 2, "failed": 1}
+    assert "copy" in result.output, "the run continued past the hang"
+
+
+def test_the_per_case_timeout_can_be_raised_for_a_slow_host():
+    suite = regression.suite_for("spock", test_timeout=900)
+
+    assert suite.test_timeout == 900
+    assert regression.suite_for("spock").test_timeout == 300

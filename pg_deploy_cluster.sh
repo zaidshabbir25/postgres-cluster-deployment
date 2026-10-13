@@ -144,6 +144,10 @@ Cleanup
   --install-requirements    with --health_check, install what a suite needs and
                             the host lacks, where it is a package this tool can
                             name (the -devel/-dev files pg_regress comes with)
+  --tests LIST              with --health_check, run only these cases of a suite
+                            that has named ones (spock: basic, copy, ...)
+  --test-timeout N          with --health_check, seconds one case may take
+                            before it is called timed out                  [300]
 
   --cleanup                 scrub every host in the inventory and exit: Patroni
                             units, etcd state, data directories, cluster config
@@ -530,8 +534,8 @@ while [[ $# -gt 0 ]]; do
     --health_check|--health-check)
       [[ $# -ge 2 ]] || die "--health_check needs a component list (e.g. spock,lolor,snowflake,ace, or all)"
       HEALTH_CHECK="$2"; INTERACTIVE=false; shift 2 ;;
-    --node|--stop-on-failure|--install-requirements)
-      if [[ "$1" != "--node" ]]; then
+    --node|--tests|--test-timeout|--stop-on-failure|--install-requirements)
+      if [[ "$1" == "--stop-on-failure" || "$1" == "--install-requirements" ]]; then
         HEALTH_ARGS+=("$1"); shift
       else
         [[ $# -ge 2 ]] || die "--node needs a node name"

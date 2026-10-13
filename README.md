@@ -886,11 +886,25 @@ out because upstream disables it, and `conflict_stat` below PostgreSQL 18
 because it reads what 18 added. A case absent from the ref being tested is
 reported as absent rather than counted as a failure.
 
-`--tests` narrows it further:
+Each case is reported as it finishes, because forty of them with nothing
+printed until the end is indistinguishable from a hang. Several set up
+replication and wait for it, so each has its own timeout — 300 seconds by
+default. A case that exceeds it is that case's failure: the ones already run
+keep their results and the rest are still attempted.
 
 ```bash
-./pg_deploy_cluster.sh --health_check spock          # the Makefile order
-python3 -m deployment.cli health-check --components spock --tests basic,copy
+./pg_deploy_cluster.sh --health_check spock                  # the Makefile order
+./pg_deploy_cluster.sh --health_check spock --tests preseed,infofuncs,basic
+./pg_deploy_cluster.sh --health_check spock --test-timeout 900   # a slow host
+```
+
+```
+spock: 40 case(s) against spockregress_provider, 300s each
+  [1/40] preseed                      ok
+  [2/40] infofuncs                    ok
+  [3/40] init_fail                    ok
+  [4/40] init                         TIMED OUT after 300s
+  [5/40] preseed_check                FAILED
 ```
 
 One caveat: upstream's `regress-postgresql.conf` turns on settings a deployed
