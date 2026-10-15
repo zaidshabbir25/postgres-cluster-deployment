@@ -34,7 +34,7 @@ from regression import runner as regression
 from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
 from deployment import (add_standby, cleanup, deploy_cluster, health_check,
-                        ops_cli, topology)
+                        ops_cli, server_logging, topology)
 from reports import report_generator
 
 EXIT_OK = 0
@@ -443,6 +443,29 @@ def cmd_add_standby(args):
     return EXIT_FAIL
 
 
+def cmd_logging(args):
+    """Turn on PostgreSQL's own logging across a running cluster."""
+    cluster = args.cluster or state.latest_cluster()
+    if not cluster:
+        print("No deployed clusters found.", file=sys.stderr)
+        return EXIT_FAIL
+
+    overrides = {}
+    for pair in _split_list(args.set):
+        if "=" not in pair:
+            print(f"--set wants name=value, not {pair!r}", file=sys.stderr)
+            return EXIT_USAGE
+        key, value = pair.split("=", 1)
+        overrides[key.strip()] = value.strip()
+
+    result = server_logging.apply(
+        cluster_name=cluster, db_password=args.db_password,
+        restart=args.restart, overrides=overrides,
+    )
+    print(f"\nLogs: {result.get('log_dir')}")
+    return EXIT_OK if result["outcome"] == "succeeded" else EXIT_FAIL
+
+
 def cmd_health_check(args):
     """Run each named component's upstream regression suite."""
     cluster = args.cluster or state.latest_cluster()
@@ -691,6 +714,22 @@ def build_parser():
     standby.add_argument("--sync-strict", action="store_true",
                          help="block writes when no standby is available")
     standby.set_defaults(func=cmd_add_standby)
+
+    # --- logging --------------------------------------------------------
+    logging_parser = subparsers.add_parser(
+        "logging",
+        help="turn on PostgreSQL server logging on a running cluster",
+    )
+    add_common(logging_parser)
+    logging_parser.add_argument(
+        "--restart", action="store_true",
+        help="restart each node that needs it, one at a time. "
+             "logging_collector is read only at startup, so without this the "
+             "settings are stored but no files are written yet")
+    logging_parser.add_argument(
+        "--set", action="append",
+        help="override one setting, as name=value; repeatable")
+    logging_parser.set_defaults(func=cmd_logging)
 
     # --- health-check -------------------------------------------------
     checking = subparsers.add_parser(

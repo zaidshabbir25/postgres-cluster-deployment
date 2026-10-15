@@ -87,12 +87,11 @@ def test_each_component_works_in_its_own_directory():
 # ---------------------------------------------------------------------------
 
 
-def test_spocks_tests_come_from_the_branch_the_extension_was_built_from():
-    """A newer suite tests behaviour an older extension does not have, and the
-    failures are about the skew rather than the cluster."""
+def test_spock_reports_that_its_cases_are_not_fetched():
+    """They ship with this tool, so there is no branch or tag to choose."""
     plan = plan_with(source_build={"spock_branch": "v5.0.5"})
 
-    assert health_check.ref_for(plan, "spock") == "v5.0.5"
+    assert health_check.ref_for(plan, "spock") == "in-tree"
 
 
 def test_an_extensions_tests_follow_the_ref_it_was_built_from():
@@ -114,243 +113,219 @@ def test_a_packaged_extension_falls_back_to_the_default_branch():
 
 
 def spock_ready(**extra):
-    """An executor where every scratch database and every test file exists."""
+    """An executor where psql is present and every comparison matches."""
     replies = {"test -x /usr/pgsql-17/bin/psql": (True, ""),
                "diff -u": (True, "")}
     replies.update(extra)
     return FakeExecutor(replies=replies)
 
 
-def test_spock_runs_the_sql_files_rather_than_make():
-    """Driving the files with psql needs nothing a cluster does not already
-    have; `make installcheck` needs the server's development files."""
+def spock_sql_files():
+    from regression import spock as spock_suite
+
+    return sorted(spock_suite.SQL_DIR.glob("*.sql"))
+
+
+# ---------------------------------------------------------------------------
+# nothing is created
+# ---------------------------------------------------------------------------
+
+
+def test_the_cases_ship_with_this_tool_and_nothing_is_cloned():
+    """Upstream's cases build the cluster they test; these assume one is
+    already running, so there is no repository to fetch."""
     plan = plan_with()
     executor = spock_ready()
 
-    result = regression.suite_for("spock", tests=["basic"]).run(
-        executor, plan, plan.node("n1"), "v5_STABLE",
-        run_logger=RecordingLogger())
+    regression.suite_for("spock", tests=["01_extension"]).run(
+        executor, plan, plan.node("n1"), "in-tree")
 
-    assert result.status == regression.PASSED
-    assert not any("make" in c for c in executor.commands)
+    assert not any("git clone" in c for c in executor.commands)
+    assert regression.suite_for("spock").repo == ""
+
+
+def test_the_suite_creates_no_database_role_or_instance():
+    """The whole point: it runs against the cluster as it stands. Upstream's
+    init.sql creates passwordless roles that only work under trust pg_hba, and
+    making that pass would mean lowering a running cluster's authentication."""
+    plan = plan_with()
+    executor = spock_ready()
+
+    regression.suite_for("spock").run(executor, plan, plan.node("n1"),
+                                       "in-tree")
+
+    forbidden = ("CREATE DATABASE", "DROP DATABASE", "CREATE USER",
+                 "CREATE ROLE", "pg_hba", "initdb", "ALTER DATABASE")
+    for banned in forbidden:
+        assert not any(banned in c for c in executor.commands), banned
+
+
+def test_no_case_reconnects_or_creates_a_role():
+    """Read as the files, not as commands: peers are reached with dblink in one
+    session, so nothing depends on psql handling a conninfo in a variable and
+    nothing needs a password the suite does not already have."""
+    for path in spock_sql_files():
+        text = path.read_text()
+        assert "\\c " not in text, f"{path.name} reconnects"
+        assert "CREATE USER" not in text.upper(), f"{path.name} creates a role"
+        assert "CREATE DATABASE" not in text.upper(), f"{path.name} creates a db"
+
+
+def test_the_cases_run_against_the_clusters_own_node_and_database():
+    plan = plan_with()
+    executor = spock_ready()
+
+    regression.suite_for("spock", tests=["01_extension"]).run(
+        executor, plan, plan.node("n1"), "in-tree")
+
     command = next(c for c in executor.commands
-                   if "/sql/basic.sql" in c and "psql" in c)
-    # pg_regress invokes psql exactly like this, which is why the expected
-    # files contain the statements as well as their output.
-    assert "-X -a -q" in command
+                   if "01_extension.sql" in c and "psql" in c)
+    assert f"-d {plan.db_name}" in command
+    assert "-p 5432" in command
 
 
-def test_spock_never_opens_the_clusters_own_database():
-    """infofuncs.sql ends with DROP EXTENSION spock, and init.sql builds its
-    own nodes. Pointed at the cluster's database they would dismantle it."""
+def test_psql_is_asked_for_values_only_and_never_prompts():
+    """-A -t keeps the expected files to what each case asserts; -w turns a
+    missing password into an instant error rather than a spent timeout."""
     plan = plan_with()
     executor = spock_ready()
 
-    regression.suite_for("spock", tests=["infofuncs"]).run(
-        executor, plan, plan.node("n1"), "v5_STABLE")
+    regression.suite_for("spock", tests=["01_extension"]).run(
+        executor, plan, plan.node("n1"), "in-tree")
 
-    running = [c for c in executor.commands if "/sql/infofuncs.sql" in c]
-    assert running, "the test should have run"
-    assert all(f"-d {plan.db_name}" not in c for c in running)
-    assert any("spockregress_provider" in c for c in running)
+    command = next(c for c in executor.commands
+                   if "01_extension.sql" in c and "psql" in c)
+    assert "-A -t" in command and " -w " in command
 
 
-def test_the_scratch_databases_are_recreated_every_run():
-    """These tests leave roles, tables and Spock nodes behind by design; a
-    second run against the first run's leftovers fails for reasons that say
-    nothing about the cluster."""
+def test_the_node_and_its_peer_count_are_passed_as_settings():
+    """psql does not interpolate :name inside a dollar-quoted body, and the
+    cases need the same value in both places."""
     plan = plan_with()
     executor = spock_ready()
 
-    regression.suite_for("spock", tests=["basic"]).run(
-        executor, plan, plan.node("n1"), "v5_STABLE")
+    regression.suite_for("spock", tests=["02_nodes"]).run(
+        executor, plan, plan.node("n1"), "in-tree")
 
-    for dbname in ("spockregress_provider", "spockregress_subscriber"):
-        assert any(f'DROP DATABASE IF EXISTS "{dbname}"' in c
-                   for c in executor.commands)
-        assert any(f'CREATE DATABASE "{dbname}"' in c
-                   for c in executor.commands)
+    command = next(c for c in executor.commands
+                   if "02_nodes.sql" in c and "psql" in c)
+    assert "spock_regress.node = " in command
+    assert "spock_regress.node_count = 2" in command
 
 
-def test_the_dsn_gucs_are_set_on_the_database_not_the_session():
-    """Every test reconnects with \\c, which would lose a session setting."""
+# ---------------------------------------------------------------------------
+# the cases themselves
+# ---------------------------------------------------------------------------
+
+
+def test_every_case_has_an_expected_file():
+    from regression import spock as spock_suite
+
+    for path in spock_sql_files():
+        expected = spock_suite.EXPECTED_DIR / f"{path.stem}.out"
+        assert expected.exists(), f"{path.name} has no expected output"
+
+
+def test_every_expected_line_asserts_something_true():
+    """A healthy cluster prints only `name|true`. Anything naming a node is
+    printed solely when that node is wrong, so it cannot appear here."""
+    from regression import spock as spock_suite
+
+    for path in sorted(spock_suite.EXPECTED_DIR.glob("*.out")):
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            assert line.endswith("|true"), f"{path.name}: {line}"
+
+
+def test_the_cases_run_in_filename_order_because_they_depend_on_it():
+    """05 creates the table 06 writes to, and 08 removes it again."""
+    names = regression.suite_for("spock").tests_for(plan_with(), node("n1"))
+
+    assert names == sorted(names)
+    assert names.index("05_ddl_replication") < names.index("06_dml")
+    assert names[-1] == "08_cleanup"
+
+
+def test_the_suite_cleans_up_after_itself():
+    """These objects replicate, so leaving them behind leaves them on every
+    node and the next run finds its own table already there."""
+    from regression import spock as spock_suite
+
+    cleanup = (spock_suite.SQL_DIR / "08_cleanup.sql").read_text()
+
+    assert "DROP SCHEMA IF EXISTS spock_regress CASCADE" in cleanup
+    assert "repset_remove_table" in cleanup
+
+
+def test_only_the_suites_own_schema_is_touched():
+    from regression import spock as spock_suite
+
+    created = [path.read_text() for path in spock_sql_files()]
+    joined = "\n".join(created)
+
+    assert "CREATE SCHEMA IF NOT EXISTS spock_regress" in joined
+    assert "DROP TABLE" not in joined.upper().replace(
+        "DROP TABLE IF EXISTS SPOCK_REGRESS", "")
+
+
+# ---------------------------------------------------------------------------
+# reporting
+# ---------------------------------------------------------------------------
+
+
+def test_a_failing_case_reports_the_first_thing_that_explains_it():
     plan = plan_with()
-    executor = spock_ready()
+    executor = spock_ready(**{
+        "diff -u": (False, ""),
+        "grep -m1": (True, "local_all_replicating|false\n"),
+    })
 
-    regression.suite_for("spock", tests=["basic"]).run(
-        executor, plan, plan.node("n1"), "v5_STABLE")
+    result = regression.suite_for("spock", tests=["03_subscriptions"]).run(
+        executor, plan, plan.node("n1"), "in-tree")
 
-    altered = [c for c in executor.commands if "ALTER DATABASE" in c
-               and "spock.provider_dsn" in c]
-    assert altered
-    assert any("port=5432" in c and "spockregress_provider" in c
-               for c in altered)
-    assert any("spock.subscriber_dsn" in c and "port=5433" in c
-               for c in executor.commands)
-
-
-def test_provider_and_subscriber_land_on_different_nodes():
-    """Upstream runs them as two databases in one instance; a real cluster can
-    do better, and that is a stronger test."""
-    suite = regression.suite_for("spock")
-    placement = suite.placement(plan_with())
-
-    assert placement["provider_dsn"].name == "n1"
-    assert placement["subscriber_dsn"].name == "n2"
-
-
-def test_a_single_node_cluster_puts_them_all_on_that_node():
-    """Which is exactly what upstream does anyway."""
-    suite = regression.suite_for("spock")
-    placement = suite.placement(plan_with(names=("n1",), ports=(5432,)))
-
-    assert {node.name for node in placement.values()} == {"n1"}
-
-
-def test_the_makefile_order_is_followed_because_the_tests_depend_on_it():
-    """preseed seeds data that preseed_check verifies after init cloned it."""
-    chosen = regression.suite_for("spock").tests_for(plan_with(), node("n1"))
-
-    assert chosen[:5] == ["preseed", "infofuncs", "init_fail", "init",
-                          "preseed_check"]
-    assert "add_table" not in chosen, "upstream disables it in its own Makefile"
-
-
-def test_a_pg18_only_test_is_left_out_below_18():
-    suite = regression.suite_for("spock")
-    plan = plan_with()
-
-    on17 = suite.tests_for(plan, node("n1"))
-    n18 = node("n1")
-    n18.pg_version = "18.6"
-    on18 = suite.tests_for(plan, n18)
-
-    assert "conflict_stat" not in on17
-    assert "conflict_stat" in on18
-
-
-def test_a_test_absent_from_this_ref_is_reported_not_counted():
-    """An older tag has fewer files than the list from main's Makefile."""
-    plan = plan_with()
-    executor = spock_ready(**{"test -f": (False, "")})
-
-    result = regression.suite_for("spock", tests=["basic"]).run(
-        executor, plan, plan.node("n1"), "v5.0.5")
-
-    assert "absent from this ref" in result.output
-    assert result.tests == {}
-
-
-def test_a_differing_output_is_a_failure_and_the_diff_is_kept():
-    plan = plan_with()
-    executor = spock_ready(**{"diff -u": (False, "")})
-
-    result = regression.suite_for("spock", tests=["basic"]).run(
-        executor, plan, plan.node("n1"), "v5_STABLE")
-
-    assert result.status == regression.FAILED
+    assert "local_all_replicating|false" in result.output
     assert result.tests == {"total": 1, "passed": 0, "failed": 1}
-    assert any("results" in path for path in result.artefacts)
 
 
-def test_spock_counts_its_own_run():
-    suite = regression.suite_for("spock")
-    output = ("test basic   ... ok\n"
-              "test copy    ... FAILED\n"
-              "1 of 2 tests failed.")
-
-    assert suite.parse(output) == {"total": 2, "passed": 1, "failed": 1}
-
-
-def test_a_cluster_whose_commit_timestamps_are_off_is_warned_about():
-    """Upstream's regression config turns it on; it needs a restart, so the
-    run says what will look wrong instead of producing silent diffs."""
+def test_each_case_is_reported_as_it_finishes():
     plan = plan_with()
-    executor = spock_ready(**{"SHOW track_commit_timestamp": (True, "off\n")})
+    executor = spock_ready()
     log = RecordingLogger()
 
-    regression.suite_for("spock", tests=["basic"]).run(
-        executor, plan, plan.node("n1"), "v5_STABLE", run_logger=log)
+    regression.suite_for("spock", tests=["01_extension", "02_nodes"]).run(
+        executor, plan, plan.node("n1"), "in-tree", run_logger=log)
 
-    assert log.said("track_commit_timestamp")
+    assert log.said("[1/2] 01_extension")
+    assert log.said("[2/2] 02_nodes")
 
 
-def test_the_suite_is_cloned_at_the_ref_into_its_own_workspace():
+def test_a_case_that_hangs_is_that_cases_failure_not_the_suites():
+    import subprocess
+
     plan = plan_with()
-    executor = ready(**{"make installcheck": (True, "All 1 tests passed.")})
 
-    regression.suite_for("lolor").run(executor, plan, plan.node("n1"), "v1.2.3")
+    class Executor(FakeExecutor):
+        def try_run(self, command, **kwargs):
+            if "06_dml.sql" in command and "psql" in command:
+                raise subprocess.TimeoutExpired("psql", 180)
+            return super().try_run(command, **kwargs)
 
-    assert executor.ran("git clone --branch v1.2.3 --depth 1 "
-                        "https://github.com/pgEdge/lolor.git "
-                        "/opt/pgedge/regression/lolor/src")
+    executor = Executor(replies={"test -x /usr/pgsql-17/bin/psql": (True, ""),
+                                 "diff -u": (True, "")})
 
+    result = regression.suite_for(
+        "spock", tests=["05_ddl_replication", "06_dml", "07_bidirectional"]
+    ).run(executor, plan, plan.node("n1"), "in-tree")
 
-@pytest.mark.parametrize("output,expected", [
-    ("All 23 tests passed.", {"total": 23, "passed": 23, "failed": 0}),
-    ("1 of 23 tests failed.", {"total": 23, "passed": 22, "failed": 1}),
-    ("make: nothing to be done", {}),
-])
-def test_pg_regress_reports_its_own_tally(output, expected):
-    assert regression.parse_pg_regress(output) == expected
-
-
-def test_a_failing_regression_keeps_the_diffs():
-    """regression.diffs is the file that says what actually differed."""
-    plan = plan_with()
-    executor = ready(**{
-        "make installcheck": (False, "1 of 23 tests failed."),
-        "test -e /opt/pgedge/regression/lolor/src/regression.diffs": (True, ""),
-    })
-
-    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
-                                               "main")
-
-    assert result.status == regression.FAILED
-    assert result.tests == {"total": 23, "passed": 22, "failed": 1}
-    assert any("regression.diffs" in path for path in result.artefacts)
+    assert "TIMED OUT after 180s" in result.output
+    assert result.tests == {"total": 3, "passed": 2, "failed": 1}
+    assert "07_bidirectional" in result.output, "the run continued past it"
 
 
-def test_the_suites_own_tally_outranks_its_exit_status():
-    """A harness that reports no failures and still exits non-zero has a
-    problem with its own teardown, not with the cluster."""
-    plan = plan_with()
-    executor = ready(**{"make installcheck": (False, "All 23 tests passed.")})
-
-    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
-                                               "main")
-
-    assert result.status == regression.PASSED
-
-
-def test_a_host_without_the_devel_package_is_skipped_not_failed():
-    """pg_regress ships with the development files, so a packaged host can
-    have psql and the server and still not have it."""
-    plan = plan_with()
-    executor = FakeExecutor(replies={
-        "pg_config --pgxs": (False, ""),
-        "FROM pg_extension WHERE extname": (True, "1\n"),
-    })
-
-    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
-                                               "main")
-
-    assert result.status == regression.SKIPPED
-    assert "pgxs" in result.detail
-    assert not executor.ran("git clone")
-
-
-def test_lolor_is_skipped_when_the_extension_was_never_created():
-    """This tool creates it after cross-wiring; a cluster where that was
-    skipped should say so rather than produce a wall of failures."""
-    plan = plan_with()
-    executor = ready(**{"FROM pg_extension WHERE extname": (True, "")})
-
-    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
-                                               "main")
-
-    assert result.status == regression.SKIPPED
-    assert "lolor extension" in result.detail
+def test_the_per_case_timeout_can_be_raised_for_a_slow_host():
+    assert regression.suite_for("spock", test_timeout=900).test_timeout == 900
+    assert regression.suite_for("spock").test_timeout == 180
 
 
 # ---------------------------------------------------------------------------
@@ -606,52 +581,44 @@ def test_a_run_with_one_pass_does_not_say_nothing_was_tested():
     assert "nothing was tested" not in text
 
 
-# ---------------------------------------------------------------------------
-# a long run has to look like one
-# ---------------------------------------------------------------------------
-
-
-def test_each_case_is_reported_as_it_finishes():
-    """Forty cases with nothing printed until the end is indistinguishable
-    from a hang, which is how this looked the first time it ran for real."""
+def test_psql_never_waits_for_a_password():
+    """The suite creates roles with no password; under scram a connection as
+    one of them prompts, and a prompt nobody can answer burns the whole
+    per-case timeout before failing."""
     plan = plan_with()
     executor = spock_ready()
-    log = RecordingLogger()
 
-    regression.suite_for("spock", tests=["basic", "copy"]).run(
-        executor, plan, plan.node("n1"), "v5_STABLE", run_logger=log)
+    regression.suite_for("spock", tests=["basic"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
 
-    assert log.said("[1/2] basic")
-    assert log.said("[2/2] copy")
+    command = next(c for c in executor.commands
+                   if "/sql/basic.sql" in c and "psql" in c)
+    assert " -w " in command
 
 
-def test_a_case_that_hangs_is_that_cases_failure_not_the_suites():
-    """The cases already run have results worth keeping, and the ones after it
-    have not been tried."""
-    import subprocess
-
+def test_a_failing_case_reports_its_first_error():
+    """Forty rows saying FAILED say only that something is wrong. When
+    thirty-eight report the same error, that is one problem, not thirty-eight."""
     plan = plan_with()
+    executor = spock_ready(**{
+        "diff -u": (False, ""),
+        "grep -m1": (True, 'psql:/x/basic.sql:21: ERROR:  relation '
+                           '"public.basic_dml" does not exist\n'),
+    })
 
-    class Executor(FakeExecutor):
-        def try_run(self, command, **kwargs):
-            if "/sql/init.sql" in command and "psql" in command:
-                raise subprocess.TimeoutExpired("psql", 300)
-            return super().try_run(command, **kwargs)
+    result = regression.suite_for("spock", tests=["basic"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
 
-    executor = Executor(replies={"test -x /usr/pgsql-17/bin/psql": (True, ""),
-                                 "diff -u": (True, "")})
-
-    result = regression.suite_for(
-        "spock", tests=["basic", "init", "copy"]
-    ).run(executor, plan, plan.node("n1"), "v5_STABLE")
-
-    assert "TIMED OUT after 300s" in result.output
-    assert result.tests == {"total": 3, "passed": 2, "failed": 1}
-    assert "copy" in result.output, "the run continued past the hang"
+    assert 'ERROR:  relation "public.basic_dml" does not exist' in result.output
+    assert "psql:/x/basic.sql:21" not in result.output, "the prefix is noise"
 
 
-def test_the_per_case_timeout_can_be_raised_for_a_slow_host():
-    suite = regression.suite_for("spock", test_timeout=900)
+def test_a_failure_with_no_error_line_still_reports_cleanly():
+    plan = plan_with()
+    executor = spock_ready(**{"diff -u": (False, ""), "grep -m1": (False, "")})
 
-    assert suite.test_timeout == 900
-    assert regression.suite_for("spock").test_timeout == 300
+    result = regression.suite_for("spock", tests=["basic"]).run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
+
+    assert "... FAILED" in result.output
+    assert result.tests == {"total": 1, "passed": 0, "failed": 1}

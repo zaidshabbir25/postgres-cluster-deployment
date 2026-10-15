@@ -44,10 +44,13 @@ def _executor_for(plan, host_name, cache, run_logger):
 
 
 def ref_for(plan, component):
-    """The branch or tag whose tests match what this cluster is running."""
+    """The branch or tag whose tests match what this cluster is running.
+
+    Spock's cases ship with this tool rather than being fetched, so there is no
+    ref to choose; the version it reports is the extension's own.
+    """
     if component == "spock":
-        return ((plan.source_build or {}).get("spock_branch")
-                or source_build.default_spock_branch(plan.spock_major))
+        return "in-tree"
 
     for item in pg_extensions.selections_of(plan):
         if item["name"] == component and item.get("ref"):

@@ -1,0 +1,9 @@
+spock_installed|true
+dblink_installed|true
+version_reported|true
+version_matches_extension|true
+has_node_add_interface|true
+has_node_info|true
+has_replicate_ddl|true
+has_repset_add_table|true
+has_sub_show_status|true

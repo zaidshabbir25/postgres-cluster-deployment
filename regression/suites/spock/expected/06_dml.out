@@ -1,0 +1,4 @@
+insert_reached_every_peer|true
+update_reached_every_peer|true
+delete_reached_every_peer|true
+local_row_count_is_two|true

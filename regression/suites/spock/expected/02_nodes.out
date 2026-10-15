@@ -1,0 +1,5 @@
+local_node_is_named|true
+local_sees_expected_nodes|true
+every_node_has_an_interface|true
+peers_agree_on_membership|true
+every_peer_knows_me|true

@@ -847,87 +847,67 @@ This differs per component and changes how a result should be read.
 | snowflake | `test/runner.py`, driven by `EDGE_*` | **the deployed cluster**, through a shim |
 | ace | `tests/integration/*.go` via `go test` | **its own containers** |
 
-### spock: the SQL files, in databases of their own
+### spock: written for a cluster that is already running
 
-Upstream drives `tests/regress/sql` through `make installcheck`, which needs
-the server's development files. Running the same files directly with psql needs
-nothing a cluster does not already have, and gives the same comparison against
-`tests/regress/expected`.
+Upstream's `tests/regress` cannot be used against a deployed cluster, and the
+reason is worth recording. Those cases build the thing they test: `init.sql`
+creates the nodes and the subscription, after creating passwordless roles
+`super` and `nonsuper` that only authenticate under the `trust` pg_hba upstream
+ships for its throwaway instance. Against a real cluster every Spock connection
+as `super` fails, `init` fails, and the thirty-eight cases after it fail with
+it. Making them pass would mean lowering a running cluster's authentication and
+leaving a superuser behind.
 
-**These tests own the databases they run in.** `infofuncs.sql` ends with `DROP
-EXTENSION spock`, `init.sql` creates roles and replicates DDL, and everything
-from `init.sql` onwards builds its own Spock nodes and subscriptions. Pointed
-at the cluster's own database they would dismantle the cluster. So scratch
-databases are created on the real nodes — same servers, ports, binaries and
-Spock — and the tests own those. The cluster's database is never opened, and
-the scratch ones are dropped and recreated each run, because these tests leave
-state behind by design.
+So the cases in `regression/suites/spock/` are this tool's own, and they ask
+the opposite question: given a cluster that is already cross-wired and already
+serving, does replication work? **Nothing is created, initialised or torn
+down** — no instance, no node, no subscription, no role, no database, no change
+to `pg_hba`. The only objects that appear are a `spock_regress` schema and one
+table in it, dropped again by the last case.
 
-Aligning the SQL needs no edits to any file, only four settings. Every test
-begins
+| case | asks |
+|---|---|
+| `01_extension` | Spock and dblink installed, version consistent, entry points present |
+| `02_nodes` | every node agrees on the membership, and every peer knows us |
+| `03_subscriptions` | every subscription is replicating, on every node |
+| `04_slots` | each node's outbound slots are active and not hoarding WAL |
+| `05_ddl_replication` | `replicate_ddl` reaches every peer |
+| `06_dml` | insert, update and delete each reach every peer |
+| `07_bidirectional` | a write on a peer comes back to us |
+| `08_cleanup` | the schema is gone again, everywhere |
 
-```sql
-SELECT * FROM spock_regress_variables()
-\gset
-\c :provider_dsn
-```
+Three decisions make that work against a live cluster:
 
-and `preseed.sql` defines that function as a read of `spock.provider_dsn`,
-`spock.subscriber_dsn`, `spock.provider1_dsn` and `spock.orig_provider_dsn`.
-Upstream fills them with `dbname=regression` and `dbname=postgres` — two
-databases in one temporary instance. Here they become conninfo strings for the
-scratch databases on *different nodes*, which maps the same tests onto a real
-multi-node cluster. They are set with `ALTER DATABASE` rather than `SET`,
-because every `\c` would lose a session setting.
+* **Peers are found through `spock.node_interface`**, where the deployment
+  registered them and where Spock's own procedures read them. Nothing is passed
+  in, so a wrong DSN there is itself a fault — and `02_nodes` is the first case
+  to trip over it.
+* **Peers are read through dblink in one session**, not by reconnecting, so
+  nothing depends on psql's handling of a conninfo in a variable and nothing
+  needs a password the suite does not already have.
+* **Output is values only** (`psql -A -t`), and every case prints fixed
+  `name|true` lines. Detail naming a node is printed *only when that node is
+  wrong*, so a healthy cluster matches a fixed expected file and a broken one
+  produces a diff that says which node and why.
 
-The order comes from Spock's own Makefile and matters: `preseed` seeds data
-that `preseed_check` verifies after `init` has cloned it. `add_table` is left
-out because upstream disables it, and `conflict_stat` below PostgreSQL 18
-because it reads what 18 added. A case absent from the ref being tested is
-reported as absent rather than counted as a failure.
-
-Each case is reported as it finishes, because forty of them with nothing
-printed until the end is indistinguishable from a hang. Several set up
-replication and wait for it, so each has its own timeout — 300 seconds by
-default. A case that exceeds it is that case's failure: the ones already run
-keep their results and the rest are still attempted.
+Each case waits for replication rather than assuming it, with its own timeout
+(180s, `--test-timeout` to change it). A case that exceeds it is that case's
+failure: the ones already run keep their results and the rest are still tried.
 
 ```bash
-./pg_deploy_cluster.sh --health_check spock                  # the Makefile order
-./pg_deploy_cluster.sh --health_check spock --tests preseed,infofuncs,basic
-./pg_deploy_cluster.sh --health_check spock --test-timeout 900   # a slow host
+./pg_deploy_cluster.sh --health_check spock
+./pg_deploy_cluster.sh --health_check spock --tests 01_extension,02_nodes
 ```
 
 ```
-spock: 40 case(s) against spockregress_provider, 300s each
-  [1/40] preseed                      ok
-  [2/40] infofuncs                    ok
-  [3/40] init_fail                    ok
-  [4/40] init                         TIMED OUT after 300s
-  [5/40] preseed_check                FAILED
+spock: 8 case(s) on n1 as postgres, 180s each
+  [1/8] 01_extension                 ok
+  [2/8] 02_nodes                     ok
+  [3/8] 03_subscriptions             FAILED — local_all_replicating|false
 ```
 
-One caveat: upstream's `regress-postgresql.conf` turns on settings a deployed
-cluster may not have, `track_commit_timestamp` among them. Those need a
-restart, so the run warns about what will look wrong rather than silently
-producing diffs.
-
-lolor still uses `make installcheck`, which does need the `-devel` package.
-
-snowflake's harness takes everything from the environment except the path to
-`psql`, which it builds itself as
-`$EDGE_CLUSTER_DIR/n1/pgedge/$EDGE_COMPONENT/bin/psql`. Rather than patch a
-copy of the harness, a small tree of symlinks in its workspace makes that path
-resolve to this cluster's binaries. It also assumes the second node is on the
-first node's port + 1; where that is not true, the run says so rather than
-quietly testing one node twice.
-
-**ACE is the exception worth knowing about.** Its integration tests bring up
-their own three-node PostgreSQL cluster with testcontainers and
-`docker-compose.yaml`. They validate the ACE binary and its fixtures on this
-host; they never read the deployed cluster. The report labels this rather than
-letting a green row imply otherwise. To check *your* cluster's consistency with
-ACE, run `ace table-diff` against it — a different operation.
+lolor, snowflake and ace still run their upstream suites; only spock has cases
+of its own.
 
 A suite that cannot run here is **skipped with the reason**, not failed, and
 the reason names the fix where there is one:
@@ -1193,6 +1173,45 @@ the page.
 > **No authentication.** Binding to `0.0.0.0` exposes your cluster topology and
 > health to anyone who can reach the port. Leave it on localhost and use an SSH
 > tunnel, or put it behind something that authenticates.
+
+---
+
+## PostgreSQL server logs
+
+Every node writes its own server log under its data directory:
+
+```
+/var/lib/pgedge/n1/log/postgresql-Mon.log
+/var/lib/pgedge/n2/log/postgresql-Mon.log
+```
+
+`log_directory` is deliberately relative, which PostgreSQL resolves against the
+data directory — so two nodes sharing a host keep separate logs instead of
+interleaving into one file. The `%a` filename with `log_truncate_on_rotation`
+and a one-day rotation gives the classic seven-day cycle, `postgresql-Mon.log`
+through `postgresql-Sun.log`, each overwritten when its day comes round again.
+No cron, no logrotate, and no unbounded growth.
+
+New clusters get this from their bootstrap block. For a cluster deployed
+before — which reports every logging setting as `source = default` and
+`logging_collector = off`, because Patroni never set them:
+
+```bash
+./pg_cluster_ctl.sh ... # or:
+python3 -m deployment.cli logging --cluster pgedge --restart
+```
+
+Two things make that more than writing a config file. Patroni renders
+`postgresql.conf` itself, so the settings go into the DCS through one
+`patronictl edit-config` **per scope** — a leader and its standbys are
+configured together. And `logging_collector` is read only at server startup:
+everything else takes a reload, but until each node restarts it is configured
+to collect logs and still will not. Without `--restart` the command says
+exactly which nodes are waiting and prints the command for each; with it, they
+are restarted one at a time so the cluster keeps serving.
+
+`--set name=value` overrides a single setting, for example
+`--set log_min_messages=info`.
 
 ---
 

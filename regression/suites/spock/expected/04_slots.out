@@ -1,0 +1,4 @@
+logical_slots_present|true
+all_logical_slots_active|true
+no_slot_retaining_excessive_wal|true
+walsenders_running|true

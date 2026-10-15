@@ -142,6 +142,10 @@ class ClusterPlan:
 
     source_build: Dict[str, Any] = field(default_factory=dict)
 
+    # Server logging settings, overriding patroni_management.LOG_PARAMETERS.
+    # Empty means the defaults, which is what almost every cluster wants.
+    log_parameters: Dict[str, Any] = field(default_factory=dict)
+
     # Optional extensions, as [{"name", "mode", "ref"}, ...]. Empty is the
     # default and means the deployment never touches them. See
     # aspects/pg_extensions.py for what the entries mean.

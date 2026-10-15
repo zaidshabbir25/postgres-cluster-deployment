@@ -67,6 +67,93 @@ def normalise_sync_mode(value):
     )
 
 
+# Server logging. Patroni renders postgresql.conf itself, so none of this can
+# be written into the file: it belongs in the DCS parameters, where every
+# member of the scope reads it.
+#
+# log_directory is relative, which PostgreSQL resolves against the data
+# directory — so each node's log lands beside its own data rather than in a
+# shared place where two nodes on one host would interleave.
+#
+# The %a filename with truncate_on_rotation and a one-day age is the classic
+# seven-day rotation: postgresql-Mon.log through postgresql-Sun.log, each
+# overwritten when its day comes round again. No cron, no logrotate, no growth.
+LOG_DIRECTORY = "log"
+LOG_PARAMETERS = {
+    "logging_collector": "on",
+    "log_destination": "stderr",
+    "log_directory": LOG_DIRECTORY,
+    "log_filename": "postgresql-%a.log",
+    "log_file_mode": "0640",
+    "log_truncate_on_rotation": "on",
+    "log_rotation_age": "1d",
+    "log_rotation_size": "0",
+    # Who, from where, in what transaction — the prefix you want when reading
+    # one of these a week later.
+    "log_line_prefix": "%m [%p] %q%u@%d/%a ",
+    "log_min_messages": "warning",
+    "log_min_error_statement": "error",
+    "log_checkpoints": "on",
+    "log_lock_waits": "on",
+    "log_temp_files": "0",
+    "log_autovacuum_min_duration": "0",
+    "log_timezone": "UTC",
+}
+
+#: Changing this one costs a restart; the rest take a reload.
+NEEDS_RESTART = ("logging_collector",)
+
+
+def logging_parameters(overrides=None):
+    """The server logging settings every node gets."""
+    parameters = dict(LOG_PARAMETERS)
+    parameters.update(overrides or {})
+    return parameters
+
+
+def log_directory_for(node):
+    """Where this node's log files end up on disk."""
+    return f"{node.data_dir.rstrip('/')}/{LOG_DIRECTORY}"
+
+
+def apply_logging(executor, plan, node, overrides=None, node_name=None):
+    """Push the logging settings into a running cluster's DCS.
+
+    bootstrap.dcs was read once, when the scope was created, so a cluster that
+    is already up takes this through patronictl. Returns (ok, detail).
+    """
+    parameters = logging_parameters(overrides)
+    binary = patronictl_binary(executor, node=node_name or node.name)
+    arguments = " ".join(
+        f"-s {shlex.quote(f'postgresql.parameters.{key}={value}')}"
+        for key, value in sorted(parameters.items())
+    )
+    ok, output = executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} edit-config "
+        f"{shlex.quote(node.scope)} --force {arguments} 2>&1",
+        node=node_name or node.name,
+    )
+    return ok, output.strip()
+
+
+def pending_restart(executor, plan, node, node_name=None):
+    """Settings that are set but not yet in force, as names.
+
+    logging_collector is the one that matters here: PostgreSQL reads it only at
+    startup, so a cluster that has been told to collect logs still will not
+    until it is restarted.
+    """
+    code, output = pg_server_management.psql(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        "SELECT name FROM pg_settings WHERE pending_restart;",
+        dbname=plan.db_name, node=node_name or node.name,
+        tuples_only=True, check=False,
+    )
+    if code != 0:
+        return []
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
 def sync_settings(plan, node):
     """The DCS block governing one scope's replication mode.
 
@@ -194,6 +281,10 @@ def build_config(plan, node):
         parameters = pg_server_management.spock_guc_parameters(
             plan.pg_version or plan.pg_major
         )
+        # Set here rather than after the fact: logging_collector is read at
+        # startup, so a node that bootstraps without it needs a restart to
+        # begin writing files at all.
+        parameters.update(logging_parameters(plan.log_parameters))
         # Patroni renders postgresql.conf itself, so these belong in the DCS
         # parameters block rather than being appended to a file it will rewrite.
         dcs = {
