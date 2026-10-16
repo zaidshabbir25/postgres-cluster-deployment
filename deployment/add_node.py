@@ -662,7 +662,7 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         version = spock_management.spock_version(executor, plan, node)
         log.step_end("passed", f"spock {version or 'unknown'}, {script} loaded")
 
-        # --- 5b. the libraries the join depends on --------------------
+        # --- 5b. what the join itself requires ------------------------
         # Checked here rather than discovered inside zodan: a failure during
         # add_node leaves the node half-registered, while a failure now leaves
         # it merely started.
@@ -681,6 +681,23 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                     f"currently '{', '.join(loaded) or 'empty'}'."
                 )
             log.step_end("passed", f"{', '.join(loaded)}")
+
+        # zodan refuses to join a node that lacks an extension whose tables the
+        # source replicates -- "Please run CREATE EXTENSION lolor on the new
+        # node first". It is satisfied by the extension being present and its
+        # tables empty, which is what a node that has just bootstrapped has.
+        # Everything else is still created after the join, where the structure
+        # sync has had its say.
+        prejoin = pg_extensions.required_before_join(
+            source_executor, plan, source, selections=selections)
+        if prejoin:
+            names = ", ".join(item["name"] for item in prejoin)
+            log.step_start("Create what the join requires",
+                           f"{names} on {name}, because {source.name} "
+                           f"replicates its tables")
+            pg_extensions.create_on_node(executor, plan, node,
+                                         selections=prejoin, run_logger=log)
+            log.step_end("passed", f"{names} created before joining")
 
         # --- 6. cross-wire --------------------------------------------
         log.step_start(

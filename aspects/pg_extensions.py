@@ -306,6 +306,52 @@ def installed_on(executor, plan, node):
     return [name for name in (found or "").split(",") if name]
 
 
+#: Extensions that must already exist on a node before zodan will let it join,
+#: when the source replicates their tables. zodan checks this itself and
+#: refuses with "Please run CREATE EXTENSION <name> on the new node first".
+JOIN_REQUIRES = ("lolor",)
+
+
+def replicated_tables_in(executor, plan, node, schema):
+    """How many of this schema's tables the node has in a replication set.
+
+    The same question zodan's prerequisite asks of the source before it will
+    let a node join: if the answer is non-zero, the joining node needs the
+    extension that owns them.
+    """
+    value = pg_server_management.scalar(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        f"SELECT count(*) FROM spock.tables WHERE nspname = "
+        f"'{schema}' AND set_name IS NOT NULL;",
+        dbname=plan.db_name, node=node.name, default="0",
+    )
+    try:
+        return int((value or "0").strip() or 0)
+    except ValueError:
+        return 0
+
+
+def required_before_join(executor, plan, source, selections=None):
+    """Selections that have to be created on a joiner before it can join.
+
+    Decided from the source, not from the plan: what matters is whether the
+    source is replicating those tables, which is exactly what zodan looks at.
+    """
+    selections = selections if selections is not None else selections_of(plan)
+    known = {item["name"]: item for item in selections}
+    needed = []
+    for name in JOIN_REQUIRES:
+        spec = CATALOG.get(name)
+        if spec is None or not is_created(executor, plan, source, spec):
+            continue
+        # Replicating its tables makes it mandatory; merely having it installed
+        # makes it worth matching, and zodan allows that as long as the
+        # joiner's own tables are empty -- which a node that has just
+        # bootstrapped satisfies.
+        needed.append(known.get(name) or selection_for(name))
+    return needed
+
+
 def selection_for(name, mode=MODE_PACKAGES, ref=""):
     """A selection entry for one extension, for a cluster that has it already."""
     key = canonical(name)

@@ -787,14 +787,68 @@ def test_add_node_checks_the_preload_before_joining_not_during():
     assert check < crosswire
 
 
-def test_the_extension_is_still_created_after_the_join_not_before():
-    """zodan refuses a joining node that already carries the lolor schema: its
-    prerequisite counts pg_tables in schema lolor, and CREATE EXTENSION lolor
-    puts two there. The structure sync creates it instead."""
+def test_what_the_join_requires_is_created_before_it():
+    """zodan refuses a node that lacks an extension whose tables the source
+    replicates: "Please run CREATE EXTENSION lolor on the new node first"."""
+    from pathlib import Path
+
+    source = Path("deployment/add_node.py").read_text()
+    prejoin = source.index("pg_extensions.required_before_join(")
+    crosswire = source.index("spock_management.add_node(")
+
+    assert prejoin < crosswire
+
+
+def test_everything_else_is_still_created_after_the_join():
+    """The structure sync has its say first; the step afterwards finds what it
+    created and only assigns identities."""
     from pathlib import Path
 
     source = Path("deployment/add_node.py").read_text()
     crosswire = source.index("spock_management.add_node(")
-    creating = source.index("pg_extensions.create_on_node(")
+    after = source.index("pg_extensions.create_on_node(", crosswire)
 
-    assert crosswire < creating
+    assert crosswire < after
+
+
+def test_a_source_replicating_lolor_tables_makes_it_required():
+    """spock.tables with a set_name is what zodan itself counts."""
+    plan = plan_with()
+    executor = loaded(**{
+        "FROM pg_extension WHERE extname": (True, "1\n"),
+        "FROM spock.tables WHERE nspname": (True, "2\n"),
+    })
+
+    needed = pg_extensions.required_before_join(executor, plan, plan.node("n1"))
+
+    assert [item["name"] for item in needed] == ["lolor"]
+
+
+def test_a_source_without_lolor_requires_nothing_before_the_join():
+    plan = plan_with()
+    executor = loaded(**{"FROM pg_extension WHERE extname": (True, "")})
+
+    assert pg_extensions.required_before_join(executor, plan,
+                                              plan.node("n1")) == []
+
+
+def test_the_replicated_table_count_is_read_from_spock_not_guessed():
+    plan = plan_with()
+    executor = loaded(**{"FROM spock.tables WHERE nspname": (True, "3\n")})
+
+    assert pg_extensions.replicated_tables_in(
+        executor, plan, plan.node("n1"), "lolor") == 3
+
+
+def test_an_unreadable_count_is_treated_as_none():
+    plan = plan_with()
+    executor = loaded(**{"FROM spock.tables WHERE nspname": (False, "boom")})
+
+    assert pg_extensions.replicated_tables_in(
+        executor, plan, plan.node("n1"), "lolor") == 0
+
+
+def test_only_lolor_is_required_before_a_join():
+    """snowflake generates ids and ACE runs outside the database; neither has
+    tables the source replicates."""
+    assert pg_extensions.JOIN_REQUIRES == ("lolor",)

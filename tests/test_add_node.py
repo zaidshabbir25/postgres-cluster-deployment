@@ -270,15 +270,16 @@ def test_a_failed_add_never_raises(monkeypatch):
     assert set(result) >= {"outcome", "cluster", "failure", "log_dir"}
 
 
-def test_a_joining_node_creates_the_extensions_only_after_it_is_wired_in():
-    """zodan refuses a node whose database already carries lolor, so the
-    extension is installed on the host before the join and created in the
-    database after it."""
+def test_a_joining_node_installs_before_the_join_and_creates_around_it():
+    """Packages go on the host first. What zodan demands before it will let the
+    node in is created before the join; everything else after it, once the
+    structure sync has had its say."""
     from pathlib import Path
 
     source = Path("deployment/add_node.py").read_text()
     installing = source.index("Install the cluster's optional extensions")
+    prejoin = source.index("pg_extensions.required_before_join(")
     crosswire = source.index("spock_management.add_node(")
-    creating = source.index("pg_extensions.create_on_node(")
+    after = source.index("pg_extensions.create_on_node(", crosswire)
 
-    assert installing < crosswire < creating
+    assert installing < prejoin < crosswire < after

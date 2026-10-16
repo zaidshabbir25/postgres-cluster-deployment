@@ -720,12 +720,28 @@ The preload is then verified before the join rather than discovered inside it:
 a failure during `add_node` leaves the node half-registered, while a failure
 before it leaves the node merely started.
 
-The extension itself is still created **after** the join. zodan's prerequisite
-check counts `pg_tables` in schema `lolor` on the joining node and refuses if
-there are any — and `CREATE EXTENSION lolor` puts two there. Creating it first
-would make every add-node on a lolor cluster impossible; the structure sync
-creates it during the join instead, and the step afterwards finds it already
-present and only assigns the node its identity.
+lolor is then **created before the join**, because zodan requires it:
+
+```
+Exiting add_node: Source node replicates lolor tables but database postgres on
+new node does not have the lolor extension installed. Please run
+CREATE EXTENSION lolor on the new node first.
+```
+
+Its prerequisite counts `spock.tables WHERE nspname = 'lolor' AND set_name IS
+NOT NULL` on the *source*, and if that is non-zero the joining node must have
+the extension. Having it is fine as long as the joiner's own `lolor` tables are
+empty — which a node that has just bootstrapped satisfies — so the data from
+the source can be synchronized into them.
+
+Every other extension is still created **after** the join, once the structure
+sync has had its say; the step afterwards finds whatever is already present and
+only assigns the node its identity.
+
+> The rule differs by Spock version. Spock 5's zodan refused a joining node
+> that had lolor at all; Spock 6's requires it when the source replicates lolor
+> tables. The check is read from the source node at run time rather than
+> assumed, so both behave correctly.
 
 ACE is installed but not configured — it needs a `pg_service.conf` with a
 `[cluster]` section and one `[cluster.node]` section per node, which it
