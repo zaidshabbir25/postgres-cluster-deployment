@@ -30,8 +30,8 @@ except ImportError as exc:  # pragma: no cover - dependency guard
         "  pip install -r requirements.txt"
     ) from exc
 
-from aspects import (auth_setup, etcd_management, pg_server_management,
-                     service_management)
+from aspects import (auth_setup, etcd_management, pg_extensions,
+                     pg_server_management, service_management)
 
 CONFIG_DIR = "/etc/patroni"
 NAMESPACE = "/service/"
@@ -285,6 +285,16 @@ def build_config(plan, node):
         # startup, so a node that bootstraps without it needs a restart to
         # begin writing files at all.
         parameters.update(logging_parameters(plan.log_parameters))
+        # An extension that refuses to be loaded on demand has to be named
+        # here, before the server first starts: shared_preload_libraries is
+        # read at startup, and adding it afterwards costs a restart.
+        extra = pg_extensions.preload_libraries(plan.pg_extensions)
+        if extra:
+            libraries = [parameters.get("shared_preload_libraries", "")]
+            libraries += [name for name in extra
+                          if name not in libraries[0].split(",")]
+            parameters["shared_preload_libraries"] = ",".join(
+                part for part in libraries if part)
         # Patroni renders postgresql.conf itself, so these belong in the DCS
         # parameters block rather than being appended to a file it will rewrite.
         dcs = {

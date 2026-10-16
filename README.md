@@ -641,6 +641,16 @@ Against a packaged server that also installs the `-devel`/`-dev` package, for
 the headers. Neither extension needs `shared_preload_libraries`, so neither
 costs a restart.
 
+**lolor must be preloaded.** It refuses to be loaded on demand — `CREATE
+EXTENSION`, `LOAD` and any call into it fail with `lolor must be loaded via
+"shared_preload_libraries"`, because the hook that protects large objects when
+the extension is dropped is only in every backend when the library is
+preloaded. A cluster that asks for lolor therefore gets it in
+`shared_preload_libraries` from its bootstrap block, alongside spock, before
+the server first starts. snowflake and ACE need no such thing. Adding it to a
+cluster that is already running costs a restart, and the error says which
+command to run.
+
 Building ACE is what its README documents: `go build -o ace ./cmd/ace/`, with
 the binary installed to `/usr/local/bin/ace`. It needs Go 1.26 or newer, which
 no distribution ships yet, so the official release tarball is unpacked into
@@ -665,7 +675,10 @@ sync.
 
 Both carry a GUC naming the node — `lolor.node` (1 to 2^28) and
 `snowflake.node` (1 to 1023) — and in a multi-master cluster those values must
-differ. snowflake's default is invalid on purpose: a node with the extension
+differ. lolor's range is small because the value is encoded in the four low
+bits of every large-object OID it generates, so a cluster of more than fifteen
+Spock nodes cannot use it, and a node named `n20` takes its number from its
+position rather than its name. snowflake's default is invalid on purpose: a node with the extension
 but not the setting raises on the first `nextval()`.
 
 Setting one is less direct than it looks. `lolor.node` does not exist until
