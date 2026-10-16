@@ -719,3 +719,82 @@ def test_names_inside_the_range_still_use_their_number():
     plan = plan_with(("n1", "n3"))
 
     assert [pg_extensions.node_id(plan, n) for n in plan.spock_nodes] == [1, 3]
+
+
+# ---------------------------------------------------------------------------
+# a node joining a cluster that already has lolor
+# ---------------------------------------------------------------------------
+
+
+def test_what_a_provider_actually_has_is_probed_not_assumed():
+    """The plan says what was asked for; the provider says what is there, and
+    the two differ when an extension was created by hand or the state predates
+    it being recorded."""
+    plan = plan_with()
+    executor = FakeExecutor(replies={
+        "FROM pg_extension\nWHERE extname IN": (True, "lolor,snowflake\n"),
+        "FROM pg_extension": (True, "lolor,snowflake\n"),
+    })
+
+    assert pg_extensions.installed_on(executor, plan, plan.node("n1")) == \
+        ["lolor", "snowflake"]
+
+
+def test_a_provider_with_nothing_installed_reports_nothing():
+    plan = plan_with()
+    executor = FakeExecutor(replies={"FROM pg_extension": (True, "\n")})
+
+    assert pg_extensions.installed_on(executor, plan, plan.node("n1")) == []
+
+
+def test_a_selection_can_be_built_for_something_already_there():
+    assert pg_extensions.selection_for("lolor") == {
+        "name": "lolor", "mode": "packages", "ref": ""}
+    assert pg_extensions.selection_for("pgedge-lolor")["name"] == "lolor"
+
+
+def test_the_preloaded_libraries_of_a_node_can_be_read():
+    plan = plan_with()
+    executor = FakeExecutor(replies={
+        "SHOW shared_preload_libraries": (True, "spock, lolor\n")})
+
+    assert pg_extensions.preloaded_libraries(executor, plan, plan.node("n1")) \
+        == ["spock", "lolor"]
+
+
+def test_add_node_decides_the_preload_before_it_configures_the_node():
+    """shared_preload_libraries is read at startup, so it has to be settled
+    before the node is written and started — not after it has joined."""
+    from pathlib import Path
+
+    source = Path("deployment/add_node.py").read_text()
+    probe = source.index("pg_extensions.installed_on(")
+    config = source.index("patroni_management.write_config(executor, plan, node")
+    crosswire = source.index("spock_management.add_node(")
+
+    assert probe < config < crosswire
+
+
+def test_add_node_checks_the_preload_before_joining_not_during():
+    """A failure inside zodan leaves the node half-registered; a failure before
+    it leaves the node merely started."""
+    from pathlib import Path
+
+    source = Path("deployment/add_node.py").read_text()
+    check = source.index("pg_extensions.preloaded_libraries(executor, plan, node)")
+    crosswire = source.index("spock_management.add_node(")
+
+    assert check < crosswire
+
+
+def test_the_extension_is_still_created_after_the_join_not_before():
+    """zodan refuses a joining node that already carries the lolor schema: its
+    prerequisite counts pg_tables in schema lolor, and CREATE EXTENSION lolor
+    puts two there. The structure sync creates it instead."""
+    from pathlib import Path
+
+    source = Path("deployment/add_node.py").read_text()
+    crosswire = source.index("spock_management.add_node(")
+    creating = source.index("pg_extensions.create_on_node(")
+
+    assert crosswire < creating

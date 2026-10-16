@@ -709,6 +709,24 @@ Neither applies to ACE: it has no GUC and no tables of its own.
 A node added later with `--add-node` picks up whatever the cluster asked for,
 from the same source and the same ref, and is given its own node number.
 
+For lolor there is an ordering that matters, and it is not the obvious one.
+Before the new node is configured, `--add-node` **probes the source node** for
+what is actually installed — not what the saved state records, since the two
+differ when an extension was created by hand — and makes sure the joining node
+preloads it. That has to be settled before the node starts, because
+`shared_preload_libraries` is read at startup, and because zodan's structure
+sync replays `CREATE EXTENSION lolor` on the new node, which fails without it.
+The preload is then verified before the join rather than discovered inside it:
+a failure during `add_node` leaves the node half-registered, while a failure
+before it leaves the node merely started.
+
+The extension itself is still created **after** the join. zodan's prerequisite
+check counts `pg_tables` in schema `lolor` on the joining node and refuses if
+there are any — and `CREATE EXTENSION lolor` puts two there. Creating it first
+would make every add-node on a lolor cluster impossible; the structure sync
+creates it during the join instead, and the step afterwards finds it already
+present and only assigns the node its identity.
+
 ACE is installed but not configured — it needs a `pg_service.conf` with a
 `[cluster]` section and one `[cluster.node]` section per node, which it
 generates itself with `ace cluster init` and `ace config init`. See its

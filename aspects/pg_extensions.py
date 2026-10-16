@@ -287,6 +287,31 @@ def validate(selections, pg_major, node_count=0):
 # ---------------------------------------------------------------------------
 
 
+def installed_on(executor, plan, node):
+    """Which catalogue extensions this node actually has, by probe.
+
+    The saved plan says what was asked for. This says what is there, and the
+    two can differ: an extension created by hand, or a cluster whose state
+    predates it being recorded. For a node about to join, the second question
+    is the one that matters — what it has to be able to replay.
+    """
+    found = pg_server_management.scalar(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        "SELECT string_agg(extname, ',' ORDER BY extname) FROM pg_extension "
+        "WHERE extname IN ("
+        + ", ".join("'" + name + "'" for name in sorted(CATALOG))
+        + ");",
+        dbname=plan.db_name, node=node.name, default="",
+    )
+    return [name for name in (found or "").split(",") if name]
+
+
+def selection_for(name, mode=MODE_PACKAGES, ref=""):
+    """A selection entry for one extension, for a cluster that has it already."""
+    key = canonical(name)
+    return {"name": key, "mode": mode, "ref": ref}
+
+
 def preload_libraries(selections):
     """Libraries that must be in shared_preload_libraries for these to work.
 
@@ -570,7 +595,7 @@ def build_on_host(executor, plan, host, selections, run_logger=None):
 # ---------------------------------------------------------------------------
 
 
-def _preloaded_libraries(executor, plan, node):
+def preloaded_libraries(executor, plan, node):
     value = pg_server_management.scalar(
         executor, node.bin_dir, node.pg_port, plan.db_user,
         "SHOW shared_preload_libraries;", dbname=plan.db_name,
@@ -580,12 +605,12 @@ def _preloaded_libraries(executor, plan, node):
 
 
 def _is_preloaded(executor, plan, node, spec):
-    return spec.library in _preloaded_libraries(executor, plan, node)
+    return spec.library in preloaded_libraries(executor, plan, node)
 
 
 def _preload_target(executor, plan, node, spec):
     """What shared_preload_libraries should say, keeping what is already there."""
-    libraries = _preloaded_libraries(executor, plan, node)
+    libraries = preloaded_libraries(executor, plan, node)
     if spec.library not in libraries:
         libraries.append(spec.library)
     return ",".join(libraries)
