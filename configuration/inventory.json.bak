@@ -1,0 +1,36 @@
+{
+  "_comment": "Written by ./pg_deploy_cluster.sh. Edit it by hand or answer the host questions again; the previous file is kept as inventory.json.bak.",
+  "defaults": {
+    "cluster_name": "pgedge",
+    "node_count": 2,
+    "standby_of": [],
+    "pg_major": "17",
+    "spock_major": "50",
+    "repo_channel": "release",
+    "db_name": "postgres",
+    "db_user": "postgres",
+    "db_password": "postgres",
+    "base_port": 5432,
+    "base_restapi_port": 8008,
+    "data_root": "/var/lib/pgedge",
+    "hba_cidrs": []
+  },
+  "hosts": [
+    {
+      "name": "13.201.170.129",
+      "host": "13.201.170.129",
+      "username": "rocky",
+      "enabled": true,
+      "key_file": "/Users/zaid/Documents/GitHub/postgres-cluster-deployment/zaid_aws_connect2.pem",
+      "port": 22
+    },
+    {
+      "name": "13.206.74.11",
+      "host": "13.206.74.11",
+      "username": "rocky",
+      "enabled": true,
+      "key_file": "/Users/zaid/Documents/GitHub/postgres-cluster-deployment/zaid_aws_connect2.pem",
+      "port": 22
+    }
+  ]
+}

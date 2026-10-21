@@ -33,8 +33,8 @@ from aspects import (health, inventory, patroni_management, pg_extensions,
 from regression import runner as regression
 from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
-from deployment import (add_standby, cleanup, deploy_cluster, health_check,
-                        ops_cli, server_logging, topology)
+from deployment import (add_component, add_standby, cleanup, deploy_cluster,
+                        health_check, ops_cli, server_logging, topology)
 from reports import report_generator
 
 EXIT_OK = 0
@@ -443,6 +443,27 @@ def cmd_add_standby(args):
     return EXIT_FAIL
 
 
+def cmd_add_component(args):
+    """Add lolor, snowflake or ACE to a cluster that is already running."""
+    cluster = args.cluster or state.latest_cluster()
+    if not cluster:
+        print("No deployed clusters found.", file=sys.stderr)
+        return EXIT_FAIL
+
+    result = add_component.add(
+        cluster_name=cluster, components=",".join(_split_list(args.components)),
+        db_password=args.db_password, restart=args.restart,
+        inventory_path=args.inventory,
+    )
+    print(f"\nLogs: {result.get('log_dir')}")
+    if result["outcome"] == "failed":
+        print(f"Failed: {result.get('failure')}", file=sys.stderr)
+        return EXIT_FAIL
+    # "incomplete" is a real state, not a failure: everything was installed and
+    # configured, and a restart is all that is left.
+    return EXIT_OK
+
+
 def cmd_logging(args):
     """Turn on PostgreSQL's own logging across a running cluster."""
     cluster = args.cluster or state.latest_cluster()
@@ -461,6 +482,7 @@ def cmd_logging(args):
     result = server_logging.apply(
         cluster_name=cluster, db_password=args.db_password,
         restart=args.restart, overrides=overrides,
+        inventory_path=args.inventory,
     )
     print(f"\nLogs: {result.get('log_dir')}")
     return EXIT_OK if result["outcome"] == "succeeded" else EXIT_FAIL
@@ -491,6 +513,7 @@ def cmd_health_check(args):
         install_requirements=args.install_requirements,
         tests=_split_list(args.tests),
         test_timeout=args.test_timeout,
+        inventory_path=args.inventory,
     )
     if getattr(args, "json", False):
         printable = dict(result)
@@ -714,6 +737,24 @@ def build_parser():
     standby.add_argument("--sync-strict", action="store_true",
                          help="block writes when no standby is available")
     standby.set_defaults(func=cmd_add_standby)
+
+    # --- add-component ----------------------------------------------
+    component = subparsers.add_parser(
+        "add-component",
+        help="add lolor, snowflake or ACE to a cluster that is already running",
+    )
+    add_common(component)
+    component.add_argument(
+        "--components", "--add-component", action="append", required=True,
+        help="comma-separated: " + ", ".join(pg_extensions.known_names())
+             + ". Each may say how it arrives and what to build, as "
+               "name:mode[@ref]")
+    component.add_argument(
+        "--restart", action="store_true",
+        help="restart the nodes that need it, one at a time. lolor has to be "
+             "in shared_preload_libraries, which is read only at startup, so "
+             "without this it is installed and configured but not created")
+    component.set_defaults(func=cmd_add_component)
 
     # --- logging --------------------------------------------------------
     logging_parser = subparsers.add_parser(

@@ -49,9 +49,10 @@ def _executor_for(plan, host_name, cache, run_logger):
 
 
 def apply(cluster_name, db_password=None, restart=False, overrides=None,
-          run_logger=None):
+          run_logger=None, inventory_path=None):
     """Configure logging on every scope. Returns a result dict."""
-    plan, metadata = state.load(cluster_name, db_password=db_password)
+    plan, metadata = state.load(cluster_name, db_password=db_password,
+                               inventory_path=inventory_path)
     plan.db_password = state.resolve_password(plan, explicit=db_password)
 
     log = run_logger or RunLogger(new_run_id(f"{cluster_name}-logging"))

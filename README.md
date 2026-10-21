@@ -141,6 +141,29 @@ default and nothing sensitive touches the repo. Otherwise set
 `configuration/inventory.json` is gitignored too, because it names your
 machines.
 
+The key path is kept in the cluster's saved state, because that is how a later
+`--add-node`, `--add-component` or `--health_check` reaches the hosts again. It
+is left out of the HTML reports, which get shared around. A cluster whose state
+was written before this reads the path back from the inventory on load, so it
+stays reachable without a redeploy.
+
+**A key with a passphrase** is handled three ways, in this order:
+
+| | |
+|---|---|
+| `PG_CLUSTER_SSH_PASSPHRASE` | for an unattended run |
+| a prompt | asked once per key, not once per host, and only when there is a terminal to ask at |
+| the ssh agent | what an encrypted key falls back to, since a key with a passphrase is usually loaded into one already |
+
+Pressing Enter at the prompt chooses the agent. A scripted run is never
+prompted — a question with nobody to answer it would hang the deployment — so
+it goes straight to the agent.
+
+If none of those unlock it, the run stops immediately rather than retrying: the
+key will be just as encrypted on the third attempt, and the message names
+`ssh-add`, `PG_CLUSTER_SSH_PASSPHRASE` and `PG_CLUSTER_SSH_KEY` rather than
+repeating `Private key file is encrypted` three times.
+
 ### Rehearse without touching anything
 
 ```bash
@@ -705,6 +728,52 @@ lolor is installed and inert — large objects land in its schema and replicate
 nowhere, which is the one thing it exists to fix.
 
 Neither applies to ACE: it has no GUC and no tables of its own.
+
+### Adding one to a cluster that is already running
+
+```bash
+./pg_deploy_cluster.sh --add-component pgedge-ace
+./pg_deploy_cluster.sh --add-component pgedge-lolor,pgedge-snowflake --restart
+```
+
+Installed on every host, then created on every Spock node with its own
+identity, then — for lolor — its tables joined to the default replication set.
+The cluster's saved state records them, so a later `--add-node` gives the
+joining node the same thing. Naming a component the cluster already has checks
+it is complete rather than redoing it, and does not change the ref it was built
+from, so a half-finished run can simply be repeated.
+
+**lolor costs a restart.** It has to be in `shared_preload_libraries`, which
+PostgreSQL reads only at startup, so the sequence is: install → extend the
+preload list through the DCS, once per scope → restart → create. The preload
+list is *extended*, never replaced; setting it to just `lolor` would unload
+spock and take replication with it. Without `--restart` the run stops after
+configuring and reports `incomplete` with the commands to finish — everything
+is installed and a restart is all that is left, which reads differently from a
+failure. With it, nodes restart one at a time so the cluster keeps serving.
+
+Either way it ends with the state of every node, because "configured" and
+"loaded" are different answers and the gap between them is exactly an
+outstanding restart:
+
+```
+  NODE         IN THE DCS             LOADED NOW
+  ------------ ---------------------- ----------------------
+  n1           spock,lolor            spock,lolor
+  n2           spock,lolor            spock
+```
+
+`n2` there is configured but has not restarted, and `CREATE EXTENSION lolor`
+on it would still fail with `must be loaded via "shared_preload_libraries"`.
+The DCS column comes from `patronictl show-config`, not from `SHOW`: a `SHOW`
+answers what the running backend loaded, which for a restart-only setting is
+the old value, so it cannot tell "configured, waiting" from "never
+configured". Every *node* is checked, not every scope — a standby has to load
+the library too, or it cannot replay what its leader writes. After a restart
+the check runs again rather than assuming it worked.
+
+ACE and snowflake need no restart: ACE is a binary beside the cluster, and
+snowflake loads on demand.
 
 A node added later with `--add-node` picks up whatever the cluster asked for,
 from the same source and the same ref, and is given its own node number.

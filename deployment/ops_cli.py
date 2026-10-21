@@ -53,7 +53,8 @@ def _load(args):
     cluster = _resolve_cluster(args)
     if cluster is None:
         raise SystemExit(EXIT_FAIL)
-    plan, meta = state.load(cluster, db_password=args.db_password)
+    plan, meta = state.load(cluster, db_password=args.db_password,
+                            inventory_path=getattr(args, 'inventory', None))
     plan.db_password = state.resolve_password(plan, explicit=args.db_password)
     return plan, meta
 

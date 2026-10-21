@@ -61,9 +61,10 @@ def ref_for(plan, component):
 
 def run(cluster_name, components, db_password=None, node_name=None,
         run_logger=None, keep_going=True, install_requirements=False,
-        tests=None, test_timeout=None):
+        tests=None, test_timeout=None, inventory_path=None):
     """Run the selected suites. Returns a result dict."""
-    plan, metadata = state.load(cluster_name, db_password=db_password)
+    plan, metadata = state.load(cluster_name, db_password=db_password,
+                               inventory_path=inventory_path)
     plan.db_password = state.resolve_password(plan, explicit=db_password)
 
     log = run_logger or RunLogger(new_run_id(f"{cluster_name}-health-check"))

@@ -20,6 +20,8 @@ packaged single `patroni` unit, because a host may carry several nodes.
 
 import json
 import shlex
+
+import yaml
 from urllib.parse import urlsplit
 
 try:
@@ -134,6 +136,113 @@ def apply_logging(executor, plan, node, overrides=None, node_name=None):
         node=node_name or node.name,
     )
     return ok, output.strip()
+
+
+def configured_parameters(executor, node, node_name=None):
+    """The scope's parameters as the DCS holds them, not as the server runs them.
+
+    `SHOW` answers what this backend has loaded, which for anything needing a
+    restart is the *old* value. Telling "configured, waiting for a restart"
+    from "never configured" needs the DCS, and that is what show-config reads.
+    """
+    binary = patronictl_binary(executor, node=node_name or node.name)
+    ok, output = executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} show-config "
+        f"{shlex.quote(node.scope)} 2>/dev/null",
+        node=node_name or node.name,
+    )
+    if not ok or not output.strip():
+        return {}
+    try:
+        parsed = yaml.safe_load(output) or {}
+    except Exception:
+        return {}
+    postgresql = parsed.get("postgresql") or {}
+    return postgresql.get("parameters") or {}
+
+
+def configured_preload(executor, node, node_name=None):
+    """shared_preload_libraries as the DCS holds it, as a list."""
+    value = configured_parameters(executor, node, node_name=node_name).get(
+        "shared_preload_libraries", "")
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def apply_preload(executor, plan, node, libraries, node_name=None):
+    """Extend a scope's shared_preload_libraries in the DCS.
+
+    Extended, never replaced: setting it to just the new library would unload
+    spock and take the cluster's replication with it. Compared against what the
+    DCS holds rather than what the server has loaded, so a re-run after a
+    configured-but-not-yet-restarted node does not write the same value again.
+
+    Returns (ok, value) where value is what the DCS should now say.
+    """
+    configured = configured_preload(executor, node, node_name=node_name)
+    if not configured:
+        # No DCS answer -- an older Patroni, or a scope that has not published
+        # its config. The running value is the only thing left to build on,
+        # and losing spock would be far worse than a redundant write.
+        configured = pg_extensions.preloaded_libraries(executor, plan, node)
+
+    wanted = list(configured)
+    for library in libraries:
+        if library not in wanted:
+            wanted.append(library)
+    value = ",".join(wanted)
+    if wanted == configured:
+        return True, value
+
+    binary = patronictl_binary(executor, node=node_name or node.name)
+    ok, output = executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} edit-config "
+        f"{shlex.quote(node.scope)} --force "
+        f"-s {shlex.quote('postgresql.parameters.shared_preload_libraries=' + value)}"
+        f" 2>&1",
+        node=node_name or node.name,
+    )
+    if not ok:
+        return False, output.strip()
+
+    # Verify rather than trust: an edit-config that is accepted and changes
+    # nothing would otherwise be reported as success, and the failure would
+    # surface much later as CREATE EXTENSION refusing to run.
+    now = configured_preload(executor, node, node_name=node_name)
+    if now and any(library not in now for library in libraries):
+        return False, (f"edit-config was accepted but the DCS still says "
+                       f"{', '.join(now) or 'nothing'}")
+    return True, value
+
+
+def preload_report(executor_for, plan, libraries):
+    """Per node: what the DCS says, and what the server has loaded.
+
+    The two differ exactly while a restart is outstanding, which is the state
+    this whole operation has to be able to describe.
+    """
+    rows = []
+    for node in plan.nodes:
+        executor = executor_for(node)
+        configured = configured_preload(executor, node)
+        loaded = pg_extensions.preloaded_libraries(executor, plan, node)
+        rows.append({
+            "node": node.name,
+            "configured": configured,
+            "loaded": loaded,
+            "missing_from_dcs": [l for l in libraries if l not in configured],
+            "not_loaded": [l for l in libraries if l not in loaded],
+        })
+    return rows
+
+
+def restart_member(executor, node, node_name=None, timeout=600):
+    """Restart one member through Patroni, so the DCS stays in step."""
+    binary = patronictl_binary(executor, node=node_name or node.name)
+    return executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} restart "
+        f"{shlex.quote(node.scope)} {shlex.quote(node.name)} --force",
+        node=node_name or node.name, timeout=timeout,
+    )
 
 
 def pending_restart(executor, plan, node, node_name=None):

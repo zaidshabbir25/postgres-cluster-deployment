@@ -11,7 +11,9 @@ reconnected on the next command rather than failing the deployment.
 """
 
 import io
+import getpass
 import os
+import sys
 import shlex
 import socket
 import tarfile
@@ -43,6 +45,12 @@ class CommandFailed(RuntimeError):
         super().__init__(
             f"[{host}] command failed (exit {exit_code}): {command}\n{output.strip()}"
         )
+
+
+#: Passphrases already asked for, by key path. A twenty-host inventory shares
+#: one key far more often than not, and asking per host would be unusable.
+_UNASKED = object()
+_PASSPHRASES = {}
 
 
 class SSHExecutor:
@@ -84,9 +92,26 @@ class SSHExecutor:
             if not key_path.is_absolute():
                 key_path = REPO_ROOT / key_path
             if not key_path.exists():
-                raise FileNotFoundError(f"SSH key not found: {key_path}")
-            pkey = self._load_key(key_path)
-            use_agent = False
+                raise FileNotFoundError(
+                    f"SSH key not found: {key_path}. Set PG_CLUSTER_SSH_KEY or "
+                    f"fix key_file in the inventory."
+                )
+            try:
+                pkey = self._load_key(key_path)
+            except paramiko.PasswordRequiredException:
+                # Encrypted. Ask for the passphrase, or let the agent try: a
+                # key with a passphrase is usually loaded into one already,
+                # which is the whole reason for having the agent.
+                passphrase = self.passphrase_for(key_path)
+                if passphrase:
+                    pkey = self._load_key(key_path, passphrase)
+                else:
+                    self._emit(
+                        f"{key_path} is encrypted and no passphrase was given "
+                        f"— trying the ssh agent instead. Set "
+                        f"PG_CLUSTER_SSH_PASSPHRASE to use the key directly."
+                    )
+            use_agent = pkey is None
 
         last_exc = None
         for attempt in range(1, self._max_retries + 1):
@@ -105,6 +130,30 @@ class SSHExecutor:
                 self._client = client
                 self._emit(f"connected to {self.username}@{self.host}:{self.port}")
                 return self
+            except paramiko.PasswordRequiredException as exc:
+                # Retrying cannot help: the key will be just as encrypted next
+                # time, and three identical failures only delay the message.
+                if self.key_file:
+                    which = f"{key_path} is encrypted"
+                    add = f"ssh-add {self.key_file}"
+                else:
+                    # Nothing configured, so paramiko was scanning ~/.ssh and
+                    # found something encrypted there. Naming no key at all
+                    # leaves the reader with nowhere to start.
+                    which = ("no key is configured for this host, and an "
+                             "encrypted one was found in ~/.ssh")
+                    add = "ssh-add"
+                raise ConnectionError(
+                    f"Cannot SSH to {self.username}@{self.host}:{self.port}: "
+                    f"{which}, and neither a passphrase nor the ssh agent "
+                    f"could unlock it.\n"
+                    f"  Add it to your agent:      {add}\n"
+                    f"  Or give the passphrase:    "
+                    f"export PG_CLUSTER_SSH_PASSPHRASE=...\n"
+                    f"  Or name the key to use:    "
+                    f"export PG_CLUSTER_SSH_KEY=/path/to/key\n"
+                    f"  Or set key_file for this host in the inventory."
+                ) from exc
             except Exception as exc:
                 last_exc = exc
                 if attempt < self._max_retries:
@@ -117,19 +166,84 @@ class SSHExecutor:
         )
 
     @staticmethod
-    def _load_key(key_path):
-        """Load a private key without needing to know its algorithm up front."""
-        errors = []
-        for key_class in (
-            paramiko.Ed25519Key,
-            paramiko.ECDSAKey,
-            paramiko.RSAKey,
-            paramiko.DSSKey,
-        ):
+    def passphrase_for(key_path):
+        """The passphrase for an encrypted key, or None.
+
+        Looked up once per process and cached: a twenty-host inventory would
+        otherwise ask twenty times for the same key. Sources, in order:
+
+          * PG_CLUSTER_SSH_PASSPHRASE, for an unattended run
+          * a prompt, when there is a terminal to ask at
+
+        No prompt without a terminal: a scripted run would hang on it, and the
+        caller can fall back to the agent instead.
+        """
+        from_env = os.environ.get("PG_CLUSTER_SSH_PASSPHRASE")
+        if from_env:
+            return from_env
+
+        cached = _PASSPHRASES.get(str(key_path), _UNASKED)
+        if cached is not _UNASKED:
+            return cached
+
+        answer = None
+        if sys.stdin.isatty():
             try:
-                return key_class.from_private_key_file(str(key_path))
+                answer = getpass.getpass(
+                    f"Passphrase for {key_path} (Enter to try the ssh agent): "
+                ) or None
+            except (EOFError, KeyboardInterrupt):
+                answer = None
+        _PASSPHRASES[str(key_path)] = answer
+        return answer
+
+    @staticmethod
+    def _key_classes():
+        """The key types this paramiko can load, newest algorithm first.
+
+        Looked up rather than listed: paramiko 4 removed DSSKey, and naming it
+        in a literal tuple raises AttributeError while the tuple is being
+        built — before a single key has been tried, so an Ed25519 key that
+        would have loaded fine fails with "module 'paramiko' has no attribute
+        'DSSKey'". DSA has been off by default in OpenSSH for years, so its
+        absence is a reason to stop naming it, not to pin paramiko back.
+        """
+        names = ("Ed25519Key", "ECDSAKey", "RSAKey", "DSSKey")
+        return [getattr(paramiko, name) for name in names
+                if hasattr(paramiko, name)]
+
+    @staticmethod
+    def _load_key(key_path, passphrase=None):
+        """Load a private key without needing to know its algorithm up front.
+
+        Raises paramiko.PasswordRequiredException when the key is encrypted and
+        no passphrase was given, so the caller can tell "needs a passphrase"
+        from "not a key I understand" — they lead somewhere different.
+        """
+        # paramiko 4 added a loader that detects the type itself. Preferred
+        # where it exists: it understands formats the per-class loaders do not.
+        loader = getattr(paramiko.PKey, "from_path", None)
+        if loader is not None:
+            try:
+                return loader(str(key_path), passphrase)
+            except paramiko.PasswordRequiredException:
+                raise
+            except Exception:
+                pass  # fall through to trying each class, for a better message
+
+        errors = []
+        encrypted = False
+        for key_class in SSHExecutor._key_classes():
+            try:
+                return key_class.from_private_key_file(str(key_path), passphrase)
+            except paramiko.PasswordRequiredException:
+                encrypted = True
             except Exception as exc:
                 errors.append(f"{key_class.__name__}: {exc}")
+        if encrypted:
+            raise paramiko.PasswordRequiredException(
+                f"{key_path} is encrypted"
+            )
         raise ValueError(
             f"Unsupported or encrypted SSH key {key_path}:\n  " + "\n  ".join(errors)
         )

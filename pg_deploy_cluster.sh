@@ -131,6 +131,13 @@ Cleanup
                             node, un-replicated WAL, or a failed un-wiring
   --yes                     with --remove-node or --cleanup, skip the prompt
 
+  --add-component LIST      add pgedge-lolor, pgedge-snowflake or pgedge-ace to a
+                            cluster that is already running, and exit. Each entry
+                            may say how it arrives and what to build, as
+                            name:mode[@ref]. lolor needs a restart to take
+                            effect, which --restart does one node at a time.
+  --restart                 with --add-component, restart the nodes that need it
+
   --health_check LIST       after a cluster is deployed, run each component's own
                             regression suite against it and exit. Comma-separated:
                             spock, lolor, snowflake, ace, or all. Each component
@@ -505,6 +512,8 @@ CLEANUP_ARGS=()
 ADD_NODE=""
 HEALTH_CHECK=""
 HEALTH_ARGS=()
+ADD_COMPONENT=""
+COMPONENT_ARGS=()
 PG_EXTENSIONS=""
 REMOVE_NODE=""
 REMOVE_ARGS=()
@@ -531,6 +540,11 @@ while [[ $# -gt 0 ]]; do
     --add-node)
       [[ $# -ge 2 ]] || die "--add-node needs a node name (e.g. --add-node n3)"
       ADD_NODE="$2"; INTERACTIVE=false; shift 2 ;;
+    --add-component)
+      [[ $# -ge 2 ]] || die "--add-component needs a component list (e.g. pgedge-lolor,pgedge-ace)"
+      ADD_COMPONENT="$2"; INTERACTIVE=false; shift 2 ;;
+    --restart)
+      COMPONENT_ARGS+=("$1"); shift ;;
     --health_check|--health-check)
       [[ $# -ge 2 ]] || die "--health_check needs a component list (e.g. spock,lolor,snowflake,ace, or all)"
       HEALTH_CHECK="$2"; INTERACTIVE=false; shift 2 ;;
@@ -584,6 +598,38 @@ ensure_venv
 # ---------------------------------------------------------------------------
 # Cleanup — a mode of its own, not a deployment
 # ---------------------------------------------------------------------------
+
+if [[ -n "$ADD_COMPONENT" ]]; then
+  [[ -z "$ADD_NODE" && -z "$REMOVE_NODE" && -z "$HEALTH_CHECK" ]] \
+    || die "--add-component works on its own; run it before or after the others"
+  [[ "$CLEANUP" == false ]] || die "--add-component and --cleanup do opposite things; pick one"
+  FACTS="$(cluster_facts "$CLUSTER_NAME")"
+  [[ -n "$FACTS" ]] || die "no deployed cluster found — deploy one before adding a component to it"
+  IFS='|' read -r FACT_CLUSTER FACT_PG FACT_SPOCK FACT_ALL FACT_MODE \
+    FACT_SPOCK_MAJOR FACT_BRANCH <<<"$FACTS"
+
+  say ""
+  say "${BOLD}Adding $ADD_COMPONENT to cluster '$FACT_CLUSTER'${RESET}"
+  rule
+  say "   PostgreSQL : $FACT_PG"
+  say "   Spock      : spock${FACT_SPOCK_MAJOR}"
+  say "   Spock nodes: ${FACT_SPOCK:-none}"
+  say "   Install    : $FACT_MODE"
+  rule
+  say ""
+  say "${DIM}Installed on every host, then created on every Spock node with its"
+  say "own node identity. lolor also joins shared_preload_libraries, which"
+  say "PostgreSQL reads only at startup — so those nodes need a restart before"
+  say "the extension can be created. Without --restart they are configured and"
+  say "the command tells you what is left.${RESET}"
+  say ""
+
+  exec python3 -m deployment.cli add-component \
+    --components "$ADD_COMPONENT" \
+    --inventory "$INVENTORY" \
+    ${CLUSTER_NAME:+--cluster "$CLUSTER_NAME"} \
+    "${COMPONENT_ARGS[@]+"${COMPONENT_ARGS[@]}"}"
+fi
 
 if [[ -n "$HEALTH_CHECK" ]]; then
   [[ -z "$ADD_NODE" && -z "$REMOVE_NODE" ]] \

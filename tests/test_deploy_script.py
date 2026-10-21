@@ -39,6 +39,8 @@ def script(tmp_path):
                         'exit_after echo "REMOVE: node remove"', 1)
     text = text.replace('exec python3 -m deployment.cli health-check',
                         'exit_after echo "CHECK: health-check"', 1)
+    text = text.replace('exec python3 -m deployment.cli add-component',
+                        'exit_after echo "COMPONENT: add-component"', 1)
     text = text.replace('exec python3 -m deployment.cli cleanup',
                         'exit_after echo "CLEANUP: cleanup"', 1)
     # `exec` would have replaced the process; the stub has to stop by itself.
@@ -753,3 +755,40 @@ def test_health_check_does_not_combine_with_changing_the_cluster(script, invento
 
     assert code != 0
     assert "does not change one" in output
+
+
+# ---------------------------------------------------------------------------
+# --add-component
+# ---------------------------------------------------------------------------
+
+
+def test_add_component_forwards_the_list(script, inventory):
+    code, output = run(script, inventory, "--add-component", "pgedge-lolor",
+                       facts=SOURCE_50)
+
+    assert code == 0
+    assert "COMPONENT: add-component" in output
+
+
+def test_add_component_explains_the_restart_lolor_costs(script, inventory):
+    code, output = run(script, inventory, "--add-component",
+                       "pgedge-lolor,pgedge-ace", facts=SOURCE_50)
+
+    assert "shared_preload_libraries" in output
+    assert "reads only at startup" in output
+
+
+def test_add_component_needs_a_deployed_cluster(script, inventory):
+    code, output = run(script, inventory, "--add-component", "pgedge-lolor",
+                       facts="")
+
+    assert code != 0
+    assert "deploy one before adding a component" in output
+
+
+def test_add_component_does_not_combine_with_the_other_modes(script, inventory):
+    code, output = run(script, inventory, "--add-component", "pgedge-lolor",
+                       "--add-node", "n3", facts=SOURCE_50)
+
+    assert code != 0
+    assert "works on its own" in output
