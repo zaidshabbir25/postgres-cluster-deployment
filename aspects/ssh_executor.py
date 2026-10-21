@@ -349,8 +349,27 @@ class SSHExecutor:
         return output
 
     def try_run(self, command, user="root", timeout=DEFAULT_TIMEOUT, node=None):
-        """Run a command, tolerating failure. Returns (ok, output)."""
-        exit_code, output = self.exec_run(command, user=user, timeout=timeout, node=node)
+        """Run a command, tolerating failure. Returns (ok, output).
+
+        Tolerating failure means tolerating all of it. A command that times
+        out, or a transport that dies, used to raise straight through here and
+        out of whatever best-effort loop was calling it — which is how a
+        cleanup, whose entire job is to cope with broken hosts, died with a
+        traceback on the one host that was broken.
+
+        `run()` is the strict variant and still raises; callers choose.
+        """
+        try:
+            exit_code, output = self.exec_run(command, user=user,
+                                              timeout=timeout, node=node)
+        except TimeoutError as exc:
+            self._emit(f"{exc}")
+            return False, str(exc)
+        except (paramiko.SSHException, EOFError, OSError) as exc:
+            # OSError covers a dead socket; TimeoutError above is a subclass of
+            # it, so the order matters.
+            self._emit(f"command failed on the transport: {exc}")
+            return False, f"[{self.host}] {type(exc).__name__}: {exc}"
         return exit_code == 0, output
 
     def exists(self, path):

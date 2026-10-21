@@ -377,3 +377,63 @@ def test_a_missing_key_says_where_to_point_it(tmp_path):
     with pytest.raises(FileNotFoundError, match="PG_CLUSTER_SSH_KEY"):
         SSHExecutor(name="h", host="10.0.0.1", username="rocky",
                     key_file=str(tmp_path / "absent")).connect()
+
+
+# ---------------------------------------------------------------------------
+# try_run tolerates all of it
+# ---------------------------------------------------------------------------
+
+
+def executor_whose_commands(raise_this):
+    """An executor whose every command fails in the given way."""
+    from aspects.ssh_executor import SSHExecutor
+
+    executor = SSHExecutor(name="h", host="10.0.0.1", username="rocky")
+
+    def boom(*args, **kwargs):
+        raise raise_this
+
+    executor.exec_run = boom
+    return executor
+
+
+def test_a_timed_out_command_is_a_false_not_a_traceback():
+    """"Tolerating failure" has to mean tolerating all of it: a timeout used
+    to raise straight through and out of whatever best-effort loop was calling
+    it, which is how a cleanup died on the one host that was broken."""
+    executor = executor_whose_commands(
+        TimeoutError("[10.0.0.1] timed out after 600s: systemctl list-unit-files"))
+
+    ok, output = executor.try_run("systemctl list-unit-files")
+
+    assert ok is False
+    assert "timed out" in output
+
+
+def test_a_dead_transport_is_a_false_too():
+    import paramiko
+
+    executor = executor_whose_commands(paramiko.SSHException("channel closed"))
+
+    ok, output = executor.try_run("anything")
+
+    assert ok is False
+    assert "channel closed" in output
+
+
+def test_a_socket_error_is_a_false_too():
+    executor = executor_whose_commands(OSError("broken pipe"))
+
+    ok, output = executor.try_run("anything")
+
+    assert ok is False
+    assert "broken pipe" in output
+
+
+def test_run_still_raises_because_it_is_the_strict_one():
+    """Callers choose: run() for something the deployment depends on, try_run
+    for best-effort work."""
+    executor = executor_whose_commands(TimeoutError("timed out"))
+
+    with pytest.raises(TimeoutError):
+        executor.run("anything")

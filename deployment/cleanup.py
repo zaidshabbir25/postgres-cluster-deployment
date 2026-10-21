@@ -27,6 +27,11 @@ from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
 from deployment import topology
 
+#: Probes, not work. The default timeout is sized for compiling PostgreSQL;
+#: a host that cannot answer `systemctl list-unit-files` in a minute is one to
+#: report rather than wait on.
+PROBE_TIMEOUT = 60
+
 CONFIG_PATHS = (
     "/etc/patroni",
     "/etc/profile.d/pgcluster.sh",
@@ -69,6 +74,8 @@ def wipe_hosts(hosts, data_root=None, db_user="postgres", purge_packages=False,
     then knows about — this finds them on the machine itself and removes them.
     """
     data_root = data_root or topology.DEFAULT_DATA_ROOT
+    # Probes, not work: a host that cannot answer one in a minute is a host
+    # worth reporting rather than waiting on.
     log = run_logger or RunLogger(new_run_id("host-cleanup"))
     started = time.time()
     cleaned, unreachable = [], {}
@@ -95,65 +102,76 @@ def wipe_hosts(hosts, data_root=None, db_user="postgres", purge_packages=False,
             log.warn(f"{host.name} unreachable, skipping: {exc}")
             continue
 
-        log.step_start(f"Clean {host.name}", host.address)
-
-        # --- Patroni units, whatever they are called ------------------
-        _, listed = executor.try_run(
-            "systemctl list-unit-files 'patroni-*.service' --no-legend "
-            "2>/dev/null | awk '{print $1}'",
-            node=host.name,
-        )
-        units = [line.strip() for line in listed.splitlines() if line.strip()]
-        for unit in units:
-            executor.try_run(f"systemctl disable --now {unit} 2>/dev/null || true",
-                             node=host.name)
-            executor.try_run(f"rm -f /etc/systemd/system/{unit}", node=host.name)
-        executor.try_run("pkill -f '/etc/patroni/' 2>/dev/null || true", node=host.name)
-
-        # --- PostgreSQL left behind by a half-bootstrapped node -------
-        executor.try_run(
-            f"pkill -f 'postgres -D {data_root}' 2>/dev/null || true", node=host.name
-        )
-
-        # --- etcd -----------------------------------------------------
-        etcd_management.purge(executor, node=host.name)
-        executor.try_run("rm -f /etc/etcd/etcd.yml /etc/etcd/etcd.conf",
-                         node=host.name)
-
-        # --- files ----------------------------------------------------
-        executor.try_run(f"rm -rf {shlex.quote(data_root)}", node=host.name)
-        for path in CONFIG_PATHS:
-            executor.try_run(f"rm -rf {path}", node=host.name)
         try:
-            family = host.family or platform_detect.detect(executor)["family"]
-        except Exception:
-            family = "rhel"
-        home = platform_detect.pg_home(family)
-        executor.try_run(
-            f"rm -f {home}/.pgpass {home}/.pg_service.conf "
-            f"/root/.pgpass /root/.pg_service.conf",
-            node=host.name,
-        )
-        executor.try_run("systemctl daemon-reload 2>/dev/null || true", node=host.name)
+            log.step_start(f"Clean {host.name}", host.address)
 
-        if purge_packages:
-            installed = package_management.list_pgedge_packages(
-                executor, family, node=host.name
+            # --- Patroni units, whatever they are called ------------------
+            # A short timeout: these are probes, and systemd on a host that is
+            # half-wedged can sit on one indefinitely. The default is sized for
+            # compiling PostgreSQL, which is the wrong budget here.
+            _, listed = executor.try_run(
+                "systemctl list-unit-files 'patroni-*.service' --no-legend "
+                "2>/dev/null | awk '{print $1}'",
+                node=host.name, timeout=PROBE_TIMEOUT,
             )
-            names = [entry["package"] for entry in installed]
-            if names:
-                package_management.remove(executor, family, names, node=host.name)
-                log.info(f"    {host.name}: removed {len(names)} package(s)")
-            if family == "rhel":
-                executor.try_run("rm -f /etc/yum.repos.d/pgedge.repo", node=host.name)
-            else:
-                executor.try_run(
-                    "rm -f /etc/apt/sources.list.d/pgedge.sources && apt-get update",
-                    node=host.name,
-                )
+            units = [line.strip() for line in listed.splitlines() if line.strip()]
+            for unit in units:
+                executor.try_run(f"systemctl disable --now {unit} 2>/dev/null || true",
+                                 node=host.name)
+                executor.try_run(f"rm -f /etc/systemd/system/{unit}", node=host.name)
+            executor.try_run("pkill -f '/etc/patroni/' 2>/dev/null || true", node=host.name)
 
-        log.step_end("passed", f"{len(units)} patroni unit(s), data and configs removed")
-        cleaned.append(host.name)
+            # --- PostgreSQL left behind by a half-bootstrapped node -------
+            executor.try_run(
+                f"pkill -f 'postgres -D {data_root}' 2>/dev/null || true", node=host.name
+            )
+
+            # --- etcd -----------------------------------------------------
+            etcd_management.purge(executor, node=host.name)
+            executor.try_run("rm -f /etc/etcd/etcd.yml /etc/etcd/etcd.conf",
+                             node=host.name)
+
+            # --- files ----------------------------------------------------
+            executor.try_run(f"rm -rf {shlex.quote(data_root)}", node=host.name)
+            for path in CONFIG_PATHS:
+                executor.try_run(f"rm -rf {path}", node=host.name)
+            try:
+                family = host.family or platform_detect.detect(executor)["family"]
+            except Exception:
+                family = "rhel"
+            home = platform_detect.pg_home(family)
+            executor.try_run(
+                f"rm -f {home}/.pgpass {home}/.pg_service.conf "
+                f"/root/.pgpass /root/.pg_service.conf",
+                node=host.name,
+            )
+            executor.try_run("systemctl daemon-reload 2>/dev/null || true", node=host.name)
+
+            if purge_packages:
+                installed = package_management.list_pgedge_packages(
+                    executor, family, node=host.name
+                )
+                names = [entry["package"] for entry in installed]
+                if names:
+                    package_management.remove(executor, family, names, node=host.name)
+                    log.info(f"    {host.name}: removed {len(names)} package(s)")
+                if family == "rhel":
+                    executor.try_run("rm -f /etc/yum.repos.d/pgedge.repo", node=host.name)
+                else:
+                    executor.try_run(
+                        "rm -f /etc/apt/sources.list.d/pgedge.sources && apt-get update",
+                        node=host.name,
+                    )
+
+            log.step_end("passed", f"{len(units)} patroni unit(s), data and configs removed")
+            cleaned.append(host.name)
+        except Exception as exc:
+            # A host that wedges mid-scrub must not take the others with
+            # it: cleanup is what you reach for when things are already
+            # broken, and the remaining hosts still need clearing.
+            unreachable[host.name] = str(exc)
+            log.step_end("failed", f"{type(exc).__name__}: {exc}")
+            log.warn(f"{host.name} could not be finished: {exc}")
         try:
             executor.close()
         except Exception:
