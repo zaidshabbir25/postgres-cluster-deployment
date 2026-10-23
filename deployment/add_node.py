@@ -217,8 +217,6 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         inventory_path=None, db_password=None, run_logger=None,
         skip_verify=False, pg_version="", spock_major="", spock_branch=""):
     """Add one Spock node. Returns a result dict; never raises."""
-    plan, metadata = state.load(cluster_name, db_password=db_password)
-    plan.db_password = state.resolve_password(plan, explicit=db_password)
 
     log = run_logger or RunLogger(new_run_id(f"{cluster_name}-add-node"))
     executors = {}
@@ -229,6 +227,12 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
     registered = ""
 
     try:
+        # Inside the try: a cluster with no saved state is an ordinary
+        # refusal with a message, not a traceback out of a function that
+        # promises to return a result dict.
+        plan, metadata = state.load(cluster_name, db_password=db_password)
+        plan.db_password = state.resolve_password(plan, explicit=db_password)
+
         if not plan.spock_nodes:
             raise AddNodeError(
                 f"cluster {cluster_name!r} has no Spock nodes to join"

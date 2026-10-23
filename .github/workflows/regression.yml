@@ -19,13 +19,23 @@ permissions:
 jobs:
   tests:
     name: tests (python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # 3.9 is what Rocky 9 ships and therefore what the control machine
         # usually runs; the newest is where the dependencies move first.
-        python: ["3.9", "3.12"]
+        #
+        # The runner is pinned per version rather than left at ubuntu-latest:
+        # that label moved to Ubuntu 26.04, which setup-python has no 3.9 build
+        # for, so the older job has to name an image that still does. Dropping
+        # 3.9 instead would drop the version most of these deployments are
+        # actually driven from.
+        include:
+          - python: "3.9"
+            os: ubuntu-22.04
+          - python: "3.12"
+            os: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4

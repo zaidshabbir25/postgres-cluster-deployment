@@ -44,3 +44,29 @@ def test_no_module_fails_to_parse():
               if "invalid syntax" in line or "unexpected" in line.lower()]
 
     assert not broken, "\n".join(broken)
+
+
+def test_every_module_parses_on_the_oldest_supported_python():
+    """CI runs 3.9 because that is what Rocky 9 ships and what most of these
+    deployments are driven from. Syntax that needs a newer one — a nested
+    same-quote f-string, say — compiles fine on a developer's machine and
+    fails only there."""
+    import shutil
+    import subprocess
+
+    oldest = shutil.which("python3.9") or "/usr/bin/python3"
+    probe = subprocess.run(
+        [oldest, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != "3.9":
+        pytest.skip("no python3.9 available to parse with")
+
+    result = subprocess.run(
+        [oldest, "-m", "compileall", "-q",
+         *[str(REPO_ROOT / name) for name in PACKAGES
+           if (REPO_ROOT / name).exists()]],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

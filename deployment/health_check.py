@@ -63,9 +63,6 @@ def run(cluster_name, components, db_password=None, node_name=None,
         run_logger=None, keep_going=True, install_requirements=False,
         tests=None, test_timeout=None, inventory_path=None):
     """Run the selected suites. Returns a result dict."""
-    plan, metadata = state.load(cluster_name, db_password=db_password,
-                               inventory_path=inventory_path)
-    plan.db_password = state.resolve_password(plan, explicit=db_password)
 
     log = run_logger or RunLogger(new_run_id(f"{cluster_name}-health-check"))
     executors = {}
@@ -73,6 +70,13 @@ def run(cluster_name, components, db_password=None, node_name=None,
     results = []
 
     try:
+        # Inside the try: a cluster with no saved state is an ordinary
+        # refusal with a message, not a traceback out of a function that
+        # promises to return a result dict.
+        plan, metadata = state.load(cluster_name, db_password=db_password,
+                                   inventory_path=inventory_path)
+        plan.db_password = state.resolve_password(plan, explicit=db_password)
+
         if not plan.spock_nodes:
             raise HealthCheckError(
                 f"cluster {cluster_name!r} has no Spock node to test against"

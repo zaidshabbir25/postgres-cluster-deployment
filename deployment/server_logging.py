@@ -51,9 +51,6 @@ def _executor_for(plan, host_name, cache, run_logger):
 def apply(cluster_name, db_password=None, restart=False, overrides=None,
           run_logger=None, inventory_path=None):
     """Configure logging on every scope. Returns a result dict."""
-    plan, metadata = state.load(cluster_name, db_password=db_password,
-                               inventory_path=inventory_path)
-    plan.db_password = state.resolve_password(plan, explicit=db_password)
 
     log = run_logger or RunLogger(new_run_id(f"{cluster_name}-logging"))
     executors = {}
@@ -62,6 +59,13 @@ def apply(cluster_name, db_password=None, restart=False, overrides=None,
     configured, restarted, pending = [], [], []
 
     try:
+        # Inside the try: a cluster with no saved state is an ordinary
+        # refusal with a message, not a traceback out of a function that
+        # promises to return a result dict.
+        plan, metadata = state.load(cluster_name, db_password=db_password,
+                                   inventory_path=inventory_path)
+        plan.db_password = state.resolve_password(plan, explicit=db_password)
+
         parameters = patroni_management.logging_parameters(overrides)
         log.banner(f"Server logging for '{cluster_name}'")
         log.info(f"    scopes   : {len(plan.scopes())}")

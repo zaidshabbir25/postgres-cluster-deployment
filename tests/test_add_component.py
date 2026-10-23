@@ -160,19 +160,44 @@ def test_lolors_tables_are_replicated_when_it_is_added_later():
 # ---------------------------------------------------------------------------
 
 
-def test_naming_nothing_is_refused():
-    result = add_component.add("pgedge", "", db_password="x")
+def saved(state_dir, deployed_plan):
+    """A cluster on disk, in a temporary state directory.
+
+    add() loads the plan before it validates anything, so a test that skips
+    this passes only on a machine that happens to have a real cluster saved —
+    which is exactly how these two went green locally and red in CI.
+    """
+    from aspects import state
+
+    state.save(deployed_plan)
+    return deployed_plan.cluster_name
+
+
+def test_naming_nothing_is_refused(state_dir, deployed_plan):
+    cluster = saved(state_dir, deployed_plan)
+
+    result = add_component.add(cluster, "", db_password="x")
 
     assert result["outcome"] == "failed"
     assert "name at least one component" in result["failure"]
 
 
-def test_an_unknown_component_is_refused_by_name():
-    result = add_component.add("pgedge", "pgedge-timescale", db_password="x")
+def test_an_unknown_component_is_refused_by_name(state_dir, deployed_plan):
+    cluster = saved(state_dir, deployed_plan)
+
+    result = add_component.add(cluster, "pgedge-timescale", db_password="x")
 
     assert result["outcome"] == "failed"
     assert "unknown extension 'pgedge-timescale'" in result["failure"]
     assert "pgedge-lolor" in result["failure"], "it should say what does exist"
+
+
+def test_a_cluster_with_no_saved_state_says_so(state_dir):
+    """Rather than a traceback about a missing file."""
+    result = add_component.add("absent", "pgedge-lolor", db_password="x")
+
+    assert result["outcome"] == "failed"
+    assert "No saved state" in result["failure"]
 
 
 # ---------------------------------------------------------------------------
