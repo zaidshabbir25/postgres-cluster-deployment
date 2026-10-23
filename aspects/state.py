@@ -30,7 +30,11 @@ def save(plan, extra=None):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "saved_at": datetime.now(timezone.utc).isoformat(),
-        "plan": plan.to_dict(),
+        # Unredacted on purpose: this is how a later add-node, add-component
+        # or health-check reaches the hosts again. The file lives in
+        # configuration/clusters, which is gitignored, and holds a path rather
+        # than a key.
+        "plan": plan.to_dict(redact_key=False),
         "metadata": extra or {},
     }
     path = state_path(plan.cluster_name)
@@ -40,7 +44,39 @@ def save(plan, extra=None):
     return path
 
 
-def load(cluster_name, db_password=None):
+def adopt_inventory_keys(plan, inventory_path=None):
+    """Fill in host key paths the saved state does not have.
+
+    State written before key paths were kept has none, and every operation on
+    such a cluster would fall back to the ssh agent. The inventory still names
+    them, so read them back from there rather than making the operator
+    redeploy. Hosts matched by name, then by address.
+    """
+    missing = [host for host in plan.hosts if not host.key_file and not host.local]
+    if not missing:
+        return []
+
+    try:
+        from aspects import inventory as inventory_module
+
+        hosts, defaults = inventory_module.load(inventory_path)
+    except Exception:
+        return []
+
+    by_name = {h.name: h for h in hosts}
+    by_address = {h.address: h for h in hosts}
+    fallback = defaults.get("key_file") if isinstance(defaults, dict) else None
+    adopted = []
+    for host in missing:
+        match = by_name.get(host.name) or by_address.get(host.address)
+        key_file = (match.key_file if match else None) or fallback
+        if key_file:
+            host.key_file = key_file
+            adopted.append(host.name)
+    return adopted
+
+
+def load(cluster_name, db_password=None, inventory_path=None):
     """Read a cluster's plan back. Returns (plan, metadata)."""
     path = state_path(cluster_name)
     if not path.exists():
@@ -52,6 +88,7 @@ def load(cluster_name, db_password=None):
     payload = json.loads(path.read_text(encoding="utf-8"))
     password = db_password or os.environ.get("PG_CLUSTER_DB_PASSWORD") or ""
     plan = ClusterPlan.from_dict(payload["plan"], db_password=password)
+    adopt_inventory_keys(plan, inventory_path)
     return plan, payload.get("metadata", {})
 
 

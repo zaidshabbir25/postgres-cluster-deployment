@@ -272,3 +272,51 @@ def test_cleanup_skips_the_prompt_with_yes(monkeypatch, inventory_file):
     assert cli.cmd_cleanup(types.SimpleNamespace(
         inventory=str(path), data_root=None, db_user=None,
         purge=False, yes=True)) == 0
+
+
+# ---------------------------------------------------------------------------
+# a broken host must not take the others with it
+# ---------------------------------------------------------------------------
+
+
+def test_a_host_that_wedges_mid_scrub_does_not_stop_the_rest(monkeypatch, tmp_path):
+    """Cleanup is what you reach for when things are already broken, so the
+    one host that is broken must not end the run — the others still need
+    clearing. This used to escape as a TimeoutError traceback."""
+    from aspects.cluster_model import Host
+    from deployment import cleanup as cleanup_module
+    from tests.conftest import FakeExecutor
+
+    class Wedged(FakeExecutor):
+        def try_run(self, command, **kwargs):
+            if "list-unit-files" in command:
+                raise TimeoutError("[bad] timed out after 60s: systemctl")
+            return super().try_run(command, **kwargs)
+
+    made = {}
+
+    def build(config, run_logger=None):
+        executor = (Wedged() if config["name"] == "bad" else FakeExecutor())
+        made[config["name"]] = executor
+        return executor
+
+    monkeypatch.setattr(cleanup_module, "build_executor", build)
+    monkeypatch.setattr(cleanup_module.state, "list_clusters", lambda: [])
+
+    result = cleanup_module.wipe_hosts(
+        [Host(name="bad", address="10.0.0.1"),
+         Host(name="good", address="10.0.0.2")],
+        data_root=str(tmp_path),
+    )
+
+    assert "good" in result["cleaned"], "the healthy host was still cleaned"
+    assert "bad" in result["unreachable"]
+    assert made["good"].commands, "the healthy host was actually touched"
+
+
+def test_the_probes_do_not_wait_the_full_build_timeout():
+    """The default is sized for compiling PostgreSQL. A host that cannot
+    answer systemctl in a minute is one to report rather than wait on."""
+    from deployment import cleanup as cleanup_module
+
+    assert cleanup_module.PROBE_TIMEOUT <= 120

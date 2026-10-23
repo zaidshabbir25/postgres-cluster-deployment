@@ -20,6 +20,8 @@ packaged single `patroni` unit, because a host may carry several nodes.
 
 import json
 import shlex
+
+import yaml
 from urllib.parse import urlsplit
 
 try:
@@ -30,8 +32,8 @@ except ImportError as exc:  # pragma: no cover - dependency guard
         "  pip install -r requirements.txt"
     ) from exc
 
-from aspects import (auth_setup, etcd_management, pg_server_management,
-                     service_management)
+from aspects import (auth_setup, etcd_management, pg_extensions,
+                     pg_server_management, service_management)
 
 CONFIG_DIR = "/etc/patroni"
 NAMESPACE = "/service/"
@@ -65,6 +67,200 @@ def normalise_sync_mode(value):
         f"unknown replication mode {value!r}; use one of: async (off), "
         f"sync (on), quorum"
     )
+
+
+# Server logging. Patroni renders postgresql.conf itself, so none of this can
+# be written into the file: it belongs in the DCS parameters, where every
+# member of the scope reads it.
+#
+# log_directory is relative, which PostgreSQL resolves against the data
+# directory — so each node's log lands beside its own data rather than in a
+# shared place where two nodes on one host would interleave.
+#
+# The %a filename with truncate_on_rotation and a one-day age is the classic
+# seven-day rotation: postgresql-Mon.log through postgresql-Sun.log, each
+# overwritten when its day comes round again. No cron, no logrotate, no growth.
+LOG_DIRECTORY = "log"
+LOG_PARAMETERS = {
+    "logging_collector": "on",
+    "log_destination": "stderr",
+    "log_directory": LOG_DIRECTORY,
+    "log_filename": "postgresql-%a.log",
+    "log_file_mode": "0640",
+    "log_truncate_on_rotation": "on",
+    "log_rotation_age": "1d",
+    "log_rotation_size": "0",
+    # Who, from where, in what transaction — the prefix you want when reading
+    # one of these a week later.
+    "log_line_prefix": "%m [%p] %q%u@%d/%a ",
+    "log_min_messages": "warning",
+    "log_min_error_statement": "error",
+    "log_checkpoints": "on",
+    "log_lock_waits": "on",
+    "log_temp_files": "0",
+    "log_autovacuum_min_duration": "0",
+    "log_timezone": "UTC",
+}
+
+#: Changing this one costs a restart; the rest take a reload.
+NEEDS_RESTART = ("logging_collector",)
+
+
+def logging_parameters(overrides=None):
+    """The server logging settings every node gets."""
+    parameters = dict(LOG_PARAMETERS)
+    parameters.update(overrides or {})
+    return parameters
+
+
+def log_directory_for(node):
+    """Where this node's log files end up on disk."""
+    return f"{node.data_dir.rstrip('/')}/{LOG_DIRECTORY}"
+
+
+def apply_logging(executor, plan, node, overrides=None, node_name=None):
+    """Push the logging settings into a running cluster's DCS.
+
+    bootstrap.dcs was read once, when the scope was created, so a cluster that
+    is already up takes this through patronictl. Returns (ok, detail).
+    """
+    parameters = logging_parameters(overrides)
+    binary = patronictl_binary(executor, node=node_name or node.name)
+    arguments = " ".join(
+        f"-s {shlex.quote(f'postgresql.parameters.{key}={value}')}"
+        for key, value in sorted(parameters.items())
+    )
+    ok, output = executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} edit-config "
+        f"{shlex.quote(node.scope)} --force {arguments} 2>&1",
+        node=node_name or node.name,
+    )
+    return ok, output.strip()
+
+
+def configured_parameters(executor, node, node_name=None):
+    """The scope's parameters as the DCS holds them, not as the server runs them.
+
+    `SHOW` answers what this backend has loaded, which for anything needing a
+    restart is the *old* value. Telling "configured, waiting for a restart"
+    from "never configured" needs the DCS, and that is what show-config reads.
+    """
+    binary = patronictl_binary(executor, node=node_name or node.name)
+    ok, output = executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} show-config "
+        f"{shlex.quote(node.scope)} 2>/dev/null",
+        node=node_name or node.name,
+    )
+    if not ok or not output.strip():
+        return {}
+    try:
+        parsed = yaml.safe_load(output) or {}
+    except Exception:
+        return {}
+    postgresql = parsed.get("postgresql") or {}
+    return postgresql.get("parameters") or {}
+
+
+def configured_preload(executor, node, node_name=None):
+    """shared_preload_libraries as the DCS holds it, as a list."""
+    value = configured_parameters(executor, node, node_name=node_name).get(
+        "shared_preload_libraries", "")
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def apply_preload(executor, plan, node, libraries, node_name=None):
+    """Extend a scope's shared_preload_libraries in the DCS.
+
+    Extended, never replaced: setting it to just the new library would unload
+    spock and take the cluster's replication with it. Compared against what the
+    DCS holds rather than what the server has loaded, so a re-run after a
+    configured-but-not-yet-restarted node does not write the same value again.
+
+    Returns (ok, value) where value is what the DCS should now say.
+    """
+    configured = configured_preload(executor, node, node_name=node_name)
+    if not configured:
+        # No DCS answer -- an older Patroni, or a scope that has not published
+        # its config. The running value is the only thing left to build on,
+        # and losing spock would be far worse than a redundant write.
+        configured = pg_extensions.preloaded_libraries(executor, plan, node)
+
+    wanted = list(configured)
+    for library in libraries:
+        if library not in wanted:
+            wanted.append(library)
+    value = ",".join(wanted)
+    if wanted == configured:
+        return True, value
+
+    binary = patronictl_binary(executor, node=node_name or node.name)
+    ok, output = executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} edit-config "
+        f"{shlex.quote(node.scope)} --force "
+        f"-s {shlex.quote('postgresql.parameters.shared_preload_libraries=' + value)}"
+        f" 2>&1",
+        node=node_name or node.name,
+    )
+    if not ok:
+        return False, output.strip()
+
+    # Verify rather than trust: an edit-config that is accepted and changes
+    # nothing would otherwise be reported as success, and the failure would
+    # surface much later as CREATE EXTENSION refusing to run.
+    now = configured_preload(executor, node, node_name=node_name)
+    if now and any(library not in now for library in libraries):
+        return False, (f"edit-config was accepted but the DCS still says "
+                       f"{', '.join(now) or 'nothing'}")
+    return True, value
+
+
+def preload_report(executor_for, plan, libraries):
+    """Per node: what the DCS says, and what the server has loaded.
+
+    The two differ exactly while a restart is outstanding, which is the state
+    this whole operation has to be able to describe.
+    """
+    rows = []
+    for node in plan.nodes:
+        executor = executor_for(node)
+        configured = configured_preload(executor, node)
+        loaded = pg_extensions.preloaded_libraries(executor, plan, node)
+        rows.append({
+            "node": node.name,
+            "configured": configured,
+            "loaded": loaded,
+            "missing_from_dcs": [l for l in libraries if l not in configured],
+            "not_loaded": [l for l in libraries if l not in loaded],
+        })
+    return rows
+
+
+def restart_member(executor, node, node_name=None, timeout=600):
+    """Restart one member through Patroni, so the DCS stays in step."""
+    binary = patronictl_binary(executor, node=node_name or node.name)
+    return executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} restart "
+        f"{shlex.quote(node.scope)} {shlex.quote(node.name)} --force",
+        node=node_name or node.name, timeout=timeout,
+    )
+
+
+def pending_restart(executor, plan, node, node_name=None):
+    """Settings that are set but not yet in force, as names.
+
+    logging_collector is the one that matters here: PostgreSQL reads it only at
+    startup, so a cluster that has been told to collect logs still will not
+    until it is restarted.
+    """
+    code, output = pg_server_management.psql(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        "SELECT name FROM pg_settings WHERE pending_restart;",
+        dbname=plan.db_name, node=node_name or node.name,
+        tuples_only=True, check=False,
+    )
+    if code != 0:
+        return []
+    return [line.strip() for line in output.splitlines() if line.strip()]
 
 
 def sync_settings(plan, node):
@@ -194,6 +390,20 @@ def build_config(plan, node):
         parameters = pg_server_management.spock_guc_parameters(
             plan.pg_version or plan.pg_major
         )
+        # Set here rather than after the fact: logging_collector is read at
+        # startup, so a node that bootstraps without it needs a restart to
+        # begin writing files at all.
+        parameters.update(logging_parameters(plan.log_parameters))
+        # An extension that refuses to be loaded on demand has to be named
+        # here, before the server first starts: shared_preload_libraries is
+        # read at startup, and adding it afterwards costs a restart.
+        extra = pg_extensions.preload_libraries(plan.pg_extensions)
+        if extra:
+            libraries = [parameters.get("shared_preload_libraries", "")]
+            libraries += [name for name in extra
+                          if name not in libraries[0].split(",")]
+            parameters["shared_preload_libraries"] = ",".join(
+                part for part in libraries if part)
         # Patroni renders postgresql.conf itself, so these belong in the DCS
         # parameters block rather than being appended to a file it will rewrite.
         dcs = {

@@ -4,6 +4,10 @@
 # by the deployment itself, so the control machine only needs SSH, YAML and a
 # web framework for the dashboard.
 
-paramiko>=3.4.0        # SSH transport for every remote command
+paramiko>=3.4.0        # SSH transport for every remote command.
+                       # Unpinned on purpose, so 4.x and 5.x are fine:
+                       # 4 removed DSSKey, which ssh_executor no longer
+                       # names, and tests/test_ssh_executor.py loads a
+                       # real key of each type the installed one has.
 PyYAML>=6.0.1          # renders Patroni configuration
 Flask>=3.0.0           # the live dashboard

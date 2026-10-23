@@ -30,9 +30,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from aspects import (health, inventory, patroni_management, pg_extensions,
                      spock_management, state)
+from regression import runner as regression
 from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
-from deployment import add_standby, cleanup, deploy_cluster, ops_cli, topology
+from deployment import (add_component, add_standby, cleanup, deploy_cluster,
+                        health_check, ops_cli, server_logging, topology)
 from reports import report_generator
 
 EXIT_OK = 0
@@ -441,6 +443,87 @@ def cmd_add_standby(args):
     return EXIT_FAIL
 
 
+def cmd_add_component(args):
+    """Add lolor, snowflake or ACE to a cluster that is already running."""
+    cluster = args.cluster or state.latest_cluster()
+    if not cluster:
+        print("No deployed clusters found.", file=sys.stderr)
+        return EXIT_FAIL
+
+    result = add_component.add(
+        cluster_name=cluster, components=",".join(_split_list(args.components)),
+        db_password=args.db_password, restart=args.restart,
+        inventory_path=args.inventory,
+    )
+    print(f"\nLogs: {result.get('log_dir')}")
+    if result["outcome"] == "failed":
+        print(f"Failed: {result.get('failure')}", file=sys.stderr)
+        return EXIT_FAIL
+    # "incomplete" is a real state, not a failure: everything was installed and
+    # configured, and a restart is all that is left.
+    return EXIT_OK
+
+
+def cmd_logging(args):
+    """Turn on PostgreSQL's own logging across a running cluster."""
+    cluster = args.cluster or state.latest_cluster()
+    if not cluster:
+        print("No deployed clusters found.", file=sys.stderr)
+        return EXIT_FAIL
+
+    overrides = {}
+    for pair in _split_list(args.set):
+        if "=" not in pair:
+            print(f"--set wants name=value, not {pair!r}", file=sys.stderr)
+            return EXIT_USAGE
+        key, value = pair.split("=", 1)
+        overrides[key.strip()] = value.strip()
+
+    result = server_logging.apply(
+        cluster_name=cluster, db_password=args.db_password,
+        restart=args.restart, overrides=overrides,
+        inventory_path=args.inventory,
+    )
+    print(f"\nLogs: {result.get('log_dir')}")
+    return EXIT_OK if result["outcome"] == "succeeded" else EXIT_FAIL
+
+
+def cmd_health_check(args):
+    """Run each named component's upstream regression suite."""
+    cluster = args.cluster or state.latest_cluster()
+    if not cluster:
+        print("No deployed clusters found. Deploy one before running its "
+              "regression suites.", file=sys.stderr)
+        return EXIT_FAIL
+    try:
+        components = regression.parse_components(args.components)
+    except ValueError as exc:
+        print(f"--health_check: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    if not components:
+        print("--health_check needs at least one component: "
+              f"{', '.join(regression.known_components())}, or 'all'",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    result = health_check.run(
+        cluster_name=cluster, components=components,
+        db_password=args.db_password, node_name=args.node,
+        keep_going=not args.stop_on_failure,
+        install_requirements=args.install_requirements,
+        tests=_split_list(args.tests),
+        test_timeout=args.test_timeout,
+        inventory_path=args.inventory,
+    )
+    if getattr(args, "json", False):
+        printable = dict(result)
+        printable.pop("plan", None)
+        print(json.dumps(printable, indent=2, default=str))
+
+    print(f"\nLogs: {result.get('log_dir')}")
+    return EXIT_OK if result["outcome"] == "succeeded" else EXIT_FAIL
+
+
 def cmd_remove(args):
     cluster = args.cluster or state.latest_cluster()
     if not cluster:
@@ -654,6 +737,73 @@ def build_parser():
     standby.add_argument("--sync-strict", action="store_true",
                          help="block writes when no standby is available")
     standby.set_defaults(func=cmd_add_standby)
+
+    # --- add-component ----------------------------------------------
+    component = subparsers.add_parser(
+        "add-component",
+        help="add lolor, snowflake or ACE to a cluster that is already running",
+    )
+    add_common(component)
+    component.add_argument(
+        "--components", "--add-component", action="append", required=True,
+        help="comma-separated: " + ", ".join(pg_extensions.known_names())
+             + ". Each may say how it arrives and what to build, as "
+               "name:mode[@ref]")
+    component.add_argument(
+        "--restart", action="store_true",
+        help="restart the nodes that need it, one at a time. lolor has to be "
+             "in shared_preload_libraries, which is read only at startup, so "
+             "without this it is installed and configured but not created")
+    component.set_defaults(func=cmd_add_component)
+
+    # --- logging --------------------------------------------------------
+    logging_parser = subparsers.add_parser(
+        "logging",
+        help="turn on PostgreSQL server logging on a running cluster",
+    )
+    add_common(logging_parser)
+    logging_parser.add_argument(
+        "--restart", action="store_true",
+        help="restart each node that needs it, one at a time. "
+             "logging_collector is read only at startup, so without this the "
+             "settings are stored but no files are written yet")
+    logging_parser.add_argument(
+        "--set", action="append",
+        help="override one setting, as name=value; repeatable")
+    logging_parser.set_defaults(func=cmd_logging)
+
+    # --- health-check -------------------------------------------------
+    checking = subparsers.add_parser(
+        "health-check",
+        help="run each component's own regression suite against the cluster",
+    )
+    add_common(checking)
+    checking.add_argument(
+        "--components", "--health_check", "--health-check", default="all",
+        help="comma-separated: "
+             + ", ".join(regression.known_components())
+             + ", or all [all]")
+    checking.add_argument("--node", help="Spock node to run against "
+                                         "[the first one]")
+    checking.add_argument(
+        "--install-requirements", action="store_true",
+        help="install what a suite needs but the host lacks, where that is a "
+             "package this tool can name (the -devel/-dev files pg_regress "
+             "comes with). Go and Docker are left alone")
+    checking.add_argument(
+        "--tests", action="append",
+        help="run only these cases of a suite that has named ones "
+             "(spock: basic, copy, sequence, ...); repeatable or "
+             "comma-separated. Ignored by suites that run as one unit")
+    checking.add_argument(
+        "--test-timeout", type=int, default=0,
+        help="seconds one case of a suite may take before it is called timed "
+             "out [300 for spock]. Some cases set up replication and wait for "
+             "it, so a slow host may need more")
+    checking.add_argument("--stop-on-failure", action="store_true",
+                          help="do not run the remaining suites after one fails")
+    checking.add_argument("--json", action="store_true")
+    checking.set_defaults(func=cmd_health_check)
 
     # --- remove -------------------------------------------------------
     remove = subparsers.add_parser("remove", help="tear a cluster down")

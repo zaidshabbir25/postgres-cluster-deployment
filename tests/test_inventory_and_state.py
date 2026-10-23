@@ -158,12 +158,81 @@ def test_the_password_is_not_written_to_disk(state_dir, deployed_plan):
     assert "secret" not in path.read_text(encoding="utf-8")
 
 
-def test_key_files_are_not_written_to_disk(state_dir, deployed_plan):
+def test_a_report_does_not_carry_key_paths(deployed_plan):
+    """to_dict renders the HTML reports, and those get shared around."""
+    deployed_plan.hosts[0].key_file = "/root/.ssh/id_rsa"
+
+    payload = deployed_plan.to_dict()
+
+    assert "key_file" not in payload["hosts"][0]
+    assert "id_rsa" not in json.dumps(payload)
+
+
+def test_saved_state_keeps_the_key_path_because_it_is_how_we_get_back_in(
+        state_dir, deployed_plan):
+    """Every day-two operation reloads the plan to reach the hosts. Without
+    the key path it falls back to the ssh agent, and on a machine with no
+    agent identities that fails with an error about the key rather than about
+    the state that lost it. The file is gitignored and holds a path, not a
+    key."""
     deployed_plan.hosts[0].key_file = "/root/.ssh/id_rsa"
 
     path = state.save(deployed_plan)
+    reloaded, _ = state.load(deployed_plan.cluster_name)
 
-    assert "id_rsa" not in path.read_text(encoding="utf-8")
+    assert "id_rsa" in path.read_text(encoding="utf-8")
+    assert reloaded.hosts[0].key_file == "/root/.ssh/id_rsa"
+
+
+def test_state_written_before_this_adopts_the_key_from_the_inventory(
+        state_dir, deployed_plan, inventory_file, tmp_path):
+    """So an existing cluster is reachable again without a redeploy."""
+    key = tmp_path / "from-inventory.pem"
+    key.write_text("key")
+    for host in deployed_plan.hosts:
+        host.key_file = None
+        host.local = False
+    state.save(deployed_plan)
+    path = inventory_file([
+        {"name": host.name, "host": host.address, "username": "rocky",
+         "key_file": str(key), "enabled": True}
+        for host in deployed_plan.hosts
+    ])
+
+    reloaded, _ = state.load(deployed_plan.cluster_name, inventory_path=path)
+
+    assert all(h.key_file == str(key) for h in reloaded.hosts)
+
+
+def test_a_key_already_in_the_state_is_not_overwritten_by_the_inventory(
+        state_dir, deployed_plan, inventory_file, tmp_path):
+    key = tmp_path / "from-inventory.pem"
+    key.write_text("key")
+    deployed_plan.hosts[0].local = False
+    deployed_plan.hosts[0].key_file = "/keys/from-state.pem"
+    state.save(deployed_plan)
+    path = inventory_file([
+        {"name": deployed_plan.hosts[0].name,
+         "host": deployed_plan.hosts[0].address, "username": "rocky",
+         "key_file": str(key), "enabled": True},
+    ])
+
+    reloaded, _ = state.load(deployed_plan.cluster_name, inventory_path=path)
+
+    assert reloaded.hosts[0].key_file == "/keys/from-state.pem"
+
+
+def test_a_missing_inventory_leaves_the_plan_alone(state_dir, deployed_plan):
+    """Operations can run without one; losing the plan to an exception there
+    would be worse than having no key path."""
+    for host in deployed_plan.hosts:
+        host.key_file = None
+    state.save(deployed_plan)
+
+    reloaded, _ = state.load(deployed_plan.cluster_name,
+                             inventory_path="/no/such/inventory.json")
+
+    assert all(h.key_file is None for h in reloaded.hosts)
 
 
 def test_listing_and_deleting(state_dir, deployed_plan):

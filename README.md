@@ -141,6 +141,29 @@ default and nothing sensitive touches the repo. Otherwise set
 `configuration/inventory.json` is gitignored too, because it names your
 machines.
 
+The key path is kept in the cluster's saved state, because that is how a later
+`--add-node`, `--add-component` or `--health_check` reaches the hosts again. It
+is left out of the HTML reports, which get shared around. A cluster whose state
+was written before this reads the path back from the inventory on load, so it
+stays reachable without a redeploy.
+
+**A key with a passphrase** is handled three ways, in this order:
+
+| | |
+|---|---|
+| `PG_CLUSTER_SSH_PASSPHRASE` | for an unattended run |
+| a prompt | asked once per key, not once per host, and only when there is a terminal to ask at |
+| the ssh agent | what an encrypted key falls back to, since a key with a passphrase is usually loaded into one already |
+
+Pressing Enter at the prompt chooses the agent. A scripted run is never
+prompted — a question with nobody to answer it would hang the deployment — so
+it goes straight to the agent.
+
+If none of those unlock it, the run stops immediately rather than retrying: the
+key will be just as encrypted on the third attempt, and the message names
+`ssh-add`, `PG_CLUSTER_SSH_PASSPHRASE` and `PG_CLUSTER_SSH_KEY` rather than
+repeating `Private key file is encrypted` three times.
+
 ### Rehearse without touching anything
 
 ```bash
@@ -641,6 +664,16 @@ Against a packaged server that also installs the `-devel`/`-dev` package, for
 the headers. Neither extension needs `shared_preload_libraries`, so neither
 costs a restart.
 
+**lolor must be preloaded.** It refuses to be loaded on demand — `CREATE
+EXTENSION`, `LOAD` and any call into it fail with `lolor must be loaded via
+"shared_preload_libraries"`, because the hook that protects large objects when
+the extension is dropped is only in every backend when the library is
+preloaded. A cluster that asks for lolor therefore gets it in
+`shared_preload_libraries` from its bootstrap block, alongside spock, before
+the server first starts. snowflake and ACE need no such thing. Adding it to a
+cluster that is already running costs a restart, and the error says which
+command to run.
+
 Building ACE is what its README documents: `go build -o ace ./cmd/ace/`, with
 the binary installed to `/usr/local/bin/ace`. It needs Go 1.26 or newer, which
 no distribution ships yet, so the official release tarball is unpacked into
@@ -665,7 +698,10 @@ sync.
 
 Both carry a GUC naming the node — `lolor.node` (1 to 2^28) and
 `snowflake.node` (1 to 1023) — and in a multi-master cluster those values must
-differ. snowflake's default is invalid on purpose: a node with the extension
+differ. lolor's range is small because the value is encoded in the four low
+bits of every large-object OID it generates, so a cluster of more than fifteen
+Spock nodes cannot use it, and a node named `n20` takes its number from its
+position rather than its name. snowflake's default is invalid on purpose: a node with the extension
 but not the setting raises on the first `nextval()`.
 
 Setting one is less direct than it looks. `lolor.node` does not exist until
@@ -693,8 +729,88 @@ nowhere, which is the one thing it exists to fix.
 
 Neither applies to ACE: it has no GUC and no tables of its own.
 
+### Adding one to a cluster that is already running
+
+```bash
+./pg_deploy_cluster.sh --add-component pgedge-ace
+./pg_deploy_cluster.sh --add-component pgedge-lolor,pgedge-snowflake --restart
+```
+
+Installed on every host, then created on every Spock node with its own
+identity, then — for lolor — its tables joined to the default replication set.
+The cluster's saved state records them, so a later `--add-node` gives the
+joining node the same thing. Naming a component the cluster already has checks
+it is complete rather than redoing it, and does not change the ref it was built
+from, so a half-finished run can simply be repeated.
+
+**lolor costs a restart.** It has to be in `shared_preload_libraries`, which
+PostgreSQL reads only at startup, so the sequence is: install → extend the
+preload list through the DCS, once per scope → restart → create. The preload
+list is *extended*, never replaced; setting it to just `lolor` would unload
+spock and take replication with it. Without `--restart` the run stops after
+configuring and reports `incomplete` with the commands to finish — everything
+is installed and a restart is all that is left, which reads differently from a
+failure. With it, nodes restart one at a time so the cluster keeps serving.
+
+Either way it ends with the state of every node, because "configured" and
+"loaded" are different answers and the gap between them is exactly an
+outstanding restart:
+
+```
+  NODE         IN THE DCS             LOADED NOW
+  ------------ ---------------------- ----------------------
+  n1           spock,lolor            spock,lolor
+  n2           spock,lolor            spock
+```
+
+`n2` there is configured but has not restarted, and `CREATE EXTENSION lolor`
+on it would still fail with `must be loaded via "shared_preload_libraries"`.
+The DCS column comes from `patronictl show-config`, not from `SHOW`: a `SHOW`
+answers what the running backend loaded, which for a restart-only setting is
+the old value, so it cannot tell "configured, waiting" from "never
+configured". Every *node* is checked, not every scope — a standby has to load
+the library too, or it cannot replay what its leader writes. After a restart
+the check runs again rather than assuming it worked.
+
+ACE and snowflake need no restart: ACE is a binary beside the cluster, and
+snowflake loads on demand.
+
 A node added later with `--add-node` picks up whatever the cluster asked for,
 from the same source and the same ref, and is given its own node number.
+
+For lolor there is an ordering that matters, and it is not the obvious one.
+Before the new node is configured, `--add-node` **probes the source node** for
+what is actually installed — not what the saved state records, since the two
+differ when an extension was created by hand — and makes sure the joining node
+preloads it. That has to be settled before the node starts, because
+`shared_preload_libraries` is read at startup, and because zodan's structure
+sync replays `CREATE EXTENSION lolor` on the new node, which fails without it.
+The preload is then verified before the join rather than discovered inside it:
+a failure during `add_node` leaves the node half-registered, while a failure
+before it leaves the node merely started.
+
+lolor is then **created before the join**, because zodan requires it:
+
+```
+Exiting add_node: Source node replicates lolor tables but database postgres on
+new node does not have the lolor extension installed. Please run
+CREATE EXTENSION lolor on the new node first.
+```
+
+Its prerequisite counts `spock.tables WHERE nspname = 'lolor' AND set_name IS
+NOT NULL` on the *source*, and if that is non-zero the joining node must have
+the extension. Having it is fine as long as the joiner's own `lolor` tables are
+empty — which a node that has just bootstrapped satisfies — so the data from
+the source can be synchronized into them.
+
+Every other extension is still created **after** the join, once the structure
+sync has had its say; the step afterwards finds whatever is already present and
+only assigns the node its identity.
+
+> The rule differs by Spock version. Spock 5's zodan refused a joining node
+> that had lolor at all; Spock 6's requires it when the source replicates lolor
+> tables. The check is read from the source node at run time rather than
+> assumed, so both behave correctly.
 
 ACE is installed but not configured — it needs a `pg_service.conf` with a
 `[cluster]` section and one `[cluster.node]` section per node, which it
@@ -806,6 +922,134 @@ standby.
 
 This is the same operation as `./pg_cluster_ctl.sh node add`, which also lets
 the name default to the next free `nN`.
+
+---
+
+## Component regression suites
+
+Once a cluster is up, each component's own upstream test suite can be run
+against it:
+
+```bash
+./pg_deploy_cluster.sh --health_check spock,lolor,snowflake,ace
+./pg_deploy_cluster.sh --health_check all --stop-on-failure
+./pg_cluster_ctl.sh ... # or: python3 -m deployment.cli health-check --components spock
+```
+
+Each component is fetched into its own directory under
+`/opt/pgedge/regression/<component>`, at the branch or tag **this cluster was
+built from** — a cluster on spock v5.0.5 is tested by v5.0.5's tests, because a
+newer suite tests behaviour the installed extension does not have. Each is
+reported separately, and one failing suite neither stops the next nor disturbs
+its artefacts.
+
+```
+COMPONENT  REF        RESULT   DETAIL
+---------  ---------  -------  ---------------------------------
+spock      v5.0.5     PASSED   23/23 passed
+lolor      v1.2.3     FAILED   1/1 passed, 1 failed
+snowflake  main       SKIPPED  needs the snowflake extension in postgres on n1
+ace        main       SKIPPED  needs a running Docker daemon (docker info failed)
+```
+
+### What each suite actually tests
+
+This differs per component and changes how a result should be read.
+
+| component | suite | runs against |
+|---|---|---|
+| spock | `tests/regress/sql` driven with psql | **the deployed cluster**, in scratch databases |
+| lolor | `sql/` + `expected/` via the same | **the deployed cluster** |
+| snowflake | `test/runner.py`, driven by `EDGE_*` | **the deployed cluster**, through a shim |
+| ace | `tests/integration/*.go` via `go test` | **its own containers** |
+
+### spock: written for a cluster that is already running
+
+Upstream's `tests/regress` cannot be used against a deployed cluster, and the
+reason is worth recording. Those cases build the thing they test: `init.sql`
+creates the nodes and the subscription, after creating passwordless roles
+`super` and `nonsuper` that only authenticate under the `trust` pg_hba upstream
+ships for its throwaway instance. Against a real cluster every Spock connection
+as `super` fails, `init` fails, and the thirty-eight cases after it fail with
+it. Making them pass would mean lowering a running cluster's authentication and
+leaving a superuser behind.
+
+So the cases in `regression/suites/spock/` are this tool's own, and they ask
+the opposite question: given a cluster that is already cross-wired and already
+serving, does replication work? **Nothing is created, initialised or torn
+down** — no instance, no node, no subscription, no role, no database, no change
+to `pg_hba`. The only objects that appear are a `spock_regress` schema and one
+table in it, dropped again by the last case.
+
+| case | asks |
+|---|---|
+| `01_extension` | Spock and dblink installed, version consistent, entry points present |
+| `02_nodes` | every node agrees on the membership, and every peer knows us |
+| `03_subscriptions` | every subscription is replicating, on every node |
+| `04_slots` | each node's outbound slots are active and not hoarding WAL |
+| `05_ddl_replication` | `replicate_ddl` reaches every peer |
+| `06_dml` | insert, update and delete each reach every peer |
+| `07_bidirectional` | a write on a peer comes back to us |
+| `08_cleanup` | the schema is gone again, everywhere |
+
+Three decisions make that work against a live cluster:
+
+* **Peers are found through `spock.node_interface`**, where the deployment
+  registered them and where Spock's own procedures read them. Nothing is passed
+  in, so a wrong DSN there is itself a fault — and `02_nodes` is the first case
+  to trip over it.
+* **Peers are read through dblink in one session**, not by reconnecting, so
+  nothing depends on psql's handling of a conninfo in a variable and nothing
+  needs a password the suite does not already have.
+* **Output is values only** (`psql -A -t`), and every case prints fixed
+  `name|true` lines. Detail naming a node is printed *only when that node is
+  wrong*, so a healthy cluster matches a fixed expected file and a broken one
+  produces a diff that says which node and why.
+
+Each case waits for replication rather than assuming it, with its own timeout
+(180s, `--test-timeout` to change it). A case that exceeds it is that case's
+failure: the ones already run keep their results and the rest are still tried.
+
+```bash
+./pg_deploy_cluster.sh --health_check spock
+./pg_deploy_cluster.sh --health_check spock --tests 01_extension,02_nodes
+```
+
+```
+spock: 8 case(s) on n1 as postgres, 180s each
+  [1/8] 01_extension                 ok
+  [2/8] 02_nodes                     ok
+  [3/8] 03_subscriptions             FAILED — local_all_replicating|false
+```
+
+lolor, snowflake and ace still run their upstream suites; only spock has cases
+of its own.
+
+A suite that cannot run here is **skipped with the reason**, not failed, and
+the reason names the fix where there is one:
+
+```
+spock  v5_STABLE  SKIPPED  needs pg_config --pgxs, from pgedge-postgresql17-devel
+                           — --install-requirements installs it
+```
+
+`pg_regress` ships with the server's development files, so a packaged host can
+have `psql` and the server and still not have it. `--install-requirements`
+installs that package and re-probes:
+
+```bash
+./pg_deploy_cluster.sh --health_check spock --install-requirements
+```
+
+It stops at packages this tool can name. Go and a Docker daemon — what ACE
+needs — are a larger decision than a `-devel` package and are left to you.
+
+The other skips have no automatic fix: an extension that was never created has
+nothing to test, and Docker installed but not running fails deep inside
+testcontainers with an error that never mentions the daemon.
+
+A run where every suite skipped reports `nothing ran` rather than `succeeded`.
+Nothing failing is not the same as something passing.
 
 ---
 
@@ -1045,6 +1289,45 @@ the page.
 > **No authentication.** Binding to `0.0.0.0` exposes your cluster topology and
 > health to anyone who can reach the port. Leave it on localhost and use an SSH
 > tunnel, or put it behind something that authenticates.
+
+---
+
+## PostgreSQL server logs
+
+Every node writes its own server log under its data directory:
+
+```
+/var/lib/pgedge/n1/log/postgresql-Mon.log
+/var/lib/pgedge/n2/log/postgresql-Mon.log
+```
+
+`log_directory` is deliberately relative, which PostgreSQL resolves against the
+data directory — so two nodes sharing a host keep separate logs instead of
+interleaving into one file. The `%a` filename with `log_truncate_on_rotation`
+and a one-day rotation gives the classic seven-day cycle, `postgresql-Mon.log`
+through `postgresql-Sun.log`, each overwritten when its day comes round again.
+No cron, no logrotate, and no unbounded growth.
+
+New clusters get this from their bootstrap block. For a cluster deployed
+before — which reports every logging setting as `source = default` and
+`logging_collector = off`, because Patroni never set them:
+
+```bash
+./pg_cluster_ctl.sh ... # or:
+python3 -m deployment.cli logging --cluster pgedge --restart
+```
+
+Two things make that more than writing a config file. Patroni renders
+`postgresql.conf` itself, so the settings go into the DCS through one
+`patronictl edit-config` **per scope** — a leader and its standbys are
+configured together. And `logging_collector` is read only at server startup:
+everything else takes a reload, but until each node restarts it is configured
+to collect logs and still will not. Without `--restart` the command says
+exactly which nodes are waiting and prints the command for each; with it, they
+are restarted one at a time so the cluster keeps serving.
+
+`--set name=value` overrides a single setting, for example
+`--set log_min_messages=info`.
 
 ---
 

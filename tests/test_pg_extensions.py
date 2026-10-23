@@ -15,6 +15,17 @@ from aspects.cluster_model import ClusterPlan, Host, Node, ROLE_SPOCK, ROLE_STAN
 from tests.conftest import FakeExecutor, RecordingLogger
 
 
+PRELOADED = {"SHOW shared_preload_libraries": (True, "spock,lolor\n")}
+
+
+def loaded(**extra):
+    """An executor on a node where the preloaded libraries are what a cluster
+    deployed with --pg-extensions would have."""
+    replies = dict(PRELOADED)
+    replies.update(extra)
+    return FakeExecutor(replies=replies)
+
+
 def node(name, role=ROLE_SPOCK, leader=None):
     return Node(name=name, role=role, host="h0", address="10.0.1.10",
                 pg_port=5432, restapi_port=8008, data_dir=f"/var/lib/pgedge/{name}",
@@ -281,7 +292,7 @@ def test_the_extension_is_created_before_its_guc_is_set():
     """CREATE EXTENSION does not load the library, but it does put it in place
     for the LOAD that follows."""
     plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
-    executor = FakeExecutor()
+    executor = loaded()
 
     pg_extensions.create_on_node(executor, plan, plan.node("n1"))
 
@@ -296,7 +307,7 @@ def test_a_refused_load_falls_back_to_setting_the_guc_alone(logger):
     """A packaged build may name its library something else; the GUC can still
     be recognised if that library happens to be preloaded."""
     plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
-    executor = FakeExecutor(replies={"LOAD": (False, "could not access file")})
+    executor = loaded(**{"LOAD": (False, "could not access file")})
 
     created = pg_extensions.create_on_node(executor, plan, plan.node("n1"),
                                            run_logger=logger)
@@ -312,7 +323,7 @@ def test_each_node_is_given_its_own_number():
                      pg_extensions=pg_extensions.parse("pgedge-lolor"))
     seen = []
     for target in plan.spock_nodes:
-        executor = FakeExecutor()
+        executor = loaded()
         pg_extensions.create_on_node(executor, plan, target)
         seen.append(next(c for c in executor.commands
                          if "ALTER SYSTEM SET lolor.node" in c))
@@ -565,7 +576,7 @@ def test_an_extension_already_present_is_left_alone():
     """A node joining an existing cluster receives the extension's tables
     through zodan's structure sync before this runs."""
     plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
-    executor = FakeExecutor(replies={"FROM pg_extension WHERE extname": (True, "1\n")})
+    executor = loaded(**{"FROM pg_extension WHERE extname": (True, "1\n")})
 
     created = pg_extensions.create_on_node(executor, plan, plan.node("n1"))
 
@@ -578,7 +589,7 @@ def test_an_extension_already_present_is_left_alone():
 
 def test_a_joining_node_still_gets_its_identity_when_creation_collides(logger):
     plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
-    executor = FakeExecutor(replies={
+    executor = loaded(**{
         "FROM pg_extension WHERE extname": (True, ""),
         "CREATE EXTENSION": (False, 'ERROR:  relation "pg_largeobject" already exists'),
     })
@@ -595,10 +606,249 @@ def test_a_fresh_deployment_still_fails_loudly_on_a_bad_create():
     """Strict is the default: on a fresh cluster there is no replicated
     structure to collide with, so a failure there is a real one."""
     plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
-    executor = FakeExecutor(replies={
+    executor = loaded(**{
         "FROM pg_extension WHERE extname": (True, ""),
         "CREATE EXTENSION": (False, "ERROR:  could not open extension control file"),
     })
 
     with pytest.raises(Exception):
         pg_extensions.create_on_node(executor, plan, plan.node("n1"))
+
+
+# ---------------------------------------------------------------------------
+# shared_preload_libraries
+# ---------------------------------------------------------------------------
+
+
+def test_lolor_must_be_preloaded_and_snowflake_need_not_be():
+    """lolor refuses to be loaded on demand: the hook that protects large
+    objects when the extension is dropped is only in every backend when the
+    library is preloaded."""
+    assert pg_extensions.CATALOG["lolor"].preload is True
+    assert pg_extensions.CATALOG["snowflake"].preload is False
+    assert pg_extensions.CATALOG["ace"].preload is False
+
+
+def test_the_preload_list_covers_only_what_needs_it():
+    selections = pg_extensions.parse("pgedge-lolor,pgedge-snowflake,pgedge-ace")
+
+    assert pg_extensions.preload_libraries(selections) == ["lolor"]
+    assert pg_extensions.preload_libraries([]) == []
+
+
+def test_a_cluster_asking_for_lolor_preloads_it_from_the_start():
+    """shared_preload_libraries is read at startup, so adding it afterwards
+    costs a restart — and the deployment creates the extension in the same
+    run that bootstraps the server."""
+    from aspects import patroni_management
+
+    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
+    config = patroni_management.build_config(plan, plan.node("n1"))
+    libraries = config["bootstrap"]["dcs"]["postgresql"]["parameters"][
+        "shared_preload_libraries"]
+
+    assert "spock" in libraries and "lolor" in libraries
+
+
+def test_spock_is_still_preloaded_when_nothing_else_is_asked_for():
+    from aspects import patroni_management
+
+    plan = plan_with()
+    config = patroni_management.build_config(plan, plan.node("n1"))
+
+    assert config["bootstrap"]["dcs"]["postgresql"]["parameters"][
+        "shared_preload_libraries"] == "spock"
+
+
+def test_creating_lolor_without_the_preload_says_how_to_fix_it():
+    """Otherwise this surfaces as psql's own message, which names the problem
+    but not where this cluster configures it."""
+    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
+    executor = FakeExecutor(replies={
+        "SHOW shared_preload_libraries": (True, "spock\n"),
+    })
+
+    with pytest.raises(RuntimeError, match="not in shared_preload_libraries"):
+        pg_extensions.create_on_node(executor, plan, plan.node("n1"))
+
+    assert not any("CREATE EXTENSION" in c for c in executor.commands)
+
+
+def test_the_suggested_setting_keeps_what_is_already_loaded():
+    """Replacing the value rather than extending it would unload spock."""
+    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
+    executor = FakeExecutor(replies={
+        "SHOW shared_preload_libraries": (True, "spock\n"),
+    })
+
+    with pytest.raises(RuntimeError) as raised:
+        pg_extensions.create_on_node(executor, plan, plan.node("n1"))
+
+    assert "shared_preload_libraries=spock,lolor" in str(raised.value)
+
+
+# ---------------------------------------------------------------------------
+# lolor's node range
+# ---------------------------------------------------------------------------
+
+
+def test_lolors_node_range_is_the_four_bits_it_actually_has():
+    """It is encoded in the four low bits of every large-object OID, so 1-15."""
+    assert pg_extensions.CATALOG["lolor"].guc_max == 15
+
+
+def test_a_cluster_too_large_for_lolor_is_refused():
+    selections = pg_extensions.parse("pgedge-lolor")
+
+    with pytest.raises(ValueError, match="1..15"):
+        pg_extensions.validate(selections, "17", node_count=16)
+    assert pg_extensions.validate(selections, "17", node_count=15) is True
+
+
+def test_a_node_name_outside_the_range_falls_back_to_position():
+    """n20 would otherwise be handed 20, which lolor cannot store."""
+    plan = plan_with(("n14", "n20"))
+
+    ids = [pg_extensions.node_id(plan, n) for n in plan.spock_nodes]
+
+    assert ids == [1, 2]
+    assert all(value <= 15 for value in ids)
+
+
+def test_names_inside_the_range_still_use_their_number():
+    plan = plan_with(("n1", "n3"))
+
+    assert [pg_extensions.node_id(plan, n) for n in plan.spock_nodes] == [1, 3]
+
+
+# ---------------------------------------------------------------------------
+# a node joining a cluster that already has lolor
+# ---------------------------------------------------------------------------
+
+
+def test_what_a_provider_actually_has_is_probed_not_assumed():
+    """The plan says what was asked for; the provider says what is there, and
+    the two differ when an extension was created by hand or the state predates
+    it being recorded."""
+    plan = plan_with()
+    executor = FakeExecutor(replies={
+        "FROM pg_extension\nWHERE extname IN": (True, "lolor,snowflake\n"),
+        "FROM pg_extension": (True, "lolor,snowflake\n"),
+    })
+
+    assert pg_extensions.installed_on(executor, plan, plan.node("n1")) == \
+        ["lolor", "snowflake"]
+
+
+def test_a_provider_with_nothing_installed_reports_nothing():
+    plan = plan_with()
+    executor = FakeExecutor(replies={"FROM pg_extension": (True, "\n")})
+
+    assert pg_extensions.installed_on(executor, plan, plan.node("n1")) == []
+
+
+def test_a_selection_can_be_built_for_something_already_there():
+    assert pg_extensions.selection_for("lolor") == {
+        "name": "lolor", "mode": "packages", "ref": ""}
+    assert pg_extensions.selection_for("pgedge-lolor")["name"] == "lolor"
+
+
+def test_the_preloaded_libraries_of_a_node_can_be_read():
+    plan = plan_with()
+    executor = FakeExecutor(replies={
+        "SHOW shared_preload_libraries": (True, "spock, lolor\n")})
+
+    assert pg_extensions.preloaded_libraries(executor, plan, plan.node("n1")) \
+        == ["spock", "lolor"]
+
+
+def test_add_node_decides_the_preload_before_it_configures_the_node():
+    """shared_preload_libraries is read at startup, so it has to be settled
+    before the node is written and started — not after it has joined."""
+    from pathlib import Path
+
+    source = Path("deployment/add_node.py").read_text()
+    probe = source.index("pg_extensions.installed_on(")
+    config = source.index("patroni_management.write_config(executor, plan, node")
+    crosswire = source.index("spock_management.add_node(")
+
+    assert probe < config < crosswire
+
+
+def test_add_node_checks_the_preload_before_joining_not_during():
+    """A failure inside zodan leaves the node half-registered; a failure before
+    it leaves the node merely started."""
+    from pathlib import Path
+
+    source = Path("deployment/add_node.py").read_text()
+    check = source.index("pg_extensions.preloaded_libraries(executor, plan, node)")
+    crosswire = source.index("spock_management.add_node(")
+
+    assert check < crosswire
+
+
+def test_what_the_join_requires_is_created_before_it():
+    """zodan refuses a node that lacks an extension whose tables the source
+    replicates: "Please run CREATE EXTENSION lolor on the new node first"."""
+    from pathlib import Path
+
+    source = Path("deployment/add_node.py").read_text()
+    prejoin = source.index("pg_extensions.required_before_join(")
+    crosswire = source.index("spock_management.add_node(")
+
+    assert prejoin < crosswire
+
+
+def test_everything_else_is_still_created_after_the_join():
+    """The structure sync has its say first; the step afterwards finds what it
+    created and only assigns identities."""
+    from pathlib import Path
+
+    source = Path("deployment/add_node.py").read_text()
+    crosswire = source.index("spock_management.add_node(")
+    after = source.index("pg_extensions.create_on_node(", crosswire)
+
+    assert crosswire < after
+
+
+def test_a_source_replicating_lolor_tables_makes_it_required():
+    """spock.tables with a set_name is what zodan itself counts."""
+    plan = plan_with()
+    executor = loaded(**{
+        "FROM pg_extension WHERE extname": (True, "1\n"),
+        "FROM spock.tables WHERE nspname": (True, "2\n"),
+    })
+
+    needed = pg_extensions.required_before_join(executor, plan, plan.node("n1"))
+
+    assert [item["name"] for item in needed] == ["lolor"]
+
+
+def test_a_source_without_lolor_requires_nothing_before_the_join():
+    plan = plan_with()
+    executor = loaded(**{"FROM pg_extension WHERE extname": (True, "")})
+
+    assert pg_extensions.required_before_join(executor, plan,
+                                              plan.node("n1")) == []
+
+
+def test_the_replicated_table_count_is_read_from_spock_not_guessed():
+    plan = plan_with()
+    executor = loaded(**{"FROM spock.tables WHERE nspname": (True, "3\n")})
+
+    assert pg_extensions.replicated_tables_in(
+        executor, plan, plan.node("n1"), "lolor") == 3
+
+
+def test_an_unreadable_count_is_treated_as_none():
+    plan = plan_with()
+    executor = loaded(**{"FROM spock.tables WHERE nspname": (False, "boom")})
+
+    assert pg_extensions.replicated_tables_in(
+        executor, plan, plan.node("n1"), "lolor") == 0
+
+
+def test_only_lolor_is_required_before_a_join():
+    """snowflake generates ids and ACE runs outside the database; neither has
+    tables the source replicates."""
+    assert pg_extensions.JOIN_REQUIRES == ("lolor",)

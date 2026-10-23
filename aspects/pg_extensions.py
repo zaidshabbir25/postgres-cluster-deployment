@@ -73,6 +73,7 @@ class ExtensionSpec:
     build_command: str = ""        # for a tool: what produces the binary
     binary: str = ""               # for a tool: the file it produces
     module: str = ""               # shared library defining the GUC; default: name
+    preload: bool = False          # must be in shared_preload_libraries
     guc: str = ""                  # per-node identity GUC, if it has one
     guc_max: int = 0
     min_pg_major: int = 0
@@ -107,8 +108,15 @@ CATALOG = {
     "lolor": ExtensionSpec(
         name="lolor",
         repo="https://github.com/pgEdge/lolor.git",
+        # lolor refuses to be loaded on demand: CREATE EXTENSION, LOAD and any
+        # call into it fail with 'must be loaded via "shared_preload_libraries"'.
+        # The hook that protects large objects when the extension is dropped is
+        # only in place in every backend when the library is preloaded.
+        preload=True,
         guc="lolor.node",
-        guc_max=2 ** 28,
+        # Four low bits of every large-object OID lolor generates, so 1-15 and
+        # no more. 0 means unset.
+        guc_max=15,
         min_pg_major=16,
         summary="large objects that replicate — stores them in the lolor "
                 "schema instead of the catalog, so Spock can carry them",
@@ -279,6 +287,88 @@ def validate(selections, pg_major, node_count=0):
 # ---------------------------------------------------------------------------
 
 
+def installed_on(executor, plan, node):
+    """Which catalogue extensions this node actually has, by probe.
+
+    The saved plan says what was asked for. This says what is there, and the
+    two can differ: an extension created by hand, or a cluster whose state
+    predates it being recorded. For a node about to join, the second question
+    is the one that matters — what it has to be able to replay.
+    """
+    found = pg_server_management.scalar(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        "SELECT string_agg(extname, ',' ORDER BY extname) FROM pg_extension "
+        "WHERE extname IN ("
+        + ", ".join("'" + name + "'" for name in sorted(CATALOG))
+        + ");",
+        dbname=plan.db_name, node=node.name, default="",
+    )
+    return [name for name in (found or "").split(",") if name]
+
+
+#: Extensions that must already exist on a node before zodan will let it join,
+#: when the source replicates their tables. zodan checks this itself and
+#: refuses with "Please run CREATE EXTENSION <name> on the new node first".
+JOIN_REQUIRES = ("lolor",)
+
+
+def replicated_tables_in(executor, plan, node, schema):
+    """How many of this schema's tables the node has in a replication set.
+
+    The same question zodan's prerequisite asks of the source before it will
+    let a node join: if the answer is non-zero, the joining node needs the
+    extension that owns them.
+    """
+    value = pg_server_management.scalar(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        f"SELECT count(*) FROM spock.tables WHERE nspname = "
+        f"'{schema}' AND set_name IS NOT NULL;",
+        dbname=plan.db_name, node=node.name, default="0",
+    )
+    try:
+        return int((value or "0").strip() or 0)
+    except ValueError:
+        return 0
+
+
+def required_before_join(executor, plan, source, selections=None):
+    """Selections that have to be created on a joiner before it can join.
+
+    Decided from the source, not from the plan: what matters is whether the
+    source is replicating those tables, which is exactly what zodan looks at.
+    """
+    selections = selections if selections is not None else selections_of(plan)
+    known = {item["name"]: item for item in selections}
+    needed = []
+    for name in JOIN_REQUIRES:
+        spec = CATALOG.get(name)
+        if spec is None or not is_created(executor, plan, source, spec):
+            continue
+        # Replicating its tables makes it mandatory; merely having it installed
+        # makes it worth matching, and zodan allows that as long as the
+        # joiner's own tables are empty -- which a node that has just
+        # bootstrapped satisfies.
+        needed.append(known.get(name) or selection_for(name))
+    return needed
+
+
+def selection_for(name, mode=MODE_PACKAGES, ref=""):
+    """A selection entry for one extension, for a cluster that has it already."""
+    key = canonical(name)
+    return {"name": key, "mode": mode, "ref": ref}
+
+
+def preload_libraries(selections):
+    """Libraries that must be in shared_preload_libraries for these to work.
+
+    Returned in a stable order so the rendered parameter does not churn between
+    runs and show up as a configuration change that is not one.
+    """
+    return sorted(CATALOG[item["name"]].library
+                  for item in selections or []
+                  if CATALOG[item["name"]].preload)
+
+
 def node_id(plan, node):
     """The value for this node's identity GUCs.
 
@@ -309,7 +399,14 @@ def node_id(plan, node):
 
     numbers = {n.name: _number_in(n.name) for n in members}
     usable = [value for value in numbers.values() if value]
-    if len(usable) == len(members) and len(set(usable)) == len(members):
+    # lolor's range is 1-15, so a cluster of n14, n15, n20 cannot take its ids
+    # from the names however convenient that would be. Position is always
+    # within range, because validate() refuses a cluster larger than the range.
+    ceiling = min((CATALOG[key].guc_max for key in CATALOG
+                   if CATALOG[key].guc_max), default=0)
+    in_range = not ceiling or all(value <= ceiling for value in usable)
+    if (len(usable) == len(members) and len(set(usable)) == len(members)
+            and in_range):
         return numbers[target.name]
 
     for index, member in enumerate(members, start=1):
@@ -544,6 +641,27 @@ def build_on_host(executor, plan, host, selections, run_logger=None):
 # ---------------------------------------------------------------------------
 
 
+def preloaded_libraries(executor, plan, node):
+    value = pg_server_management.scalar(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        "SHOW shared_preload_libraries;", dbname=plan.db_name,
+        node=node.name, default="",
+    )
+    return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+
+def _is_preloaded(executor, plan, node, spec):
+    return spec.library in preloaded_libraries(executor, plan, node)
+
+
+def _preload_target(executor, plan, node, spec):
+    """What shared_preload_libraries should say, keeping what is already there."""
+    libraries = preloaded_libraries(executor, plan, node)
+    if spec.library not in libraries:
+        libraries.append(spec.library)
+    return ",".join(libraries)
+
+
 def is_created(executor, plan, node, spec):
     """Is this extension already registered in the node's database?"""
     found = pg_server_management.scalar(
@@ -588,6 +706,20 @@ def create_on_node(executor, plan, node, selections=None, run_logger=None,
             # A tool runs beside the cluster, not inside it. There is nothing
             # to create in a database and no node identity to give it.
             continue
+
+        if spec.preload and not _is_preloaded(executor, plan, node, spec):
+            raise RuntimeError(
+                f"{node.name}: {spec.name} is not in shared_preload_libraries, "
+                f"and it refuses to be loaded on demand. A cluster deployed "
+                f"with --pg-extensions gets this from its bootstrap block; one "
+                f"that did not needs the setting added and the node restarted:"
+                f"\n  patronictl -c {node.config_file} edit-config "
+                f"{node.scope} --force -s "
+                f"postgresql.parameters.shared_preload_libraries="
+                f"{_preload_target(executor, plan, node, spec)}"
+                f"\n  patronictl -c {node.config_file} restart {node.scope} "
+                f"{node.name} --force"
+            )
 
         if not is_created(executor, plan, node, spec):
             statement = f"CREATE EXTENSION IF NOT EXISTS {spec.name};"

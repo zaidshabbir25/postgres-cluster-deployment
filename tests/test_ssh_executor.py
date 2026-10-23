@@ -122,3 +122,318 @@ def test_localhost_without_the_flag_still_goes_over_ssh():
     assert isinstance(executor, SSHExecutor)
     assert not isinstance(executor, LocalExecutor)
     assert executor.username == "rocky"
+
+
+# ---------------------------------------------------------------------------
+# loading SSH keys across paramiko versions
+# ---------------------------------------------------------------------------
+
+
+def test_only_key_types_this_paramiko_has_are_tried():
+    """paramiko 4 removed DSSKey. Naming it in a literal tuple raises
+    AttributeError while the tuple is built — before a single key is tried —
+    so an Ed25519 key that would load fine failed with "module 'paramiko' has
+    no attribute 'DSSKey'"."""
+    import paramiko
+
+    from aspects.ssh_executor import SSHExecutor
+
+    classes = SSHExecutor._key_classes()
+
+    assert classes, "no key types at all"
+    assert all(getattr(paramiko, c.__name__, None) is c for c in classes)
+    if not hasattr(paramiko, "DSSKey"):
+        assert "DSSKey" not in [c.__name__ for c in classes]
+
+
+def test_a_missing_key_type_does_not_stop_the_others(monkeypatch):
+    """The failure mode this guards against: one absent attribute taking out
+    every key type, including the ones that are present."""
+    import paramiko
+
+    from aspects.ssh_executor import SSHExecutor
+
+    monkeypatch.delattr(paramiko, "ECDSAKey", raising=False)
+
+    names = [c.__name__ for c in SSHExecutor._key_classes()]
+
+    assert "ECDSAKey" not in names
+    assert "Ed25519Key" in names and "RSAKey" in names
+
+
+@pytest.mark.parametrize("key_type", ["ed25519", "rsa", "ecdsa"])
+def test_a_real_key_of_each_supported_type_loads(tmp_path, key_type):
+    """Generated here rather than fixtured, so this follows whatever the
+    installed OpenSSH and paramiko agree on."""
+    import shutil
+    import subprocess
+
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen is required to make a key to load")
+
+    from aspects.ssh_executor import SSHExecutor
+
+    path = tmp_path / f"id_{key_type}"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", key_type, "-N", "", "-f", str(path)],
+        check=True, capture_output=True,
+    )
+
+    key = SSHExecutor._load_key(path)
+
+    assert key.get_name()
+
+
+def test_an_unreadable_key_says_what_each_type_complained_about(tmp_path):
+    from aspects.ssh_executor import SSHExecutor
+
+    path = tmp_path / "notakey"
+    path.write_text("this is not a private key")
+
+    with pytest.raises(ValueError, match="Unsupported or encrypted SSH key"):
+        SSHExecutor._load_key(path)
+
+
+# ---------------------------------------------------------------------------
+# keys with a passphrase
+# ---------------------------------------------------------------------------
+
+
+def make_key(tmp_path, passphrase=""):
+    """A real key, so these test what paramiko actually does with one."""
+    import shutil
+    import subprocess
+
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen is required to make a key")
+
+    path = tmp_path / "id_ed25519"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", passphrase, "-f", str(path)],
+        check=True, capture_output=True,
+    )
+    return path
+
+
+def test_an_encrypted_key_is_distinguished_from_an_unreadable_one(tmp_path):
+    """"Needs a passphrase" and "not a key I understand" lead somewhere
+    different, so the caller has to be able to tell them apart."""
+    import paramiko
+
+    from aspects.ssh_executor import SSHExecutor
+
+    path = make_key(tmp_path, passphrase="hunter2")
+
+    with pytest.raises(paramiko.PasswordRequiredException):
+        SSHExecutor._load_key(path)
+
+
+def test_an_encrypted_key_loads_when_the_passphrase_is_given(tmp_path):
+    from aspects.ssh_executor import SSHExecutor
+
+    path = make_key(tmp_path, passphrase="hunter2")
+
+    assert SSHExecutor._load_key(path, "hunter2").get_name()
+
+
+def test_the_passphrase_comes_from_the_environment_for_an_unattended_run(
+        monkeypatch):
+    from aspects.ssh_executor import SSHExecutor
+
+    monkeypatch.setenv("PG_CLUSTER_SSH_PASSPHRASE", "from-env")
+
+    assert SSHExecutor.passphrase_for("/any/key") == "from-env"
+
+
+def test_a_scripted_run_is_never_prompted(monkeypatch):
+    """A prompt with no terminal behind it would hang the run; falling back to
+    the agent is the useful thing to do instead."""
+    from aspects import ssh_executor
+    from aspects.ssh_executor import SSHExecutor
+
+    monkeypatch.delenv("PG_CLUSTER_SSH_PASSPHRASE", raising=False)
+    monkeypatch.setattr(ssh_executor.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(ssh_executor, "_PASSPHRASES", {})
+    monkeypatch.setattr(ssh_executor.getpass, "getpass",
+                        lambda *a, **k: pytest.fail("should not have prompted"))
+
+    assert SSHExecutor.passphrase_for("/any/key") is None
+
+
+def test_one_key_is_asked_about_once_however_many_hosts_use_it(monkeypatch):
+    """A twenty-host inventory shares one key far more often than not."""
+    from aspects import ssh_executor
+    from aspects.ssh_executor import SSHExecutor
+
+    monkeypatch.delenv("PG_CLUSTER_SSH_PASSPHRASE", raising=False)
+    monkeypatch.setattr(ssh_executor.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(ssh_executor, "_PASSPHRASES", {})
+    asked = []
+
+    def prompt(message=""):
+        asked.append(message)
+        return "secret"
+
+    monkeypatch.setattr(ssh_executor.getpass, "getpass", prompt)
+
+    first = SSHExecutor.passphrase_for("/same/key")
+    second = SSHExecutor.passphrase_for("/same/key")
+
+    assert (first, second) == ("secret", "secret")
+    assert len(asked) == 1
+
+
+def test_declining_the_prompt_is_remembered_too(monkeypatch):
+    """Pressing Enter means "use the agent", and asking again every host would
+    make that answer unusable."""
+    from aspects import ssh_executor
+    from aspects.ssh_executor import SSHExecutor
+
+    monkeypatch.delenv("PG_CLUSTER_SSH_PASSPHRASE", raising=False)
+    monkeypatch.setattr(ssh_executor.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(ssh_executor, "_PASSPHRASES", {})
+    asked = []
+    monkeypatch.setattr(ssh_executor.getpass, "getpass",
+                        lambda *a, **k: asked.append(1) or "")
+
+    assert SSHExecutor.passphrase_for("/k") is None
+    assert SSHExecutor.passphrase_for("/k") is None
+    assert len(asked) == 1
+
+
+def test_an_encrypted_key_with_no_passphrase_falls_back_to_the_agent(
+        tmp_path, monkeypatch):
+    """A key with a passphrase is usually loaded into an agent already, which
+    is the whole reason for having one."""
+    from aspects import ssh_executor
+    from aspects.ssh_executor import SSHExecutor
+
+    monkeypatch.delenv("PG_CLUSTER_SSH_PASSPHRASE", raising=False)
+    monkeypatch.setattr(ssh_executor.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(ssh_executor, "_PASSPHRASES", {})
+    path = make_key(tmp_path, passphrase="hunter2")
+    seen = {}
+
+    class FakeClient:
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **kwargs):
+            seen.update(kwargs)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ssh_executor.paramiko, "SSHClient", FakeClient)
+
+    SSHExecutor(name="h", host="10.0.0.1", username="rocky",
+                key_file=str(path)).connect()
+
+    assert seen["pkey"] is None, "no key was loaded"
+    assert seen["allow_agent"] is True and seen["look_for_keys"] is True
+
+
+def test_an_encrypted_key_the_agent_cannot_unlock_is_not_retried(
+        tmp_path, monkeypatch):
+    """Retrying cannot help — the key is just as encrypted next time — and
+    three identical failures only delay the message."""
+    import paramiko
+
+    from aspects import ssh_executor
+    from aspects.ssh_executor import SSHExecutor
+
+    monkeypatch.delenv("PG_CLUSTER_SSH_PASSPHRASE", raising=False)
+    monkeypatch.setattr(ssh_executor.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(ssh_executor, "_PASSPHRASES", {})
+    path = make_key(tmp_path, passphrase="hunter2")
+    attempts = []
+
+    class FakeClient:
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **kwargs):
+            attempts.append(1)
+            raise paramiko.PasswordRequiredException("encrypted")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ssh_executor.paramiko, "SSHClient", FakeClient)
+
+    with pytest.raises(ConnectionError) as raised:
+        SSHExecutor(name="h", host="10.0.0.1", username="rocky",
+                    key_file=str(path)).connect()
+
+    assert len(attempts) == 1, "it should not have retried"
+    message = str(raised.value)
+    assert "PG_CLUSTER_SSH_PASSPHRASE" in message
+    assert "ssh-add" in message
+
+
+def test_a_missing_key_says_where_to_point_it(tmp_path):
+    from aspects.ssh_executor import SSHExecutor
+
+    with pytest.raises(FileNotFoundError, match="PG_CLUSTER_SSH_KEY"):
+        SSHExecutor(name="h", host="10.0.0.1", username="rocky",
+                    key_file=str(tmp_path / "absent")).connect()
+
+
+# ---------------------------------------------------------------------------
+# try_run tolerates all of it
+# ---------------------------------------------------------------------------
+
+
+def executor_whose_commands(raise_this):
+    """An executor whose every command fails in the given way."""
+    from aspects.ssh_executor import SSHExecutor
+
+    executor = SSHExecutor(name="h", host="10.0.0.1", username="rocky")
+
+    def boom(*args, **kwargs):
+        raise raise_this
+
+    executor.exec_run = boom
+    return executor
+
+
+def test_a_timed_out_command_is_a_false_not_a_traceback():
+    """"Tolerating failure" has to mean tolerating all of it: a timeout used
+    to raise straight through and out of whatever best-effort loop was calling
+    it, which is how a cleanup died on the one host that was broken."""
+    executor = executor_whose_commands(
+        TimeoutError("[10.0.0.1] timed out after 600s: systemctl list-unit-files"))
+
+    ok, output = executor.try_run("systemctl list-unit-files")
+
+    assert ok is False
+    assert "timed out" in output
+
+
+def test_a_dead_transport_is_a_false_too():
+    import paramiko
+
+    executor = executor_whose_commands(paramiko.SSHException("channel closed"))
+
+    ok, output = executor.try_run("anything")
+
+    assert ok is False
+    assert "channel closed" in output
+
+
+def test_a_socket_error_is_a_false_too():
+    executor = executor_whose_commands(OSError("broken pipe"))
+
+    ok, output = executor.try_run("anything")
+
+    assert ok is False
+    assert "broken pipe" in output
+
+
+def test_run_still_raises_because_it_is_the_strict_one():
+    """Callers choose: run() for something the deployment depends on, try_run
+    for best-effort work."""
+    executor = executor_whose_commands(TimeoutError("timed out"))
+
+    with pytest.raises(TimeoutError):
+        executor.run("anything")

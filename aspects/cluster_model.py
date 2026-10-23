@@ -36,9 +36,19 @@ class Host:
     bin_dir: str = ""
     is_etcd_member: bool = False
 
-    def to_dict(self):
+    def to_dict(self, redact_key=True):
+        """Serialise this host.
+
+        `key_file` is dropped by default, because the same method renders the
+        HTML reports and those get shared around. Saved state is the exception
+        and asks for it: every day-two operation reloads the plan to reach the
+        hosts, and without the key path it falls back to the ssh agent, which
+        on a machine that has none fails with an error about the key rather
+        than about the state that lost it.
+        """
         payload = asdict(self)
-        payload.pop("key_file", None)  # never persist key paths into reports
+        if redact_key:
+            payload.pop("key_file", None)
         return payload
 
 
@@ -142,6 +152,10 @@ class ClusterPlan:
 
     source_build: Dict[str, Any] = field(default_factory=dict)
 
+    # Server logging settings, overriding patroni_management.LOG_PARAMETERS.
+    # Empty means the defaults, which is what almost every cluster wants.
+    log_parameters: Dict[str, Any] = field(default_factory=dict)
+
     # Optional extensions, as [{"name", "mode", "ref"}, ...]. Empty is the
     # default and means the deployment never touches them. See
     # aspects/pg_extensions.py for what the entries mean.
@@ -191,9 +205,9 @@ class ClusterPlan:
     # Serialisation
     # ------------------------------------------------------------------
 
-    def to_dict(self):
+    def to_dict(self, redact_key=True):
         payload = asdict(self)
-        payload["hosts"] = [h.to_dict() for h in self.hosts]
+        payload["hosts"] = [h.to_dict(redact_key=redact_key) for h in self.hosts]
         payload["nodes"] = [n.to_dict() for n in self.nodes]
         # The password is a deployment input, not something to persist into a
         # report or state file that gets shared around.

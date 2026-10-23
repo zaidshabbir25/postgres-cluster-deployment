@@ -75,8 +75,6 @@ def spock_branch_for(plan, node):
 def remove(cluster_name, node_name, db_password=None, wipe_data=False,
            drain_timeout=300, force=False, run_logger=None):
     """Remove one node — Spock or standby — and return a result dict."""
-    plan, metadata = state.load(cluster_name, db_password=db_password)
-    plan.db_password = state.resolve_password(plan, explicit=db_password)
 
     log = run_logger or RunLogger(new_run_id(f"{cluster_name}-remove-node"))
     executors = {}
@@ -84,6 +82,12 @@ def remove(cluster_name, node_name, db_password=None, wipe_data=False,
     warnings = []
 
     try:
+        # Inside the try: a cluster with no saved state is an ordinary
+        # refusal with a message, not a traceback out of a function that
+        # promises to return a result dict.
+        plan, metadata = state.load(cluster_name, db_password=db_password)
+        plan.db_password = state.resolve_password(plan, explicit=db_password)
+
         try:
             node = plan.node(node_name)
         except KeyError:

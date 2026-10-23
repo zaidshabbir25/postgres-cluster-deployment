@@ -94,8 +94,6 @@ def add(cluster_name, leader_name, host_name=None, db_password=None,
     setting it earlier would make a strict scope refuse writes while the clone
     is still being taken.
     """
-    plan, metadata = state.load(cluster_name, db_password=db_password)
-    plan.db_password = state.resolve_password(plan, explicit=db_password)
 
     log = run_logger or RunLogger(new_run_id(f"{cluster_name}-add-standby"))
     executors = {}
@@ -103,6 +101,12 @@ def add(cluster_name, leader_name, host_name=None, db_password=None,
     warnings = []
 
     try:
+        # Inside the try: a cluster with no saved state is an ordinary
+        # refusal with a message, not a traceback out of a function that
+        # promises to return a result dict.
+        plan, metadata = state.load(cluster_name, db_password=db_password)
+        plan.db_password = state.resolve_password(plan, explicit=db_password)
+
         try:
             leader = plan.node(leader_name)
         except KeyError:

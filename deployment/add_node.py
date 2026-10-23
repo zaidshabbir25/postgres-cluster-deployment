@@ -217,8 +217,6 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
         inventory_path=None, db_password=None, run_logger=None,
         skip_verify=False, pg_version="", spock_major="", spock_branch=""):
     """Add one Spock node. Returns a result dict; never raises."""
-    plan, metadata = state.load(cluster_name, db_password=db_password)
-    plan.db_password = state.resolve_password(plan, explicit=db_password)
 
     log = run_logger or RunLogger(new_run_id(f"{cluster_name}-add-node"))
     executors = {}
@@ -229,6 +227,12 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
     registered = ""
 
     try:
+        # Inside the try: a cluster with no saved state is an ordinary
+        # refusal with a message, not a traceback out of a function that
+        # promises to return a result dict.
+        plan, metadata = state.load(cluster_name, db_password=db_password)
+        plan.db_password = state.resolve_password(plan, explicit=db_password)
+
         if not plan.spock_nodes:
             raise AddNodeError(
                 f"cluster {cluster_name!r} has no Spock nodes to join"
@@ -503,6 +507,30 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                              f"{info['pretty']} — PostgreSQL {node.pg_version} "
                              f"installed at {node.bin_dir}")
 
+        # --- 1a. what the providers actually run ----------------------
+        # The plan says what was asked for; the source node says what is there,
+        # and a joining node has to be able to replay whatever that is. lolor
+        # is the case that bites: zodan's structure sync emits CREATE EXTENSION
+        # lolor on the new node, and that fails unless the library is already
+        # in shared_preload_libraries — which is set at startup, so it has to
+        # be decided before the node is configured, not after it has joined.
+        source_executor = _executor_for(plan, source.host, executors, log)
+        present = pg_extensions.installed_on(source_executor, plan, source)
+        for found in present:
+            if any(item["name"] == found for item in plan.pg_extensions):
+                continue
+            plan.pg_extensions.append(pg_extensions.selection_for(found))
+            warnings.append(
+                f"{source.name} has {found} installed but the saved cluster "
+                f"state did not record it; {name} is being given it too"
+            )
+            log.warn(warnings[-1])
+
+        preload = pg_extensions.preload_libraries(plan.pg_extensions)
+        if preload:
+            log.info(f"    {name} will preload {', '.join(preload)} "
+                     f"(required before it can replay {source.name}'s schema)")
+
         # --- 1b. the cluster's optional extensions --------------------
         # A node joining a cluster that uses lolor or snowflake has to have
         # them too, from the same source and ref: zodan synchronises the schema
@@ -637,6 +665,43 @@ def add(cluster_name, host_name=None, node_name=None, source_node=None,
                                              branch=wanted_branch)
         version = spock_management.spock_version(executor, plan, node)
         log.step_end("passed", f"spock {version or 'unknown'}, {script} loaded")
+
+        # --- 5b. what the join itself requires ------------------------
+        # Checked here rather than discovered inside zodan: a failure during
+        # add_node leaves the node half-registered, while a failure now leaves
+        # it merely started.
+        if preload:
+            log.step_start("Check the preloaded libraries",
+                           ", ".join(preload) + f" on {name}")
+            loaded = pg_extensions.preloaded_libraries(executor, plan, node)
+            missing = [library for library in preload if library not in loaded]
+            if missing:
+                log.step_end("failed", f"{', '.join(missing)} not loaded")
+                raise AddNodeError(
+                    f"{name} does not preload {', '.join(missing)}, and "
+                    f"{source.name} has it installed. Joining would fail when "
+                    f"zodan replays {source.name}'s schema, leaving {name} "
+                    f"half-registered. shared_preload_libraries on {name} is "
+                    f"currently '{', '.join(loaded) or 'empty'}'."
+                )
+            log.step_end("passed", f"{', '.join(loaded)}")
+
+        # zodan refuses to join a node that lacks an extension whose tables the
+        # source replicates -- "Please run CREATE EXTENSION lolor on the new
+        # node first". It is satisfied by the extension being present and its
+        # tables empty, which is what a node that has just bootstrapped has.
+        # Everything else is still created after the join, where the structure
+        # sync has had its say.
+        prejoin = pg_extensions.required_before_join(
+            source_executor, plan, source, selections=selections)
+        if prejoin:
+            names = ", ".join(item["name"] for item in prejoin)
+            log.step_start("Create what the join requires",
+                           f"{names} on {name}, because {source.name} "
+                           f"replicates its tables")
+            pg_extensions.create_on_node(executor, plan, node,
+                                         selections=prejoin, run_logger=log)
+            log.step_end("passed", f"{names} created before joining")
 
         # --- 6. cross-wire --------------------------------------------
         log.step_start(
