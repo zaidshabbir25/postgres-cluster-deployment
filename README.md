@@ -164,10 +164,44 @@ key will be just as encrypted on the third attempt, and the message names
 `ssh-add`, `PG_CLUSTER_SSH_PASSPHRASE` and `PG_CLUSTER_SSH_KEY` rather than
 repeating `Private key file is encrypted` three times.
 
+### Named topologies
+
+The wizard asks a dozen questions and most of the answers are the same every
+time. `configuration/topologies.json` holds them under a name, so a shape that
+has been agreed once is deployed again without anyone retyping it — and
+reviewed as a diff rather than recalled from a terminal transcript.
+
+```bash
+./pg_deploy_cluster.sh --list-topologies
+./pg_deploy_cluster.sh --topology 3-node
+./pg_deploy_cluster.sh --topology 3-node --pg-major 18    # that shape, on 18
+```
+
+Two ship: `2-node`, the smallest multi-master cluster, and `3-node`, which also
+gives etcd a quorum that survives losing a machine. Add your own by copying an
+entry; the file lists every key with a note on what it does.
+
+A topology describes the **shape, not the machines**. Which hosts it lands on
+still comes from `inventory.json`, so the same topology deploys to staging and
+to production without editing it. Key names match that file's `defaults` block
+and the fields of `ClusterPlan`, so there is one vocabulary rather than a third
+spelling of `node_count`.
+
+Precedence runs command line → topology → inventory defaults → built-in
+defaults, which is why `--topology 3-node --pg-major 18` is that shape on
+PostgreSQL 18.
+
+A topology is validated when it is **read**, not when the deployment reaches
+the part that would break: a source build with no exact `pg_version`, a
+`standby_of` naming a node a cluster that size will never have, a misspelled
+key that would otherwise be silently ignored, and an unusable `pg_extensions`
+list are all refused up front, with the reason.
+
 ### Rehearse without touching anything
 
 ```bash
 ./pg_deploy_cluster.sh --dry-run --nodes 3 --standby n1,n2
+./pg_deploy_cluster.sh --dry-run --topology 3-node
 ```
 
 ```
@@ -675,10 +709,20 @@ cluster that is already running costs a restart, and the error says which
 command to run.
 
 Building ACE is what its README documents: `go build -o ace ./cmd/ace/`, with
-the binary installed to `/usr/local/bin/ace`. It needs Go 1.26 or newer, which
-no distribution ships yet, so the official release tarball is unpacked into
-`/usr/local/go` when the host has no new enough Go of its own — and a host that
-already has one keeps it. An ACE-only build installs git and little else: it
+the binary installed to `/usr/local/bin/ace`.
+
+Which Go it needs is read from the checkout's own `go.mod` rather than assumed
+here — a constant would be a guess about someone else's repository, and ACE
+raised its minimum to 1.26.10 while this file still said 1.26.0. A host whose
+Go satisfies that keeps it, whatever shipped it; otherwise the official release
+tarball for exactly that version is unpacked into `/usr/local/go`. The build
+also runs with `GOTOOLCHAIN=auto`, so Go can fetch the toolchain itself when it
+can reach the proxy: Red Hat's packages default that to `local`, which turns a
+version Go could have downloaded into
+
+```
+go: go.mod requires go >= 1.26.10 (running go 1.26.7; GOTOOLCHAIN=local)
+``` An ACE-only build installs git and little else: it
 compiles against nothing of PostgreSQL's, so the C toolchain and the server
 headers would be a lot of installing for no reason.
 

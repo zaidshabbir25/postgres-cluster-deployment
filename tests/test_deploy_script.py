@@ -792,3 +792,59 @@ def test_add_component_does_not_combine_with_the_other_modes(script, inventory):
 
     assert code != 0
     assert "works on its own" in output
+
+
+# ---------------------------------------------------------------------------
+# --topology
+# ---------------------------------------------------------------------------
+
+
+def test_a_topology_deploys_without_asking_anything(script, inventory):
+    code, output = run(script, inventory, "--topology", "3-node")
+
+    assert code == 0
+    deploy = line(output, "DEPLOY:")
+    assert "--nodes 3" in deploy
+    assert "--mode packages" in deploy
+    assert "1)" not in output, "the wizard should not have run"
+
+
+def test_a_flag_after_the_topology_overrides_that_part_of_it(script, inventory):
+    """argparse keeps the last occurrence, so the command line wins."""
+    code, output = run(script, inventory, "--topology", "3-node",
+                       "--pg-major", "18")
+
+    assert code == 0
+    deploy = line(output, "DEPLOY:")
+    assert "--nodes 3" in deploy
+    assert deploy.rindex("--pg-major 18") > deploy.index("--pg-major 17")
+
+
+def test_the_shape_is_shown_before_it_is_deployed(script, inventory):
+    code, output = run(script, inventory, "--topology", "2-node")
+
+    assert "Topology '2-node'" in output
+    assert "Spock nodes : 2" in output
+
+
+def test_an_unknown_topology_names_the_ones_that_exist(script, inventory):
+    code, output = run(script, inventory, "--topology", "17-node")
+
+    assert code != 0
+    assert "2-node, 3-node" in output
+
+
+def test_listing_the_topologies_describes_each(script, inventory):
+    code, output = run(script, inventory, "--list-topologies")
+
+    assert code == 0
+    assert "2-node" in output and "3-node" in output
+    assert "multi-master" in output
+
+
+def test_a_topology_does_not_combine_with_changing_a_cluster(script, inventory):
+    code, output = run(script, inventory, "--topology", "2-node",
+                       "--add-node", "n3", facts=SOURCE_50)
+
+    assert code != 0
+    assert "does not combine" in output

@@ -852,3 +852,85 @@ def test_only_lolor_is_required_before_a_join():
     """snowflake generates ids and ACE runs outside the database; neither has
     tables the source replicates."""
     assert pg_extensions.JOIN_REQUIRES == ("lolor",)
+
+
+# ---------------------------------------------------------------------------
+# the Go a project actually requires
+# ---------------------------------------------------------------------------
+
+
+def test_the_required_go_is_read_from_go_mod_not_guessed():
+    """A constant here is a guess about someone else's repository and drifts
+    the moment they raise theirs."""
+    executor = FakeExecutor(replies={"grep -m1": (True, "go 1.26.10\n")})
+
+    assert pg_extensions.go_requirement(executor, "/build/ace") == "1.26.10"
+
+
+def test_a_checkout_with_no_go_mod_reports_nothing():
+    executor = FakeExecutor(replies={"grep -m1": (False, "")})
+
+    assert pg_extensions.go_requirement(executor, "/build/ace") == ""
+
+
+def test_a_distribution_go_that_is_new_enough_is_kept():
+    """Rocky 9 ships one; where it came from does not matter, only whether it
+    satisfies go.mod."""
+    executor = FakeExecutor(replies={
+        "go version": (True, "go version go1.26.12 linux/amd64")})
+
+    assert pg_extensions.ensure_go(executor, minimum="1.26.10") == "1.26.12"
+    assert not any("go.dev/dl" in c for c in executor.commands)
+
+
+def test_a_distribution_go_that_is_too_old_is_replaced():
+    """The exact case from a real run: Red Hat's 1.26.7 against ACE's 1.26.10.
+    A patch-level comparison is the whole point — 1.26.7 looks new enough
+    until the third component is compared as a number."""
+    executor = FakeExecutor(replies={
+        "go version": (True,
+                       "go version go1.26.7 (Red Hat 1.26.7-2.el9_8) linux/amd64")})
+
+    assert pg_extensions.ensure_go(executor, minimum="1.26.10") == "1.26.10"
+    assert any("go1.26.10.linux-amd64.tar.gz" in c for c in executor.commands)
+
+
+def test_the_version_installed_is_the_one_go_mod_asked_for():
+    executor = FakeExecutor(replies={"go version": (False, "")})
+
+    pg_extensions.ensure_go(executor, minimum="1.27.3")
+
+    assert any("go1.27.3.linux-amd64" in c for c in executor.commands)
+
+
+def test_a_project_asking_for_less_than_our_floor_still_gets_the_floor():
+    """The floor is what an unreadable go.mod falls back to; it should not
+    drag a host backwards either."""
+    executor = FakeExecutor(replies={"go version": (False, "")})
+
+    pg_extensions.ensure_go(executor, minimum="1.20.0")
+
+    assert any(f"go{pg_extensions.GO_VERSION}.linux" in c
+               for c in executor.commands)
+
+
+def test_patch_levels_compare_as_numbers_not_strings():
+    """'1.26.7' > '1.26.10' as text, which is exactly the comparison that let
+    a too-old Go through."""
+    assert pg_extensions._go_number("1.26.10") > pg_extensions._go_number("1.26.7")
+    assert pg_extensions._go_number("1.26") == (1, 26, 0)
+
+
+def test_the_build_lets_go_fetch_its_own_toolchain():
+    """Red Hat's packages default GOTOOLCHAIN to `local`, which turns a
+    version Go could have downloaded into a build failure."""
+    executor = FakeExecutor(replies={
+        "grep -m1": (True, "go 1.26.10\n"),
+        "go version": (True, "go version go1.26.10 linux/amd64"),
+    })
+
+    pg_extensions.build(executor, pg_extensions.CATALOG["ace"], "main",
+                        "/usr/pgsql-17/bin")
+
+    command = next(c for c in executor.commands if "go build" in c)
+    assert "GOTOOLCHAIN=auto" in command
