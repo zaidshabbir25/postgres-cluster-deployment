@@ -3,7 +3,10 @@
 configuration/inventory.json
 # Written by a topology whose hosts group says localhost; machine-specific.
 configuration/inventory.local.json
-configuration/inventory.json.bak
+
+# Backups the tool writes beside a file it rewrites. inventory.json.bak was
+# committed once: it held public IPs, SSH usernames and key paths.
+*.bak
 
 # Private keys, never.
 keys/*
