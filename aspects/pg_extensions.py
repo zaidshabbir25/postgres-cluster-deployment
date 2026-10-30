@@ -25,14 +25,17 @@ differ:
     default is deliberately invalid, so snowflake.nextval() raises until it is
     set, and two nodes sharing a value generate colliding ids with nothing to
     detect it.
-  * `lolor.node` (1–2^28) does the same job for large-object OIDs.
+  * `lolor.node` (1–15) does the same job for the low bits of large-object
+    OIDs. Four bits is the whole range, so a lolor cluster tops out at 15
+    Spock nodes.
 
 So the id is assigned per Spock node, and a standby deliberately inherits its
 leader's: a physical replica is a byte-for-byte copy, and when Patroni promotes
 it, it has to keep generating ids as the node it replaced rather than as a new
 one.
 
-Neither extension needs shared_preload_libraries, so neither costs a restart.
+lolor must be in shared_preload_libraries — it refuses to be loaded on demand —
+so selecting it costs one restart of every server. snowflake does not.
 """
 
 import re
@@ -57,7 +60,10 @@ KIND_TOOL = "tool"
 # Where a built tool lands, and the Go toolchain used to build one.
 TOOL_BIN_DIR = "/usr/local/bin"
 GO_ROOT = "/usr/local/go"
-GO_VERSION = "1.26.0"
+#: The floor used only when a project's go.mod cannot be read — not a target.
+#: What actually gets installed is whatever that file requires, so this does
+#: not need chasing every time an upstream raises its minimum.
+GO_VERSION = "1.26.10"
 GO_RELEASE_URL = "https://go.dev/dl/go{version}.linux-{arch}.tar.gz"
 
 
@@ -518,16 +524,42 @@ def _build_pgxs(executor, spec, source_dir, bin_dir, node=None, jobs=None):
     return {"control": control}
 
 
+def go_requirement(executor, source_dir, node=None):
+    """The Go version this checkout's go.mod insists on, or "".
+
+    Read rather than assumed. A constant in this file is a guess about someone
+    else's repository and drifts the moment they raise theirs: ACE moved to
+    1.26.10 while the guess here said 1.26.0, so a host with 1.26.7 passed our
+    check and then failed Go's.
+    """
+    ok, output = executor.try_run(
+        f"grep -m1 -E '^go [0-9]' {shlex.quote(source_dir)}/go.mod "
+        f"2>/dev/null", node=node,
+    )
+    if not ok:
+        return ""
+    match = re.search(r"^go\s+(\d+(?:\.\d+)*)", (output or "").strip())
+    return match.group(1) if match else ""
+
+
 def _build_tool(executor, spec, source_dir, node=None, arch=""):
     """What ACE's README documents: install Go, then `go build -o ace ./cmd/ace/`
     and put the binary on PATH."""
-    go_version = ensure_go(executor, node=node, arch=arch)
+    required = go_requirement(executor, source_dir, node=node)
+    go_version = ensure_go(executor, node=node, arch=arch, minimum=required)
     binary = spec.binary or spec.name
     installed = f"{TOOL_BIN_DIR}/{binary}"
 
     executor.run(
         f"cd {shlex.quote(source_dir)} && "
-        f"PATH={GO_ROOT}/bin:$PATH HOME=/root {spec.build_command}",
+        # GOTOOLCHAIN=auto lets Go fetch the exact toolchain go.mod asks for,
+        # which is how it is meant to work. Red Hat's packages default it to
+        # `local`, which turns a version it could have downloaded into
+        # "go.mod requires go >= X (running Y; GOTOOLCHAIN=local)". The Go
+        # installed above is the fallback for a host that cannot reach the
+        # proxy.
+        f"PATH={GO_ROOT}/bin:$PATH HOME=/root GOTOOLCHAIN=auto "
+        f"{spec.build_command}",
         node=node, message=f"go build {spec.name}", timeout=1800,
     )
     executor.run(
@@ -547,24 +579,29 @@ def _build_tool(executor, spec, source_dir, node=None, arch=""):
             "tool_version": version.strip()}
 
 
-def ensure_go(executor, node=None, arch="", version=GO_VERSION):
+def ensure_go(executor, node=None, arch="", version=None, minimum=None):
     """Install the Go toolchain if the host has none new enough.
 
-    ACE needs Go 1.26 or newer, which no distribution ships yet, so the
-    official release tarball is the only way to get one. A host that already
-    has a new enough Go keeps it.
-    """
-    wanted = _go_number(version)
-    _, current = executor.try_run("go version 2>/dev/null", node=node)
-    match = re.search(r"go(\d+\.\d+(?:\.\d+)?)", current or "")
-    if match and _go_number(match.group(1)) >= wanted:
-        return match.group(1)
+    `minimum` is what the thing being built actually requires — read from its
+    go.mod — and the version installed when the host falls short. A
+    distribution's Go counts: Rocky 9 ships one, and the question is only
+    whether it is new enough, not where it came from.
 
-    _, existing = executor.try_run(f"{GO_ROOT}/bin/go version 2>/dev/null",
-                                   node=node)
-    match = re.search(r"go(\d+\.\d+(?:\.\d+)?)", existing or "")
-    if match and _go_number(match.group(1)) >= wanted:
-        return match.group(1)
+    GO_VERSION is the floor used when go.mod cannot be read, not a target.
+    """
+    minimum = str(minimum or "") or GO_VERSION
+    # Install exactly what is required, unless our own floor is higher.
+    version = str(version or "") or (
+        minimum if _go_number(minimum) >= _go_number(GO_VERSION) else GO_VERSION
+    )
+    wanted = _go_number(minimum)
+
+    for probe in ("go version 2>/dev/null",
+                  f"{GO_ROOT}/bin/go version 2>/dev/null"):
+        _, current = executor.try_run(probe, node=node)
+        match = re.search(r"go(\d+(?:\.\d+)*)", current or "")
+        if match and _go_number(match.group(1)) >= wanted:
+            return match.group(1)
 
     go_arch = "arm64" if str(arch) in ("aarch64", "arm64") else "amd64"
     url = GO_RELEASE_URL.format(version=version, arch=go_arch)

@@ -1,6 +1,12 @@
 # --- secrets -----------------------------------------------------------------
 # The real inventory carries hostnames, usernames and key paths.
 configuration/inventory.json
+# Written by a topology whose hosts group says localhost; machine-specific.
+configuration/inventory.local.json
+
+# Backups the tool writes beside a file it rewrites. inventory.json.bak was
+# committed once: it held public IPs, SSH usernames and key paths.
+*.bak
 
 # Private keys, never.
 keys/*

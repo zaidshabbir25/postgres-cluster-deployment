@@ -164,10 +164,97 @@ key will be just as encrypted on the third attempt, and the message names
 `ssh-add`, `PG_CLUSTER_SSH_PASSPHRASE` and `PG_CLUSTER_SSH_KEY` rather than
 repeating `Private key file is encrypted` three times.
 
+### Named topologies
+
+The wizard asks a dozen questions and most of the answers are the same every
+time. `configuration/topologies.json` holds them under a name, so a shape that
+has been agreed once is deployed again without anyone retyping it — and
+reviewed as a diff rather than recalled from a terminal transcript.
+
+```bash
+./pg_deploy_cluster.sh --list-topologies
+./pg_deploy_cluster.sh --topology 3-node
+./pg_deploy_cluster.sh --topology 3-node --pg-major 18    # that shape, on 18
+```
+
+Seven ship:
+
+| Topology | Machines | Nodes | Standbys | Components | Install |
+|---|---|---|---|---|---|
+| `2-node` | inventory | 2 | — | — | packages |
+| `3-node` | inventory | 3 | — | — | packages |
+| `2-node-ha` | inventory | 2 | n1, n2 (sync) | — | packages |
+| `2-node-extensions` | inventory | 2 | — | all three | packages |
+| `3-node-extensions` | inventory | 3 | — | all three | packages |
+| `3-node-extensions-source` | inventory | 3 | — | all three | source |
+| `local-sandbox` | this machine | 3 | — | all three | packages |
+
+`3-node` is the smallest shape that also gives etcd a quorum surviving the loss
+of a machine. The `-extensions` shapes are the ones to deploy when the cluster
+will be checked with `--health_check lolor,snowflake,ace`, since those suites
+need their components present. `local-sandbox` runs every node on one machine,
+separated by port — no SSH and no HA, but a real mesh to develop against.
+
+Each definition is written in the **five groups the wizard asks its questions
+in**, because twenty keys in one block give no clue which of them belong
+together:
+
+```jsonc
+{
+  "hosts":        { "host_source": "inventory" },
+  "install":      { "deploy_mode": "packages", "repo_channel": "release",
+                    "pg_major": "17", "spock_major": "50" },
+  "cluster":      { "node_count": 3, "cluster_name": "pgedge" },
+  "components":   { "lolor": { "install": "packages" },
+                    "snowflake": { "install": "source", "ref": "v2.0" },
+                    "ace": { "install": "none" } },
+  "availability": { "standby_of": ["n1"], "synchronous_mode": "on" }
+}
+```
+
+The groups are presentation only — they are flattened on the way in, so a key
+is spelled the same here, in `inventory.json`'s `defaults` and in
+`ClusterPlan`, rather than a third spelling of `node_count`. A key written in
+the wrong group is refused by name, with the right one; otherwise the grouping
+would be decorative. Every key and every group is optional, and a definition
+written flat still loads.
+
+A topology describes the **shape, not the machines**: `hosts` picks a host
+list, it does not contain one, so the same topology deploys to staging and to
+production without editing it. `host_source: "inventory"` uses the hosts
+already listed; `"localhost"` deploys to this machine alone, writing
+`configuration/inventory.local.json` rather than touching your real inventory;
+`inventory_file` points at a different host list. A `--inventory` that was
+actually typed still wins over any of them.
+
+`components` says how each one arrives: `packages`, `source` (with an optional
+`ref` naming the branch or tag), or `none`. A packaged component comes from the
+same `repo_channel` as the server. Selecting lolor costs one restart of every
+server during setup, because it has to be in `shared_preload_libraries`;
+snowflake and ACE do not. A cluster deployed without a component can gain one
+later with `--add-component`, so the topology is the starting shape rather than
+a limit. The packed `--pg-extensions` string is still accepted, as
+`components.pg_extensions`, but the two forms cannot be mixed in one topology.
+
+Add your own by copying an entry; `_field_notes` documents every key under its
+group, including what each component requires.
+
+Precedence runs command line → topology → inventory defaults → built-in
+defaults, which is why `--topology 3-node --pg-major 18` is that shape on
+PostgreSQL 18.
+
+A topology is validated when it is **read**, not when the deployment reaches
+the part that would break: a source build with no exact `pg_version`, a
+`standby_of` naming a node a cluster that size will never have, a misspelled
+key that would otherwise be silently ignored, a key filed under the wrong
+group, and an unusable component list are all refused up front, with the
+reason.
+
 ### Rehearse without touching anything
 
 ```bash
 ./pg_deploy_cluster.sh --dry-run --nodes 3 --standby n1,n2
+./pg_deploy_cluster.sh --dry-run --topology 3-node
 ```
 
 ```
@@ -675,10 +762,20 @@ cluster that is already running costs a restart, and the error says which
 command to run.
 
 Building ACE is what its README documents: `go build -o ace ./cmd/ace/`, with
-the binary installed to `/usr/local/bin/ace`. It needs Go 1.26 or newer, which
-no distribution ships yet, so the official release tarball is unpacked into
-`/usr/local/go` when the host has no new enough Go of its own — and a host that
-already has one keeps it. An ACE-only build installs git and little else: it
+the binary installed to `/usr/local/bin/ace`.
+
+Which Go it needs is read from the checkout's own `go.mod` rather than assumed
+here — a constant would be a guess about someone else's repository, and ACE
+raised its minimum to 1.26.10 while this file still said 1.26.0. A host whose
+Go satisfies that keeps it, whatever shipped it; otherwise the official release
+tarball for exactly that version is unpacked into `/usr/local/go`. The build
+also runs with `GOTOOLCHAIN=auto`, so Go can fetch the toolchain itself when it
+can reach the proxy: Red Hat's packages default that to `local`, which turns a
+version Go could have downloaded into
+
+```
+go: go.mod requires go >= 1.26.10 (running go 1.26.7; GOTOOLCHAIN=local)
+``` An ACE-only build installs git and little else: it
 compiles against nothing of PostgreSQL's, so the C toolchain and the server
 headers would be a lot of installing for no reason.
 

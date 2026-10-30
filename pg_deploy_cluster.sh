@@ -43,6 +43,11 @@ Usage: ./pg_deploy_cluster.sh [options]
 Run with no options for the interactive prompts.
 
 Topology
+  --topology NAME           deploy a named shape from configuration/topologies.json
+                            instead of answering the wizard. Any flag after it
+                            overrides that part of it.
+  --list-topologies         show the shapes that file defines, and exit
+
   --nodes N                 number of Spock (multi-master) nodes           [2]
   --standby n1[,n2]         Spock nodes that get a Patroni standby
   --sync-mode async|sync|quorum
@@ -500,11 +505,70 @@ ask_int() {
   done
 }
 
+topology_flags() {
+  # topology_flags <name> -> the flags that shape is equivalent to, one per
+  # line. Non-zero with the reason on stderr when the name or the file is bad.
+  python3 - "$1" <<'PYEOF'
+import sys
+from aspects import topology_presets
+try:
+    definition = topology_presets.get(sys.argv[1])
+except topology_presets.TopologyError as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+print("\n".join(topology_presets.to_flags(definition)))
+PYEOF
+}
+
+topology_hosts() {
+  # topology_hosts <name> -> "host_source|inventory_file". The hosts group is
+  # the one part of a topology that cannot be expressed as a flag: it decides
+  # which inventory the rest of the flags are applied to.
+  python3 - "$1" <<'PYEOF'
+import sys
+from aspects import topology_presets
+definition = topology_presets.get(sys.argv[1])
+print("%s|%s" % (definition.get("host_source", "inventory"),
+                 definition.get("inventory_file", "")))
+PYEOF
+}
+
+topology_describe() {
+  python3 - "$1" <<'PYEOF'
+import sys
+from aspects import topology_presets
+definition = topology_presets.get(sys.argv[1])
+print("\n".join(topology_presets.describe(sys.argv[1], definition)))
+PYEOF
+}
+
+list_topologies() {
+  python3 - <<'PYEOF'
+import textwrap
+
+from aspects import topology_presets
+
+topologies = topology_presets.load()
+# The names have grown; a fixed column pushed the longest one's description
+# onto a ragged second start. The first sentence is the listing — the rest of
+# the description is what --topology prints before it deploys.
+width = max((len(name) for name in topologies), default=0)
+for name, definition in topologies.items():
+    summary = (definition.get("description", "").strip().split(". ") or [""])[0]
+    summary = summary.rstrip(".") + "."
+    body = textwrap.wrap(summary, 78 - width) or [""]
+    print(f"  {name:<{width}}  {body[0]}")
+    for line in body[1:]:
+        print(f"  {'':<{width}}  {line}")
+PYEOF
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing — any flag turns off the prompts
 # ---------------------------------------------------------------------------
 
 INTERACTIVE=true
+INVENTORY_EXPLICIT=false
 ARGS=()
 DRY_RUN=false
 CLEANUP=false
@@ -514,6 +578,8 @@ HEALTH_CHECK=""
 HEALTH_ARGS=()
 ADD_COMPONENT=""
 COMPONENT_ARGS=()
+TOPOLOGY=""
+LIST_TOPOLOGIES=false
 PG_EXTENSIONS=""
 REMOVE_NODE=""
 REMOVE_ARGS=()
@@ -532,7 +598,8 @@ CLUSTER_NAME=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    --inventory) INVENTORY="$2"; ARGS+=("--inventory" "$2"); INTERACTIVE=false; shift 2 ;;
+    --inventory) INVENTORY="$2"; INVENTORY_EXPLICIT=true
+                 ARGS+=("--inventory" "$2"); INTERACTIVE=false; shift 2 ;;
     --dry-run) DRY_RUN=true; ARGS+=("--dry-run"); INTERACTIVE=false; shift ;;
     --cleanup) CLEANUP=true; INTERACTIVE=false; shift ;;
     --purge) CLEANUP_ARGS+=("$1"); shift ;;
@@ -540,6 +607,13 @@ while [[ $# -gt 0 ]]; do
     --add-node)
       [[ $# -ge 2 ]] || die "--add-node needs a node name (e.g. --add-node n3)"
       ADD_NODE="$2"; INTERACTIVE=false; shift 2 ;;
+    --topology)
+      [[ $# -ge 2 ]] || die "--topology needs a name (see --list-topologies)"
+      TOPOLOGY="$2"; INTERACTIVE=false; shift 2 ;;
+    --list-topologies)
+      # Handled after ensure_venv, like every other mode: the helper imports
+      # from the repository and needs the virtualenv on PATH first.
+      LIST_TOPOLOGIES=true; INTERACTIVE=false; shift ;;
     --add-component)
       [[ $# -ge 2 ]] || die "--add-component needs a component list (e.g. pgedge-lolor,pgedge-ace)"
       ADD_COMPONENT="$2"; INTERACTIVE=false; shift 2 ;;
@@ -598,6 +672,64 @@ ensure_venv
 # ---------------------------------------------------------------------------
 # Cleanup — a mode of its own, not a deployment
 # ---------------------------------------------------------------------------
+
+if [[ "$LIST_TOPOLOGIES" == true ]]; then
+  say ""
+  say "${BOLD}Cluster topologies in configuration/topologies.json${RESET}"
+  rule
+  list_topologies || die "could not read configuration/topologies.json"
+  rule
+  say ""
+  say "${DIM}Deploy one with: ./pg_deploy_cluster.sh --topology <name>"
+  say "A flag after it wins, so --topology 3-node --pg-major 18 is the"
+  say "3-node shape on PostgreSQL 18.${RESET}"
+  exit 0
+fi
+
+if [[ -n "$TOPOLOGY" ]]; then
+  [[ -z "$ADD_NODE$REMOVE_NODE$HEALTH_CHECK$ADD_COMPONENT" ]] \
+    || die "--topology deploys a cluster; it does not combine with the operations that change one"
+  [[ "$CLEANUP" == false ]] || die "--topology and --cleanup do opposite things; pick one"
+
+  # Where it runs is settled before the flags are, because a topology that
+  # says "this machine only" has to have an inventory to deploy onto before
+  # --inventory is appended below. A --inventory that was actually typed wins
+  # over either, like every other flag.
+  if [[ "$INVENTORY_EXPLICIT" == false ]]; then
+    TOPOLOGY_HOSTS="$(topology_hosts "$TOPOLOGY")" \
+      || die "could not read topology '$TOPOLOGY' — run --list-topologies to see what is defined"
+    IFS='|' read -r TOPOLOGY_HOST_SOURCE TOPOLOGY_INVENTORY <<<"$TOPOLOGY_HOSTS"
+    if [[ "$TOPOLOGY_HOST_SOURCE" == "localhost" ]]; then
+      # Its own file, never the real inventory: a sandbox topology should not
+      # cost someone the host list they spent an afternoon on.
+      INVENTORY="$SCRIPT_DIR/configuration/inventory.local.json"
+      write_inventory "local|localhost|$(id -un)|22||yes"
+    elif [[ -n "$TOPOLOGY_INVENTORY" ]]; then
+      [[ "$TOPOLOGY_INVENTORY" == /* ]] \
+        && INVENTORY="$TOPOLOGY_INVENTORY" \
+        || INVENTORY="$SCRIPT_DIR/$TOPOLOGY_INVENTORY"
+    fi
+  fi
+
+  TOPOLOGY_FLAGS=()
+  while IFS= read -r flag; do
+    [[ -n "$flag" ]] && TOPOLOGY_FLAGS+=("$flag")
+  done < <(topology_flags "$TOPOLOGY")
+  (( ${#TOPOLOGY_FLAGS[@]} > 0 )) \
+    || die "could not read topology '$TOPOLOGY' — run --list-topologies to see what is defined"
+
+  say ""
+  say "${BOLD}Topology '$TOPOLOGY'${RESET}"
+  rule
+  topology_describe "$TOPOLOGY"
+  rule
+  say ""
+
+  # The topology first, then whatever was typed: argparse keeps the last
+  # occurrence of a flag, so a command line beats the file it came from.
+  ARGS=("${TOPOLOGY_FLAGS[@]}" "${ARGS[@]+"${ARGS[@]}"}")
+  ARGS+=(--inventory "$INVENTORY")
+fi
 
 if [[ -n "$ADD_COMPONENT" ]]; then
   [[ -z "$ADD_NODE" && -z "$REMOVE_NODE" && -z "$HEALTH_CHECK" ]] \
