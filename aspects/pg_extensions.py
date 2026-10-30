@@ -25,14 +25,17 @@ differ:
     default is deliberately invalid, so snowflake.nextval() raises until it is
     set, and two nodes sharing a value generate colliding ids with nothing to
     detect it.
-  * `lolor.node` (1–2^28) does the same job for large-object OIDs.
+  * `lolor.node` (1–15) does the same job for the low bits of large-object
+    OIDs. Four bits is the whole range, so a lolor cluster tops out at 15
+    Spock nodes.
 
 So the id is assigned per Spock node, and a standby deliberately inherits its
 leader's: a physical replica is a byte-for-byte copy, and when Patroni promotes
 it, it has to keep generating ids as the node it replaced rather than as a new
 one.
 
-Neither extension needs shared_preload_libraries, so neither costs a restart.
+lolor must be in shared_preload_libraries — it refuses to be loaded on demand —
+so selecting it costs one restart of every server. snowflake does not.
 """
 
 import re

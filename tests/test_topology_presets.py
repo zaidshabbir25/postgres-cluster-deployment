@@ -31,19 +31,101 @@ def minimal(**overrides):
 # ---------------------------------------------------------------------------
 
 
-def test_the_shipped_file_defines_a_two_and_a_three_node_shape():
-    assert presets.names() == ["2-node", "3-node"]
+SHIPPED = ["2-node", "3-node", "2-node-ha", "2-node-extensions",
+           "3-node-extensions", "3-node-extensions-source", "local-sandbox"]
 
 
-@pytest.mark.parametrize("name", ["2-node", "3-node"])
+def test_the_shipped_file_defines_the_shapes_it_documents():
+    assert presets.names() == SHIPPED
+
+
+@pytest.mark.parametrize("name", SHIPPED)
 def test_every_shipped_topology_is_valid(name):
     """They are what people copy, so a broken one propagates."""
     assert presets.get(name)
 
 
-@pytest.mark.parametrize("name,count", [("2-node", 2), ("3-node", 3)])
-def test_each_shipped_topology_has_the_node_count_its_name_claims(name, count):
-    assert presets.get(name)["node_count"] == count
+@pytest.mark.parametrize("name", [n for n in SHIPPED if n[0].isdigit()])
+def test_each_shipped_topology_has_the_node_count_its_name_claims(name):
+    assert presets.get(name)["node_count"] == int(name[0])
+
+
+@pytest.mark.parametrize("name", SHIPPED)
+def test_every_shipped_topology_is_written_in_the_groups(name):
+    """The groups are the file's organisation; one shape written flat while
+    the others are grouped is the thing that erodes it."""
+    raw = presets.load()[name]
+
+    assert set(raw) - {"description"} <= set(presets.GROUP_NAMES), name
+
+
+@pytest.mark.parametrize("name", SHIPPED)
+def test_every_shipped_topology_answers_every_group(name):
+    """A missing group is not an error — its defaults apply — but a shipped
+    shape is also the worked example of what can be set."""
+    raw = presets.load()[name]
+
+    assert set(presets.GROUP_NAMES) <= set(raw), name
+
+
+def test_a_standby_shape_says_how_its_standby_replicates():
+    """Adding a standby and leaving synchronous_mode at off is a real choice,
+    but an HA shape that does it by omission is probably an oversight."""
+    definition = presets.get("2-node-ha")
+
+    assert definition["standby_of"] == ["n1", "n2"]
+    assert definition["synchronous_mode"] == "on"
+
+
+def test_the_sandbox_shape_runs_on_this_machine_rather_than_the_inventory():
+    assert presets.get("local-sandbox")["host_source"] == "localhost"
+
+
+@pytest.mark.parametrize("name", [n for n in SHIPPED if "extensions" in n or n == "local-sandbox"])
+def test_an_extensions_shape_actually_selects_every_add_on(name):
+    """The name is the only thing distinguishing it from the plain shape, so
+    an add-on missing from the list makes the name a lie."""
+    from aspects import pg_extensions
+
+    definition = presets.get(name)
+    selected = pg_extensions.parse(definition["pg_extensions"],
+                                   default_mode=definition["deploy_mode"])
+    assert {entry["name"] for entry in selected} == set(pg_extensions.CATALOG)
+
+
+def test_the_source_shape_builds_its_add_ons_rather_than_packaging_them():
+    """A source-built cluster configures no pgEdge repository, so a packaged
+    add-on in it would have nothing to install from."""
+    from aspects import pg_extensions
+
+    definition = presets.get("3-node-extensions-source")
+    selected = pg_extensions.parse(definition["pg_extensions"],
+                                   default_mode=definition["deploy_mode"])
+    assert [entry["mode"] for entry in selected] == [pg_extensions.MODE_SOURCE] * 3
+
+
+def test_a_packaged_shape_does_not_pin_an_add_on_to_a_ref():
+    """A ref only means something to a build; parse() refuses the pair, and
+    this says so before anyone copies one shape into the other."""
+    for name in SHIPPED:
+        definition = presets.get(name)
+        if definition["deploy_mode"] == "packages":
+            assert "@" not in definition["pg_extensions"], name
+
+
+def test_an_add_on_shape_runs_a_postgres_its_add_ons_support():
+    """lolor needs PostgreSQL 16 or newer; a shape pairing it with 15 would
+    fail on the first host rather than when it was written."""
+    from aspects import pg_extensions
+
+    for name in SHIPPED:
+        definition = presets.get(name)
+        major = int(str(definition["pg_major"]).split(".")[0])
+        for entry in pg_extensions.parse(
+                definition["pg_extensions"],
+                default_mode=definition["deploy_mode"]):
+            floor = pg_extensions.CATALOG[entry["name"]].min_pg_major
+            assert major >= floor, f"{name}: {entry['name']} needs {floor}+"
 
 
 def test_every_shipped_topology_says_what_it_is_for():
@@ -198,3 +280,135 @@ def test_a_file_with_no_topologies_object_says_what_it_should_hold(tmp_path):
 
     with pytest.raises(presets.TopologyError, match="no 'topologies' object"):
         presets.load(path)
+
+
+# ---------------------------------------------------------------------------
+# the groups
+# ---------------------------------------------------------------------------
+
+
+def test_a_grouped_definition_flattens_to_the_keys_everything_else_speaks():
+    """Groups are how the file reads; downstream sees one flat dictionary."""
+    flat = presets.flatten("demo", {
+        "hosts": {"host_source": "localhost"},
+        "install": {"deploy_mode": "packages", "pg_major": "18"},
+        "cluster": {"node_count": 3},
+        "availability": {"standby_of": ["n1"]},
+    })
+
+    assert flat == {"host_source": "localhost", "deploy_mode": "packages",
+                    "pg_major": "18", "node_count": 3, "standby_of": ["n1"]}
+
+
+def test_a_definition_written_flat_still_loads():
+    """The groups arrived after the file did; a copy from before them is not
+    suddenly invalid."""
+    assert presets.flatten("demo", minimal(pg_major="17")) == minimal(pg_major="17")
+
+
+def test_a_key_in_the_wrong_group_names_the_right_one():
+    """Accepting it anywhere would make the grouping decorative."""
+    with pytest.raises(presets.TopologyError, match="belongs in 'cluster'"):
+        presets.flatten("demo", {"install": {"node_count": 2}})
+
+
+def test_a_group_that_is_not_an_object_says_what_it_should_be():
+    with pytest.raises(presets.TopologyError, match="must be an object"):
+        presets.flatten("demo", {"install": "packages"})
+
+
+def test_components_become_the_extension_list():
+    flat = presets.flatten("demo", {"components": {
+        "lolor": {"install": "packages"},
+        "snowflake": {"install": "source", "ref": "v2.0"},
+        "ace": {"install": "none"},
+    }})
+
+    assert flat["pg_extensions"] == "lolor:packages,snowflake:source@v2.0"
+
+
+def test_a_component_listed_as_none_is_the_same_as_an_absent_one():
+    all_none = presets.flatten("demo", {"components": {
+        "lolor": {"install": "none"}, "ace": {"install": "none"}}})
+
+    assert all_none["pg_extensions"] == presets.flatten(
+        "demo", {"components": {}})["pg_extensions"] == "none"
+
+
+def test_a_component_may_be_written_as_the_bare_mode():
+    flat = presets.flatten("demo", {"components": {"lolor": "packages"}})
+
+    assert flat["pg_extensions"] == "lolor:packages"
+
+
+def test_a_ref_on_a_component_that_is_not_installed_is_refused():
+    """It would be built by nobody, so it is a leftover from an edit."""
+    with pytest.raises(presets.TopologyError, match="built by nobody"):
+        presets.flatten("demo", {"components": {
+            "lolor": {"install": "none", "ref": "v1.0"}}})
+
+
+def test_a_misspelled_component_key_is_refused_rather_than_ignored():
+    with pytest.raises(presets.TopologyError, match="unknown key"):
+        presets.flatten("demo", {"components": {
+            "lolor": {"install": "source", "branch": "main"}}})
+
+
+def test_the_packed_form_is_still_accepted():
+    flat = presets.flatten("demo", {"components": {
+        "pg_extensions": "pgedge-lolor:source@v1.2.0"}})
+
+    assert flat["pg_extensions"] == "pgedge-lolor:source@v1.2.0"
+
+
+def test_the_two_component_forms_cannot_be_mixed():
+    """They would disagree, and nothing would say which one won."""
+    with pytest.raises(presets.TopologyError, match="one form or the other"):
+        presets.flatten("demo", {"components": {
+            "pg_extensions": "pgedge-lolor",
+            "snowflake": {"install": "packages"}}})
+
+
+def test_an_unusable_component_mode_is_refused_when_the_file_is_read(tmp_path):
+    path = write(tmp_path, {"demo": minimal(
+        components={"lolor": {"install": "rpm"}})})
+
+    with pytest.raises(presets.TopologyError, match="pg_extensions"):
+        presets.get("demo", path)
+
+
+# ---------------------------------------------------------------------------
+# which machines
+# ---------------------------------------------------------------------------
+
+
+def test_an_unknown_host_source_is_refused(tmp_path):
+    path = write(tmp_path, {"demo": minimal(hosts={"host_source": "kubernetes"})})
+
+    with pytest.raises(presets.TopologyError, match="host_source"):
+        presets.get("demo", path)
+
+
+def test_localhost_with_an_inventory_file_is_refused(tmp_path):
+    """localhost writes an inventory of its own, so the named one would be
+    silently ignored."""
+    path = write(tmp_path, {"demo": minimal(hosts={
+        "host_source": "localhost",
+        "inventory_file": "configuration/staging.json"})})
+
+    with pytest.raises(presets.TopologyError, match="would be ignored"):
+        presets.get("demo", path)
+
+
+def test_an_inventory_file_becomes_the_inventory_flag():
+    flags = presets.to_flags(presets.flatten("demo", {
+        "hosts": {"inventory_file": "configuration/staging.json"}}))
+
+    assert flags == ["--inventory", "configuration/staging.json"]
+
+
+def test_host_source_is_not_a_flag():
+    """The shell acts on it before any flag is built: it decides which
+    inventory the rest of them are applied to."""
+    assert "--host-source" not in presets.to_flags(
+        presets.flatten("demo", {"hosts": {"host_source": "localhost"}}))

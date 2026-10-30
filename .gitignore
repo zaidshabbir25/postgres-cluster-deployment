@@ -1,6 +1,9 @@
 # --- secrets -----------------------------------------------------------------
 # The real inventory carries hostnames, usernames and key paths.
 configuration/inventory.json
+# Written by a topology whose hosts group says localhost; machine-specific.
+configuration/inventory.local.json
+configuration/inventory.json.bak
 
 # Private keys, never.
 keys/*

@@ -1,80 +1,349 @@
 {
-  "_comment": "Named cluster shapes, each holding every answer the pg_deploy_cluster.sh wizard asks for. Deploy one with: ./pg_deploy_cluster.sh --topology 3-node. List them with --list-topologies.",
-  "_machines": "A topology describes the shape, not the machines. Which hosts it lands on comes from configuration/inventory.json, so the same topology can be deployed to any host set. One Spock node per host; surplus nodes share hosts on ports base_port+1, +2, ...",
+  "_comment": "Named cluster shapes. Each one holds every answer the pg_deploy_cluster.sh wizard asks for, in the groups it asks them in. Deploy one with: ./pg_deploy_cluster.sh --topology 3-node. List them with --list-topologies.",
   "_precedence": "A flag on the command line beats the topology, which beats inventory defaults, which beats the built-in defaults. So --topology 3-node --pg-major 18 deploys the 3-node shape on PostgreSQL 18.",
-  "_keys": "Key names match configuration/inventory.json's defaults block and the fields of ClusterPlan, so there is one vocabulary across all three. Every key below is optional; omit one and the inventory default applies.",
+
+  "_groups": {
+    "_comment": "A definition is written in these five groups, in this order, because they are the wizard's own questions. Every key is optional: omit one and the inventory default applies; omit a whole group and all of its defaults do.",
+    "hosts": "1) Which machines should the cluster run on?",
+    "install": "2) How should PostgreSQL and Spock be installed, and at which versions?",
+    "cluster": "3) How many Spock nodes, and what are they called?",
+    "components": "4) Which optional pgEdge components to install, and how each one arrives",
+    "availability": "5) Which nodes get a Patroni standby, and how it replicates"
+  },
 
   "topologies": {
     "2-node": {
       "description": "The smallest multi-master cluster: two Spock peers, each accepting writes and replicating to the other. No standby, so a lost node stays down until it is fixed while the other keeps serving.",
 
-      "deploy_mode": "packages",
-      "repo_channel": "release",
+      "hosts": {
+        "host_source": "inventory"
+      },
 
-      "node_count": 2,
-      "standby_of": [],
+      "install": {
+        "deploy_mode": "packages",
+        "repo_channel": "release",
+        "pg_major": "17",
+        "pg_version": "",
+        "spock_major": "50",
+        "spock_branch": ""
+      },
 
-      "pg_major": "17",
-      "pg_version": "",
-      "spock_major": "50",
-      "spock_branch": "",
+      "cluster": {
+        "node_count": 2,
+        "cluster_name": "pgedge",
+        "db_name": "postgres",
+        "db_user": "postgres",
+        "base_port": 5432,
+        "base_restapi_port": 8008,
+        "data_root": "/var/lib/pgedge",
+        "hba_cidrs": []
+      },
 
-      "synchronous_mode": "off",
-      "synchronous_node_count": 1,
-      "synchronous_mode_strict": false,
+      "components": {
+        "lolor": { "install": "none" },
+        "snowflake": { "install": "none" },
+        "ace": { "install": "none" }
+      },
 
-      "pg_extensions": "none",
-
-      "cluster_name": "pgedge",
-      "db_name": "postgres",
-      "db_user": "postgres",
-
-      "base_port": 5432,
-      "base_restapi_port": 8008,
-      "data_root": "/var/lib/pgedge",
-      "hba_cidrs": []
+      "availability": {
+        "standby_of": [],
+        "synchronous_mode": "off",
+        "synchronous_node_count": 1,
+        "synchronous_mode_strict": false
+      }
     },
 
     "3-node": {
       "description": "Three Spock peers. Three hosts also make a fault-tolerant etcd: a two-host cluster loses its DCS with either machine, while three survive one. Still no standby — a failed node's data stays on that node until it returns.",
 
-      "deploy_mode": "packages",
-      "repo_channel": "release",
+      "hosts": {
+        "host_source": "inventory"
+      },
 
-      "node_count": 3,
-      "standby_of": [],
+      "install": {
+        "deploy_mode": "packages",
+        "repo_channel": "release",
+        "pg_major": "17",
+        "pg_version": "",
+        "spock_major": "50",
+        "spock_branch": ""
+      },
 
-      "pg_major": "17",
-      "pg_version": "",
-      "spock_major": "50",
-      "spock_branch": "",
+      "cluster": {
+        "node_count": 3,
+        "cluster_name": "pgedge",
+        "db_name": "postgres",
+        "db_user": "postgres",
+        "base_port": 5432,
+        "base_restapi_port": 8008,
+        "data_root": "/var/lib/pgedge",
+        "hba_cidrs": []
+      },
 
-      "synchronous_mode": "off",
-      "synchronous_node_count": 1,
-      "synchronous_mode_strict": false,
+      "components": {
+        "lolor": { "install": "none" },
+        "snowflake": { "install": "none" },
+        "ace": { "install": "none" }
+      },
 
-      "pg_extensions": "none",
+      "availability": {
+        "standby_of": [],
+        "synchronous_mode": "off",
+        "synchronous_node_count": 1,
+        "synchronous_mode_strict": false
+      }
+    },
 
-      "cluster_name": "pgedge",
-      "db_name": "postgres",
-      "db_user": "postgres",
+    "2-node-ha": {
+      "description": "Two Spock peers, each with a Patroni standby that can be promoted if its node fails. Four PostgreSQL instances in all. Synchronous replication, so a committed write is on the standby before the client is told it committed.",
 
-      "base_port": 5432,
-      "base_restapi_port": 8008,
-      "data_root": "/var/lib/pgedge",
-      "hba_cidrs": []
+      "hosts": {
+        "host_source": "inventory"
+      },
+
+      "install": {
+        "deploy_mode": "packages",
+        "repo_channel": "release",
+        "pg_major": "17",
+        "pg_version": "",
+        "spock_major": "50",
+        "spock_branch": ""
+      },
+
+      "cluster": {
+        "node_count": 2,
+        "cluster_name": "pgedge",
+        "db_name": "postgres",
+        "db_user": "postgres",
+        "base_port": 5432,
+        "base_restapi_port": 8008,
+        "data_root": "/var/lib/pgedge",
+        "hba_cidrs": []
+      },
+
+      "components": {
+        "lolor": { "install": "none" },
+        "snowflake": { "install": "none" },
+        "ace": { "install": "none" }
+      },
+
+      "availability": {
+        "standby_of": ["n1", "n2"],
+        "synchronous_mode": "on",
+        "synchronous_node_count": 1,
+        "synchronous_mode_strict": false
+      }
+    },
+
+    "2-node-extensions": {
+      "description": "The 2-node shape with every pgEdge component: lolor for replicated large objects, snowflake for collision-free int8 sequences, and the ACE consistency tool. lolor needs shared_preload_libraries, so the servers are restarted once during setup.",
+
+      "hosts": {
+        "host_source": "inventory"
+      },
+
+      "install": {
+        "deploy_mode": "packages",
+        "repo_channel": "release",
+        "pg_major": "17",
+        "pg_version": "",
+        "spock_major": "50",
+        "spock_branch": ""
+      },
+
+      "cluster": {
+        "node_count": 2,
+        "cluster_name": "pgedge",
+        "db_name": "postgres",
+        "db_user": "postgres",
+        "base_port": 5432,
+        "base_restapi_port": 8008,
+        "data_root": "/var/lib/pgedge",
+        "hba_cidrs": []
+      },
+
+      "components": {
+        "lolor": { "install": "packages" },
+        "snowflake": { "install": "packages" },
+        "ace": { "install": "packages" }
+      },
+
+      "availability": {
+        "standby_of": [],
+        "synchronous_mode": "off",
+        "synchronous_node_count": 1,
+        "synchronous_mode_strict": false
+      }
+    },
+
+    "3-node-extensions": {
+      "description": "The 3-node shape with every pgEdge component, installed from the package repository. The shape to deploy when the cluster will be checked with --health_check spock,lolor,snowflake,ace: those suites need their components present.",
+
+      "hosts": {
+        "host_source": "inventory"
+      },
+
+      "install": {
+        "deploy_mode": "packages",
+        "repo_channel": "release",
+        "pg_major": "17",
+        "pg_version": "",
+        "spock_major": "50",
+        "spock_branch": ""
+      },
+
+      "cluster": {
+        "node_count": 3,
+        "cluster_name": "pgedge",
+        "db_name": "postgres",
+        "db_user": "postgres",
+        "base_port": 5432,
+        "base_restapi_port": 8008,
+        "data_root": "/var/lib/pgedge",
+        "hba_cidrs": []
+      },
+
+      "components": {
+        "lolor": { "install": "packages" },
+        "snowflake": { "install": "packages" },
+        "ace": { "install": "packages" }
+      },
+
+      "availability": {
+        "standby_of": [],
+        "synchronous_mode": "off",
+        "synchronous_node_count": 1,
+        "synchronous_mode_strict": false
+      }
+    },
+
+    "3-node-extensions-source": {
+      "description": "Three Spock peers and all three components built from git rather than installed from packages. Everything compiles on every host, so expect 20-40 minutes per machine. Each component can name the branch or tag to build.",
+
+      "hosts": {
+        "host_source": "inventory"
+      },
+
+      "install": {
+        "deploy_mode": "source",
+        "repo_channel": "",
+        "pg_major": "17",
+        "pg_version": "17.6",
+        "spock_major": "60",
+        "spock_branch": "main"
+      },
+
+      "cluster": {
+        "node_count": 3,
+        "cluster_name": "pgedge",
+        "db_name": "postgres",
+        "db_user": "postgres",
+        "base_port": 5432,
+        "base_restapi_port": 8008,
+        "data_root": "/var/lib/pgedge",
+        "hba_cidrs": []
+      },
+
+      "components": {
+        "lolor": { "install": "source", "ref": "main" },
+        "snowflake": { "install": "source", "ref": "main" },
+        "ace": { "install": "source", "ref": "main" }
+      },
+
+      "availability": {
+        "standby_of": [],
+        "synchronous_mode": "off",
+        "synchronous_node_count": 1,
+        "synchronous_mode_strict": false
+      }
+    },
+
+    "local-sandbox": {
+      "description": "Three Spock nodes on this machine alone, separated by port. No SSH, no other hardware, and no HA — every node shares one kernel and one disk. For trying the tool out, developing against a real mesh, or running the regression suites.",
+
+      "hosts": {
+        "host_source": "localhost"
+      },
+
+      "install": {
+        "deploy_mode": "packages",
+        "repo_channel": "release",
+        "pg_major": "17",
+        "pg_version": "",
+        "spock_major": "50",
+        "spock_branch": ""
+      },
+
+      "cluster": {
+        "node_count": 3,
+        "cluster_name": "pgedge",
+        "db_name": "postgres",
+        "db_user": "postgres",
+        "base_port": 5432,
+        "base_restapi_port": 8008,
+        "data_root": "/var/lib/pgedge",
+        "hba_cidrs": []
+      },
+
+      "components": {
+        "lolor": { "install": "packages" },
+        "snowflake": { "install": "packages" },
+        "ace": { "install": "packages" }
+      },
+
+      "availability": {
+        "standby_of": [],
+        "synchronous_mode": "off",
+        "synchronous_node_count": 1,
+        "synchronous_mode_strict": false
+      }
     }
   },
 
   "_field_notes": {
-    "deploy_mode": "packages | source. A source build needs an exact pg_version and compiles on every host, 20-40 minutes each.",
-    "repo_channel": "release | staging | daily. Packages mode only.",
-    "node_count": "Spock nodes: multi-master peers, each leading a Patroni scope of its own.",
-    "standby_of": "Spock nodes that get a Patroni standby, as names: [\"n1\", \"n2\"]. A standby is a physical replica of that node alone, which Patroni can promote. It never holds a peer's data.",
-    "pg_version": "An exact version such as 17.11, or 19.0beta3. Required for a source build; for packages, empty means whatever the channel carries.",
-    "spock_branch": "Source mode only: the git branch or tag to build. Empty means the default for the Spock major (v5_STABLE for spock50, main for spock60).",
-    "synchronous_mode": "off | on | quorum, per scope. Only meaningful where standby_of gives that scope a standby to wait for.",
-    "synchronous_mode_strict": "With a synchronous mode, block writes when no standby is available rather than silently falling back to asynchronous.",
-    "pg_extensions": "none, or a comma-separated list: pgedge-lolor, pgedge-snowflake, pgedge-ace. Each entry may say how it arrives and what to build, as name:mode[@ref]."
+    "_comment": "Every key, under the group it belongs to. A key written in the wrong group is refused with the name of the right one, so the grouping is not merely decorative.",
+
+    "hosts": {
+      "_comment": "A topology describes the shape, not the machines. Which hosts it lands on comes from configuration/inventory.json, so the same topology deploys to staging and to production without editing it. One Spock node per host; surplus nodes share hosts on ports base_port+1, +2, ...",
+      "host_source": "inventory | localhost. 'inventory' uses the hosts already listed in the inventory file — the wizard's 'Use these hosts'. 'localhost' is the wizard's 'This machine only': it writes configuration/inventory.local.json and deploys there, leaving your real inventory untouched. The wizard's 'Enter host details now' has no equivalent here, because a topology is the answer to that question rather than another way of asking it.",
+      "inventory_file": "Path to the inventory to deploy onto, if not configuration/inventory.json. A --inventory on the command line still wins."
+    },
+
+    "install": {
+      "deploy_mode": "packages | source. A source build needs an exact pg_version and compiles on every host, 20-40 minutes each.",
+      "repo_channel": "release | staging | daily. Which pgEdge repository packages come from — the server, Spock and any packaged component. Packages mode only; leave it empty for a source build.",
+      "pg_major": "16, 17, 18 or 19.",
+      "pg_version": "An exact version such as 17.11, or 19.0beta3. Required for a source build; for packages, empty means whatever the channel carries.",
+      "spock_major": "50 or 60.",
+      "spock_branch": "Source mode only: the git branch or tag to build. Empty means the default for the Spock major (v5_STABLE for spock50, main for spock60)."
+    },
+
+    "cluster": {
+      "node_count": "Spock nodes: multi-master peers, each leading a Patroni scope of its own and each holding different data.",
+      "cluster_name": "Names the deployment: its state file, its Patroni scopes and its log directory.",
+      "db_name": "The database the mesh replicates.",
+      "db_user": "The superuser everything connects as.",
+      "base_port": "First PostgreSQL port on each machine; instances sharing a machine take the next port up.",
+      "base_restapi_port": "The same, for Patroni's REST API.",
+      "data_root": "Where data directories and configuration are written on each host.",
+      "hba_cidrs": "Extra networks to allow in pg_hba.conf, as a list of CIDRs. The cluster's own hosts are added automatically."
+    },
+
+    "components": {
+      "_comment": "One entry per optional pgEdge component, each saying how it arrives. install: packages | source | none. ref: for a source build, the branch or tag to build — omit it for the component's default branch, and leave it out entirely for a package, which comes at whatever version repo_channel carries. A packaged component uses the same channel as the server. Listing a component as 'none' is the same as leaving it out, but says so.",
+      "lolor": "Large objects that replicate: stored in the lolor schema instead of the catalog, so Spock can carry them. Needs PostgreSQL 16 or newer, and must be in shared_preload_libraries — so selecting it costs one restart of every server during setup. Each Spock node gets a distinct lolor.node (1-15), which caps a lolor cluster at 15 Spock nodes; a standby inherits its leader's value.",
+      "snowflake": "int8 sequences that embed a node id, so multi-master nodes cannot generate colliding keys. No preload and no restart. Each Spock node gets a distinct snowflake.node (1-1023); the default is deliberately invalid, so nextval() raises until it is set.",
+      "ace": "The Active Consistency Engine: a Go command-line tool that compares nodes and repairs differences. Version-independent, so one pgedge-ace package serves every PostgreSQL and both families. It installs a binary on each host rather than an extension in a database, and there is nothing to CREATE. A source build compiles it with the Go version its go.mod requires, downloading that toolchain if the host's is older.",
+      "ordering": "Components are installed on the hosts before the Spock mesh is cross-wired and created inside databases after it. zodan's spock.add_node checks that a joining node's database is clean, so creating an extension first would make the cluster impossible to wire together.",
+      "after_setup": "A cluster deployed without a component can gain one later: ./pg_deploy_cluster.sh --add-component pgedge-lolor. The topology is the starting shape, not a limit.",
+      "pg_extensions": "Alternative to the per-component entries: the packed --pg-extensions string, as name:mode[@ref] separated by commas. The two forms cannot be mixed in one topology."
+    },
+
+    "availability": {
+      "standby_of": "Spock nodes that get a Patroni standby, as names: [\"n1\", \"n2\"]. A standby is a physical replica of that node alone, which Patroni can promote. It never holds a peer's data, so it protects a node against its own failure and nothing else.",
+      "synchronous_mode": "off | on | quorum, per scope. 'off' is asynchronous: a commit returns before the standby has it. Only meaningful where standby_of gives that scope a standby to wait for.",
+      "synchronous_node_count": "With synchronous_mode on or quorum, how many standbys must confirm a commit.",
+      "synchronous_mode_strict": "Block writes when no standby is available rather than silently falling back to asynchronous."
+    }
   }
 }

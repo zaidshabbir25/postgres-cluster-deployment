@@ -520,6 +520,19 @@ print("\n".join(topology_presets.to_flags(definition)))
 PYEOF
 }
 
+topology_hosts() {
+  # topology_hosts <name> -> "host_source|inventory_file". The hosts group is
+  # the one part of a topology that cannot be expressed as a flag: it decides
+  # which inventory the rest of the flags are applied to.
+  python3 - "$1" <<'PYEOF'
+import sys
+from aspects import topology_presets
+definition = topology_presets.get(sys.argv[1])
+print("%s|%s" % (definition.get("host_source", "inventory"),
+                 definition.get("inventory_file", "")))
+PYEOF
+}
+
 topology_describe() {
   python3 - "$1" <<'PYEOF'
 import sys
@@ -531,9 +544,22 @@ PYEOF
 
 list_topologies() {
   python3 - <<'PYEOF'
+import textwrap
+
 from aspects import topology_presets
-for name, definition in topology_presets.load().items():
-    print(f"  {name:<12} {definition.get('description', '').strip()}")
+
+topologies = topology_presets.load()
+# The names have grown; a fixed column pushed the longest one's description
+# onto a ragged second start. The first sentence is the listing — the rest of
+# the description is what --topology prints before it deploys.
+width = max((len(name) for name in topologies), default=0)
+for name, definition in topologies.items():
+    summary = (definition.get("description", "").strip().split(". ") or [""])[0]
+    summary = summary.rstrip(".") + "."
+    body = textwrap.wrap(summary, 78 - width) or [""]
+    print(f"  {name:<{width}}  {body[0]}")
+    for line in body[1:]:
+        print(f"  {'':<{width}}  {line}")
 PYEOF
 }
 
@@ -542,6 +568,7 @@ PYEOF
 # ---------------------------------------------------------------------------
 
 INTERACTIVE=true
+INVENTORY_EXPLICIT=false
 ARGS=()
 DRY_RUN=false
 CLEANUP=false
@@ -571,7 +598,8 @@ CLUSTER_NAME=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    --inventory) INVENTORY="$2"; ARGS+=("--inventory" "$2"); INTERACTIVE=false; shift 2 ;;
+    --inventory) INVENTORY="$2"; INVENTORY_EXPLICIT=true
+                 ARGS+=("--inventory" "$2"); INTERACTIVE=false; shift 2 ;;
     --dry-run) DRY_RUN=true; ARGS+=("--dry-run"); INTERACTIVE=false; shift ;;
     --cleanup) CLEANUP=true; INTERACTIVE=false; shift ;;
     --purge) CLEANUP_ARGS+=("$1"); shift ;;
@@ -662,6 +690,26 @@ if [[ -n "$TOPOLOGY" ]]; then
   [[ -z "$ADD_NODE$REMOVE_NODE$HEALTH_CHECK$ADD_COMPONENT" ]] \
     || die "--topology deploys a cluster; it does not combine with the operations that change one"
   [[ "$CLEANUP" == false ]] || die "--topology and --cleanup do opposite things; pick one"
+
+  # Where it runs is settled before the flags are, because a topology that
+  # says "this machine only" has to have an inventory to deploy onto before
+  # --inventory is appended below. A --inventory that was actually typed wins
+  # over either, like every other flag.
+  if [[ "$INVENTORY_EXPLICIT" == false ]]; then
+    TOPOLOGY_HOSTS="$(topology_hosts "$TOPOLOGY")" \
+      || die "could not read topology '$TOPOLOGY' — run --list-topologies to see what is defined"
+    IFS='|' read -r TOPOLOGY_HOST_SOURCE TOPOLOGY_INVENTORY <<<"$TOPOLOGY_HOSTS"
+    if [[ "$TOPOLOGY_HOST_SOURCE" == "localhost" ]]; then
+      # Its own file, never the real inventory: a sandbox topology should not
+      # cost someone the host list they spent an afternoon on.
+      INVENTORY="$SCRIPT_DIR/configuration/inventory.local.json"
+      write_inventory "local|localhost|$(id -un)|22||yes"
+    elif [[ -n "$TOPOLOGY_INVENTORY" ]]; then
+      [[ "$TOPOLOGY_INVENTORY" == /* ]] \
+        && INVENTORY="$TOPOLOGY_INVENTORY" \
+        || INVENTORY="$SCRIPT_DIR/$TOPOLOGY_INVENTORY"
+    fi
+  fi
 
   TOPOLOGY_FLAGS=()
   while IFS= read -r flag; do

@@ -12,9 +12,16 @@ without editing it. What it holds is the shape and the versions: how many Spock
 nodes, which of them get a standby, what PostgreSQL and Spock to run, which
 add-ons, and the ports and names to use.
 
-Keys match inventory.json's `defaults` block and the fields of ClusterPlan, so
-there is one vocabulary across all three rather than a third spelling of
-`node_count`.
+A definition is written in the groups the wizard asks its questions in —
+`hosts`, `install`, `cluster`, `components`, `availability` — because a flat
+block of twenty keys gives no clue which of them belong together, and the
+wizard's order is the one people already have in their heads. The groups are
+presentation only: `get()` flattens them, so everything downstream sees one
+flat dictionary and a key is spelled the same wherever it appears.
+
+Those flattened key names match inventory.json's `defaults` block and the
+fields of ClusterPlan, so there is one vocabulary across all three rather than
+a third spelling of `node_count`.
 """
 
 import json
@@ -31,6 +38,7 @@ class TopologyError(RuntimeError):
 #: Every key a topology may set, and the flag it becomes. Order matters only
 #: for readability of the generated command line.
 FLAGS = (
+    ("inventory_file", "--inventory"),
     ("deploy_mode", "--mode"),
     ("node_count", "--nodes"),
     ("cluster_name", "--cluster"),
@@ -60,8 +68,34 @@ BOOL_FLAGS = (
     ("synchronous_mode_strict", "--sync-strict"),
 )
 
-#: Keys that describe rather than configure.
-IGNORED = ("description",)
+#: Keys that describe rather than configure. `host_source` is acted on by the
+#: shell before any flag is built, so it is not one either.
+IGNORED = ("description", "host_source")
+
+#: The groups a definition is written in, and which keys live in each. They
+#: mirror the wizard's questions, in its order. A key in the wrong group is an
+#: error naming the right one: silently accepting it anywhere would make the
+#: grouping decorative.
+GROUPS = (
+    ("hosts", ("host_source", "inventory_file")),
+    ("install", ("deploy_mode", "repo_channel", "pg_major", "pg_version",
+                 "spock_major", "spock_branch")),
+    ("cluster", ("node_count", "cluster_name", "db_name", "db_user",
+                 "base_port", "base_restapi_port", "data_root", "hba_cidrs")),
+    ("components", ()),          # its own shape; see _flatten_components
+    ("availability", ("standby_of", "synchronous_mode",
+                      "synchronous_node_count", "synchronous_mode_strict")),
+)
+
+GROUP_NAMES = tuple(name for name, _ in GROUPS)
+GROUP_OF = {key: group for group, keys in GROUPS for key in keys}
+
+VALID_HOST_SOURCES = ("inventory", "localhost")
+
+#: How a component arrives. "none" is spelled out rather than left implicit, so
+#: a topology can list every component and say which ones it does not want —
+#: the list then reads as a complete answer instead of a partial one.
+COMPONENT_NONE = "none"
 
 VALID_MODES = ("packages", "source")
 VALID_CHANNELS = ("release", "staging", "daily")
@@ -94,6 +128,104 @@ def load(path=None):
     return topologies
 
 
+def _flatten_components(name, components):
+    """Turn the `components` group into a --pg-extensions value.
+
+    Written as one entry per component rather than a packed string, because
+    `pgedge-lolor:source@v1.2.0,pgedge-snowflake:packages` is exactly the kind
+    of line that gets edited wrongly in a hurry:
+
+        "components": {
+          "lolor":     {"install": "packages"},
+          "snowflake": {"install": "source", "ref": "v2.0"},
+          "ace":       {"install": "none"}
+        }
+
+    The packed string is still accepted, as `pg_extensions`, for anyone who
+    prefers it or is copying a command line.
+    """
+    if not isinstance(components, dict):
+        raise TopologyError(
+            f"topology {name!r}: 'components' must be an object naming each "
+            f"component, not {components!r}"
+        )
+
+    if "pg_extensions" in components:
+        extra = sorted(set(components) - {"pg_extensions"})
+        if extra:
+            raise TopologyError(
+                f"topology {name!r}: 'components' gives both pg_extensions and "
+                f"{', '.join(extra)}. Use one form or the other — a packed "
+                f"string and per-component entries would disagree."
+            )
+        return str(components["pg_extensions"])
+
+    entries = []
+    for component, spec in components.items():
+        if isinstance(spec, str):
+            spec = {"install": spec}
+        if not isinstance(spec, dict):
+            raise TopologyError(
+                f"topology {name!r}: component {component!r} must be an object "
+                f'like {{"install": "packages"}}, not {spec!r}'
+            )
+        unknown = sorted(set(spec) - {"install", "ref"})
+        if unknown:
+            raise TopologyError(
+                f"topology {name!r}: component {component!r} has unknown "
+                f"key(s) {', '.join(unknown)}. A component says how it arrives "
+                f"(install) and, for a source build, what to build (ref)."
+            )
+        install = str(spec.get("install", "")).strip().lower()
+        ref = str(spec.get("ref", "")).strip()
+        if install in ("", COMPONENT_NONE, "no", "off", "false"):
+            if ref:
+                raise TopologyError(
+                    f"topology {name!r}: component {component!r} is not "
+                    f"installed, so a ref of {ref!r} would be built by nobody"
+                )
+            continue
+        entry = f"{component}:{install}"
+        if ref:
+            entry += f"@{ref}"
+        entries.append(entry)
+    return ",".join(entries) or COMPONENT_NONE
+
+
+def flatten(name, definition):
+    """One flat dictionary from a grouped definition.
+
+    Groups are how the file reads; flat keys are what everything else speaks.
+    A definition already written flat passes through unchanged, so a file
+    predating the groups still loads.
+    """
+    if not isinstance(definition, dict):
+        raise TopologyError(f"topology {name!r} is not an object")
+
+    flat = {}
+    for key, value in definition.items():
+        if key in GROUP_NAMES:
+            if key == "components":
+                flat["pg_extensions"] = _flatten_components(name, value)
+                continue
+            if not isinstance(value, dict):
+                raise TopologyError(
+                    f"topology {name!r}: group {key!r} must be an object "
+                    f"holding its settings, not {value!r}"
+                )
+            for inner, inner_value in value.items():
+                belongs = GROUP_OF.get(inner)
+                if belongs and belongs != key:
+                    raise TopologyError(
+                        f"topology {name!r}: {inner!r} is in group {key!r} but "
+                        f"belongs in {belongs!r}"
+                    )
+                flat[inner] = inner_value
+            continue
+        flat[key] = value
+    return flat
+
+
 def names(path=None):
     """Topology names, in the order the file lists them."""
     return list(load(path).keys())
@@ -107,9 +239,7 @@ def get(name, path=None):
             f"unknown topology {name!r}. Available: "
             f"{', '.join(topologies) or '(none)'}"
         )
-    definition = topologies[name]
-    if not isinstance(definition, dict):
-        raise TopologyError(f"topology {name!r} is not an object")
+    definition = flatten(name, topologies[name])
     validate(name, definition)
     return definition
 
@@ -121,14 +251,26 @@ def validate(name, definition):
     a named shape is that it was agreed once — a typo in it should surface when
     it is read, not twenty minutes into a source build.
     """
+    definition = flatten(name, definition)
     problems = []
 
     unknown = sorted(set(definition) - _known_keys())
     if unknown:
-        problems.append(
-            f"unknown key(s): {', '.join(unknown)}. Known: "
-            f"{', '.join(sorted(_known_keys() - set(IGNORED)))}"
+        known = "; ".join(
+            f"{group}: {', '.join(keys)}" for group, keys in GROUPS if keys
         )
+        problems.append(
+            f"unknown key(s): {', '.join(unknown)}. Known, by group — "
+            f"{known}; components: one entry per component"
+        )
+
+    source = str(definition.get("host_source", "inventory"))
+    if source not in VALID_HOST_SOURCES:
+        problems.append(f"host_source must be one of "
+                        f"{', '.join(VALID_HOST_SOURCES)}, not {source!r}")
+    elif source == "localhost" and definition.get("inventory_file"):
+        problems.append("host_source 'localhost' writes an inventory of its "
+                        "own, so inventory_file would be ignored")
 
     mode = definition.get("deploy_mode", "packages")
     if mode not in VALID_MODES:
@@ -222,9 +364,14 @@ def describe(name, definition):
     """A few lines saying what this shape is, for the preview."""
     standbys = definition.get("standby_of") or []
     mode = definition.get("deploy_mode", "packages")
+    source = definition.get("host_source", "inventory")
+    where = ("this machine only (localhost, no SSH)" if source == "localhost"
+             else definition.get("inventory_file")
+             or "the hosts in configuration/inventory.json")
     lines = [
         f"{name}: {definition.get('description', '').strip()}",
         "",
+        f"   Machines    : {where}",
         f"   Spock nodes : {definition.get('node_count', 2)}",
         f"   Standbys    : {', '.join(standbys) if standbys else 'none'}",
         f"   PostgreSQL  : {definition.get('pg_major', '17')}"
