@@ -629,7 +629,18 @@ def cmd_service(args):
         svc = cluster_services
 
         if action == "status":
-            entries = svc.cluster_status(executor_for, plan)
+            # --node is accepted on every other action, so a status that
+            # silently ignored it would be the one place the flag lied.
+            if args.node:
+                try:
+                    only = _node(plan, args.node, spock_only=False)
+                except ValueError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return EXIT_USAGE
+                entries = [svc.status(executor_for(only), plan, only,
+                                      host=plan.host(only.host))]
+            else:
+                entries = svc.cluster_status(executor_for, plan)
             if args.json:
                 print(json.dumps(entries, indent=2, default=str))
             else:

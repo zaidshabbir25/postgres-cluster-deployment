@@ -320,3 +320,57 @@ def test_the_probes_do_not_wait_the_full_build_timeout():
     from deployment import cleanup as cleanup_module
 
     assert cleanup_module.PROBE_TIMEOUT <= 120
+
+
+# ---------------------------------------------------------------------------
+# service status
+# ---------------------------------------------------------------------------
+
+
+def service_args(**overrides):
+    args = dict(service_action="status", node=None, json=False,
+                cluster=None, db_password=None, inventory=None)
+    args.update(overrides)
+    return types.SimpleNamespace(**args)
+
+
+@pytest.fixture
+def service_cluster(monkeypatch, plan_factory):
+    """cmd_service against a three-node plan, with nothing contacted."""
+    plan, _ = plan_factory(node_count=3)
+    monkeypatch.setattr(ops_cli, "_load", lambda args: (plan, {}))
+    monkeypatch.setattr(ops_cli, "_with_pool",
+                        lambda plan, handler: handler(lambda node: None))
+    monkeypatch.setattr(
+        ops_cli.cluster_services, "status",
+        lambda executor, plan, node, host=None: {
+            "node": node.name, "host": node.host,
+            "patroni": {"active": True, "enabled": "enabled"},
+            "postgres": {"role": "primary", "state": "running"},
+        })
+    return plan
+
+
+def test_service_status_reports_every_node_by_default(service_cluster, capsys):
+    assert ops_cli.cmd_service(service_args()) == 0
+
+    printed = capsys.readouterr().out
+    assert "n1" in printed and "n2" in printed and "n3" in printed
+
+
+def test_service_status_honours_the_node_it_was_given(service_cluster, capsys):
+    """--node is accepted on every other service action, so a status that
+    ignored it would be the one place the flag lied."""
+    assert ops_cli.cmd_service(service_args(node="n2")) == 0
+
+    printed = capsys.readouterr().out
+    assert "n2" in printed
+    assert "n1" not in printed and "n3" not in printed
+
+
+def test_service_status_for_an_unknown_node_lists_the_real_ones(service_cluster,
+                                                                capsys):
+    code = ops_cli.cmd_service(service_args(node="n9"))
+
+    assert code == ops_cli.EXIT_USAGE
+    assert "n1" in capsys.readouterr().err
