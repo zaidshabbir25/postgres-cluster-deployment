@@ -56,7 +56,8 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
                  data_root=DEFAULT_DATA_ROOT, extra_hba_cidrs=None,
                  source_build=None, zodan_sql="", run_id="",
                  synchronous_mode="off", synchronous_node_count=1,
-                 synchronous_mode_strict=False, pg_extensions=None):
+                 synchronous_mode_strict=False, pg_extensions=None,
+                 auto_repair_failover=False):
     """Build the ClusterPlan. Returns (plan, warnings)."""
     if not hosts:
         raise TopologyError("no hosts available — check the inventory")
@@ -210,6 +211,7 @@ def plan_cluster(hosts, cluster_name, node_count, standby_of=None,
         synchronous_mode=patroni_sync_mode(synchronous_mode),
         synchronous_node_count=int(synchronous_node_count or 1),
         synchronous_mode_strict=bool(synchronous_mode_strict),
+        auto_repair_failover=bool(auto_repair_failover),
         etcd_endpoints=etcd_management.endpoints(etcd_members),
         extra_hba_cidrs=list(extra_hba_cidrs or []),
         hosts=list(hosts),

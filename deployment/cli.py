@@ -162,6 +162,7 @@ def cmd_deploy(args):
         "synchronous_mode": args.sync_mode,
         "synchronous_node_count": args.sync_count,
         "synchronous_mode_strict": args.sync_strict,
+        "auto_repair_failover": getattr(args, "auto_repair_failover", False),
     }
 
     if args.mode == "source":
@@ -223,6 +224,7 @@ def _cmd_plan(args):
         synchronous_node_count=args.sync_count,
         synchronous_mode_strict=args.sync_strict,
         pg_extensions=_extensions(args),
+        auto_repair_failover=getattr(args, "auto_repair_failover", False),
     )
 
     if getattr(args, "json", False):
@@ -654,6 +656,10 @@ def build_parser():
     deploy.add_argument("--sync-strict", action="store_true",
                         help="block writes when no standby is available, "
                              "instead of falling back to asynchronous")
+    deploy.add_argument("--auto-repair-failover", action="store_true",
+                        help="retarget a node's Spock peers from Patroni "
+                             "itself when its standby is promoted, instead of "
+                             "running --repair-failover by hand afterwards")
     deploy.add_argument("--yes", action="store_true",
                         help="skip the confirmation prompt shown after the "
                              "plan summary")
@@ -706,6 +712,7 @@ def build_parser():
                              choices=("off", "on", "quorum", "async", "sync"))
     plan_parser.add_argument("--sync-count", type=int, default=1)
     plan_parser.add_argument("--sync-strict", action="store_true")
+    plan_parser.add_argument("--auto-repair-failover", action="store_true")
     plan_parser.add_argument("--json", action="store_true")
     plan_parser.set_defaults(func=_cmd_plan)
 

@@ -32,8 +32,8 @@ except ImportError as exc:  # pragma: no cover - dependency guard
         "  pip install -r requirements.txt"
     ) from exc
 
-from aspects import (auth_setup, etcd_management, pg_extensions,
-                     pg_server_management, service_management)
+from aspects import (auth_setup, etcd_management, failover_callback,
+                     pg_extensions, pg_server_management, service_management)
 
 CONFIG_DIR = "/etc/patroni"
 NAMESPACE = "/service/"
@@ -462,6 +462,13 @@ def build_config(plan, node):
         ),
     }
 
+    if getattr(plan, "auto_repair_failover", False):
+        # on_role_change runs on the member whose role changed, so the promoted
+        # standby repairs the peers itself the moment it becomes primary.
+        config["postgresql"]["callbacks"] = {
+            "on_role_change": failover_callback.script_path(node.name),
+        }
+
     config["tags"] = {
         "nofailover": False,
         "noloadbalance": False,
@@ -502,6 +509,14 @@ def write_config(executor, plan, node, run_logger=None):
         node.config_file, content,
         owner=plan.db_user, mode="640", node=node.name,
     )
+    # The config names the callback; without the script beside it, Patroni
+    # logs a missing-file error on every role change.
+    if getattr(plan, "auto_repair_failover", False):
+        failover_callback.install(
+            executor, plan, node,
+            spock_name=failover_callback.spock_name_for(plan, node),
+            run_logger=run_logger,
+        )
     if run_logger:
         run_logger.node(node.name, f"patroni config written to {node.config_file}")
     return node.config_file

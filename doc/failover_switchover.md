@@ -107,8 +107,61 @@ host's disk.
 The command is safe to run when nothing has moved: it checks who leads the
 scope and says there is nothing to do.
 
+To have this happen on its own, see
+[Doing the retarget automatically](#doing-the-retarget-automatically).
+
 `pg_cluster_status.sh` also flags this on its own, so a node reported as
 `replica` where you expect a leader means the retarget has not been done.
+
+## Doing the retarget automatically
+
+The repair above can be handed to Patroni instead of being remembered:
+
+```bash
+./pg_cluster_ctl.sh service auto-repair --on
+./pg_cluster_ctl.sh service auto-repair          # show the current setting
+./pg_cluster_ctl.sh service auto-repair --off
+```
+
+It is off by default, and can also be switched on at deploy time with
+`--auto-repair-failover`.
+
+Turning it on writes a small shell script onto every member, names it as
+Patroni's `on_role_change` callback in each local `patroni.yml`, and reloads
+Patroni. Nothing restarts, no leader moves, and the cluster stays up
+throughout.
+
+After that, a promoted standby retargets the peers itself, within a second or
+so of taking the leader lock. `--repair-failover` still works and is still
+worth running if you want to be sure.
+
+**How it works, in case you have to debug it.** `on_role_change` fires on the
+member whose role changed, with the new role as an argument, so the script
+runs on the node that was just promoted. It exits immediately unless the role
+is `primary`, which means the demoted old leader does nothing. It then asks
+its own `spock.sub_show_status()` for the peers — that list is current and
+needs no maintenance, so a cluster that gains a node later needs no new
+scripts — and runs the same four statements on each peer that
+`--repair-failover` does.
+
+Each node logs every run:
+
+```
+/var/log/pgedge/<node>-role-change.log
+```
+
+The script is deliberately self-contained — shell, no Python, no repository
+checkout, no SSH. The machine that ran the deployment may be a laptop that is
+closed when the failover happens; a cluster host can always reach its peers.
+
+**What to expect from it.** Patroni ignores the script's exit status, so the
+log is the only record — check it first. One unreachable peer does not stop
+the others being repaired. A scope that flaps fires the callback repeatedly,
+which is safe: the repair is idempotent, and an interface that already exists
+is treated as success rather than an error.
+
+It does not change what a failover costs, only who notices. The subscriptions
+are still briefly disabled and re-enabled on each peer.
 
 ## Bringing the old node back
 
@@ -178,6 +231,7 @@ correct; wait and try again.
 | Simulate a failure | `./pg_cluster_ctl.sh service stop --node n1` |
 | Bring a node back | `./pg_cluster_ctl.sh service start --node n1` |
 | Retarget peers after a move | `./pg_cluster_status.sh --repair-failover n1` |
+| Do that automatically from now on | `./pg_cluster_ctl.sh service auto-repair --on` |
 | Rebuild a member from its leader | `./pg_cluster_ctl.sh service reinit --node n1s1 n1` |
 | Restart PostgreSQL only | `./pg_cluster_ctl.sh service restart --node n1 --component postgres` |
 | Reload config, no restart | `./pg_cluster_ctl.sh service reload --node n1` |

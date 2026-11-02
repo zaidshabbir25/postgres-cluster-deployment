@@ -25,6 +25,8 @@ from aspects import (
     cluster_services,
     consistency,
     db_operations,
+    failover_callback,
+    patroni_management,
     spock_operations,
     state,
 )
@@ -705,6 +707,64 @@ def cmd_service(args):
     return _with_pool(plan, run)
 
 
+def cmd_auto_repair(args):
+    """Turn Patroni's own failover retargeting on or off, cluster-wide.
+
+    Enabling it on a running cluster means writing the callback onto every
+    member, naming it in each local patroni.yml, and reloading Patroni —
+    which re-reads that file without touching PostgreSQL. Nothing restarts and
+    no leader moves.
+    """
+    plan, _ = _load(args)
+
+    if args.on is None:
+        state_word = "on" if plan.auto_repair_failover else "off"
+        print(f"automatic failover repair is {state_word}")
+        if plan.auto_repair_failover:
+            print(f"  callback: {failover_callback.script_path('<node>')}")
+            print(f"  log:      {failover_callback.log_path('<node>')}")
+        return EXIT_OK
+
+    plan.auto_repair_failover = args.on
+
+    def run(executor_for):
+        failures = []
+        for node in plan.nodes:
+            executor = executor_for(node)
+            try:
+                if args.on:
+                    failover_callback.install(
+                        executor, plan, node,
+                        spock_name=failover_callback.spock_name_for(plan, node),
+                    )
+                else:
+                    failover_callback.remove(executor, node)
+                patroni_management.write_config(executor, plan, node)
+                ok, message = cluster_services.reload(
+                    executor, plan, node, component="patroni")
+                print(f"{'ok' if ok else 'FAILED'} {node.name}: {message}")
+                if not ok:
+                    failures.append(node.name)
+            except Exception as exc:              # noqa: BLE001 - reported
+                print(f"FAILED {node.name}: {exc}", file=sys.stderr)
+                failures.append(node.name)
+
+        if failures:
+            print(f"\n{len(failures)} node(s) not updated: "
+                  f"{', '.join(failures)}", file=sys.stderr)
+            return EXIT_FAIL
+
+        state.save(plan)
+        print(f"\nautomatic failover repair is "
+              f"{'on' if args.on else 'off'} for every node")
+        if args.on:
+            print("A promoted standby now retargets its peers itself; "
+                  "--repair-failover stays available for doing it by hand.")
+        return EXIT_OK
+
+    return _with_pool(plan, run)
+
+
 # ===========================================================================
 # package
 # ===========================================================================
@@ -1236,6 +1296,18 @@ def _register_service(subparsers, add_common):
     p = base("reinit", "rebuild a member from its leader", with_component=False)
     p.add_argument("member", help="member to rebuild")
     p.add_argument("--yes", action="store_true")
+
+    auto = actions.add_parser(
+        "auto-repair",
+        help="retarget Spock peers automatically when a standby is promoted",
+    )
+    add_common(auto)
+    switch = auto.add_mutually_exclusive_group()
+    switch.add_argument("--on", dest="on", action="store_true", default=None,
+                        help="install the Patroni callback on every node")
+    switch.add_argument("--off", dest="on", action="store_false",
+                        help="remove it")
+    auto.set_defaults(func=cmd_auto_repair)
 
 
 def _register_package(subparsers, add_common):

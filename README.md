@@ -1298,6 +1298,13 @@ old machine back afterwards are written up in
 [doc/failover_switchover.md](doc/failover_switchover.md) — including the
 retargeting step Spock needs after any failover.
 
+That step can run on its own. `service auto-repair --on` (or
+`--auto-repair-failover` at deploy time) installs a Patroni `on_role_change`
+callback on every member, so a promoted standby points the Spock peers at
+itself instead of waiting for someone to run `--repair-failover`. It is off by
+default, because it is a cluster-wide action triggered by one node's
+promotion.
+
 ### package — the CLI's `um`, over dnf and apt
 
 ```bash

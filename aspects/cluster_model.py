@@ -161,6 +161,12 @@ class ClusterPlan:
     # aspects/pg_extensions.py for what the entries mean.
     pg_extensions: List[Dict[str, Any]] = field(default_factory=list)
 
+    # Retarget a Spock node's peers from Patroni itself when its standby is
+    # promoted, instead of leaving it to --repair-failover by hand. Off by
+    # default: it is a cluster-wide action triggered by one node's promotion,
+    # which is a thing to opt into. See aspects/failover_callback.py.
+    auto_repair_failover: bool = False
+
     run_id: str = ""
 
     # ------------------------------------------------------------------
