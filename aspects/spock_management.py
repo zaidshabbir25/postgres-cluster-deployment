@@ -824,32 +824,39 @@ def retarget_after_failover(executor_for, plan, spock_node, new_address,
 
         steps = [
             (f"SELECT spock.sub_disable({_lit(subscription)}, true);",
-             "disable subscription"),
+             "disable subscription", ()),
+            # A cluster that has failed over to this address before already has
+            # the interface, and saying so is not a failure: the switch below
+            # is what matters and it needs exactly this interface to exist.
             (f"SELECT spock.node_add_interface({_lit(spock_node.name)}, "
-             f"{_lit(interface)}, {_lit(new_dsn)});", "add interface"),
+             f"{_lit(interface)}, {_lit(new_dsn)});", "add interface",
+             ("already exists",)),
             (f"SELECT spock.sub_alter_interface({_lit(subscription)}, "
-             f"{_lit(interface)});", "switch interface"),
+             f"{_lit(interface)});", "switch interface", ()),
             # immediate := true restarts the apply worker now; without it the
             # subscription stays 'down' until the next worker cycle.
             (f"SELECT spock.sub_enable({_lit(subscription)}, true);",
-             "re-enable subscription"),
+             "re-enable subscription", ()),
         ]
 
-        for sql, description in steps:
+        for sql, description, tolerated in steps:
             code, output = pg_server_management.psql(
                 executor, peer.bin_dir, peer.pg_port, plan.db_user, sql,
                 dbname=plan.db_name, node=peer.name, check=False,
             )
+            text = output.strip()
+            lowered = text.lower()
+            ok = code == 0 or any(phrase in lowered for phrase in tolerated)
             results.append(
                 {
                     "peer": peer.name,
                     "step": description,
-                    "ok": code == 0,
-                    "output": output.strip(),
+                    "ok": ok,
+                    "output": text,
                 }
             )
-            if code != 0 and run_logger:
-                run_logger.warn(f"{peer.name}: {description} failed — {output.strip()}")
+            if not ok and run_logger:
+                run_logger.warn(f"{peer.name}: {description} failed — {text}")
 
     return results
 
