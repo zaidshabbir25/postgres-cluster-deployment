@@ -1293,6 +1293,11 @@ postmaster and would treat it as a crash, restarting it or failing over. So
 `--component postgres` routes restarts and reloads through `patronictl`, and
 stopping postgres directly is refused with an explanation rather than attempted.
 
+Moving a leader to its standby, testing an unplanned failure, and getting the
+old machine back afterwards are written up in
+[doc/failover_switchover.md](doc/failover_switchover.md) — including the
+retargeting step Spock needs after any failover.
+
 ### package — the CLI's `um`, over dnf and apt
 
 ```bash
