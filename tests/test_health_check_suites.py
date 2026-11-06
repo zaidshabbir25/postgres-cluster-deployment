@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Running each component's upstream regression suite.
+"""Running each component's health check against a deployed cluster.
 
-The four suites have almost nothing in common, and the differences are the
-point: two are pg_regress against a live server, one is a Python harness built
-for a different directory layout, and one starts its own containers and never
-looks at the deployed cluster. What is worth testing is that each is run the
-way its own project intends, that a suite which cannot run here says why rather
-than failing, and that the report does not imply ACE checked the cluster.
+The suites have almost nothing in common, and the differences are the point:
+two are cases that ship with this tool and run through psql and dblink, one is
+an upstream Python harness built for a different directory layout, one is the
+ACE binary pointed at the nodes, and one (ace-integration) starts its own
+containers and never looks at the deployed cluster. What is worth testing is
+that each is run the way it should be, that a suite which cannot run here says
+why rather than failing, and that the report never implies something checked
+the cluster when it did not.
 """
+
+import re
 
 import pytest
 
 from aspects import pg_extensions
 from aspects.cluster_model import ClusterPlan, Host, Node, ROLE_SPOCK, ROLE_STANDBY
 from deployment import health_check
-from regression import runner as regression
+from aspects.health_check import runner as regression
 from tests.conftest import FakeExecutor, RecordingLogger
 
 PGXS = "/usr/lib/pgsql/pgxs/src/makefiles/pgxs.mk"
@@ -53,18 +57,51 @@ def ready(**extra):
 # ---------------------------------------------------------------------------
 
 
-def test_all_four_components_are_known():
-    assert regression.known_components() == ["ace", "lolor", "snowflake", "spock"]
+def test_every_component_is_known():
+    assert regression.known_components() == [
+        "ace", "ace-integration", "lolor", "lolor-upstream", "snowflake",
+        "spock", "spock-upstream"]
+
+
+def test_all_means_everything_but_the_by_name_only_suites():
+    """ace-integration starts containers of its own; a run of 'all' that
+    included it would spend most of an hour proving nothing about the cluster
+    — and report it beside results that do."""
+    assert regression.default_components() == [
+        "ace", "lolor", "lolor-upstream", "snowflake", "spock",
+        "spock-upstream"]
+    assert "ace-integration" in regression.known_components()
+
+
+def test_a_component_name_runs_both_the_cluster_check_and_upstream():
+    """What the operator wants from `--health_check spock` is everything that
+    checks Spock: the cases for the running mesh, and upstream's own suite
+    fetched fresh at the branch the cluster came from."""
+    assert regression.parse_components("spock") == ["spock", "spock-upstream"]
+    assert regression.parse_components("lolor") == ["lolor", "lolor-upstream"]
+
+
+def test_either_half_can_be_asked_for_alone():
+    assert regression.parse_components("spock-upstream") == ["spock-upstream"]
+    assert regression.parse_components("spock,spock-upstream") == \
+        ["spock", "spock-upstream"]
+
+
+def test_upstream_means_every_upstream_suite():
+    assert regression.parse_components("upstream") == \
+        ["lolor-upstream", "spock-upstream"]
 
 
 def test_the_component_list_is_read_in_the_order_it_was_given():
-    assert regression.parse_components("spock,lolor") == ["spock", "lolor"]
-    assert regression.parse_components("all") == regression.known_components()
+    assert regression.parse_components("spock,lolor") == [
+        "spock", "spock-upstream", "lolor", "lolor-upstream"]
+    assert regression.parse_components("all") == regression.default_components()
     assert regression.parse_components("") == []
 
 
 def test_package_names_and_spock_majors_resolve_to_their_suite():
-    assert regression.parse_components("pgedge-lolor,spock50") == ["lolor", "spock"]
+    assert regression.parse_components("pgedge-lolor,spock50") == [
+        "lolor", "lolor-upstream", "spock", "spock-upstream"]
 
 
 def test_a_component_with_no_suite_is_refused_by_name():
@@ -95,16 +132,51 @@ def test_spock_reports_that_its_cases_are_not_fetched():
 
 
 def test_an_extensions_tests_follow_the_ref_it_was_built_from():
-    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor:source@v1.2.3"))
+    """snowflake is still fetched from upstream, so its harness has to match
+    the build: a newer suite tests behaviour the installed extension lacks."""
+    plan = plan_with(pg_extensions=pg_extensions.parse(
+        "pgedge-snowflake:source@v2.0.1"))
 
-    assert health_check.ref_for(plan, "lolor") == "v1.2.3"
+    assert health_check.ref_for(plan, "snowflake") == "v2.0.1"
+
+
+def test_spock_upstream_follows_the_branch_the_cluster_came_from():
+    """A cluster on spock50 is tested by v5_STABLE's cases today; one built
+    from a tag by that tag's. Fetched at that ref every run, so the cases are
+    whatever upstream has now for *that* line, never for a different one."""
+    assert health_check.ref_for(plan_with(spock_major="50"),
+                                "spock-upstream") == "v5_STABLE"
+    assert health_check.ref_for(plan_with(spock_major="60"),
+                                "spock-upstream") == "main"
+    plan = plan_with(spock_major="50",
+                     source_build={"spock_branch": "v5.0.11"})
+    assert health_check.ref_for(plan, "spock-upstream") == "v5.0.11"
+
+
+def test_lolor_upstream_follows_the_ref_lolor_was_built_from():
+    plan = plan_with(pg_extensions=pg_extensions.parse(
+        "pgedge-lolor:source@v1.2.3"))
+
+    assert health_check.ref_for(plan, "lolor-upstream") == "v1.2.3"
+    assert health_check.ref_for(plan_with(), "lolor-upstream") == \
+        pg_extensions.CATALOG["lolor"].default_ref
+
+
+def test_in_tree_and_installed_checks_have_no_ref_to_follow():
+    """Their version is whatever the cluster runs; there is nothing to fetch."""
+    plan = plan_with(pg_extensions=pg_extensions.parse(
+        "pgedge-lolor:source@v1.2.3"))
+
+    assert health_check.ref_for(plan, "lolor") == "in-tree"
+    assert health_check.ref_for(plan, "spock") == "in-tree"
+    assert health_check.ref_for(plan, "ace") == "installed"
 
 
 def test_a_packaged_extension_falls_back_to_the_default_branch():
-    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-lolor"))
+    plan = plan_with(pg_extensions=pg_extensions.parse("pgedge-snowflake"))
 
-    assert health_check.ref_for(plan, "lolor") == \
-        pg_extensions.CATALOG["lolor"].default_ref
+    assert health_check.ref_for(plan, "snowflake") == \
+        pg_extensions.CATALOG["snowflake"].default_ref
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +193,18 @@ def spock_ready(**extra):
 
 
 def spock_sql_files():
-    from regression import spock as spock_suite
+    from aspects.health_check import spock as spock_suite
 
     return sorted(spock_suite.SQL_DIR.glob("*.sql"))
+
+
+def in_tree_suites():
+    """Every suite whose cases ship with this tool, with its schema."""
+    from aspects.health_check import lolor as lolor_suite
+    from aspects.health_check import spock as spock_suite
+
+    return [(spock_suite.SpockSuite, spock_suite.SCHEMA),
+            (lolor_suite.LolorSuite, lolor_suite.SCHEMA)]
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +245,12 @@ def test_no_case_reconnects_or_creates_a_role():
     """Read as the files, not as commands: peers are reached with dblink in one
     session, so nothing depends on psql handling a conninfo in a variable and
     nothing needs a password the suite does not already have."""
-    for path in spock_sql_files():
-        text = path.read_text()
-        assert "\\c " not in text, f"{path.name} reconnects"
-        assert "CREATE USER" not in text.upper(), f"{path.name} creates a role"
-        assert "CREATE DATABASE" not in text.upper(), f"{path.name} creates a db"
+    for suite, _ in in_tree_suites():
+        for path in sorted(suite.sql_dir().glob("*.sql")):
+            text = path.read_text()
+            assert "\\c " not in text, f"{path.name} reconnects"
+            assert "CREATE USER" not in text.upper(), f"{path.name} creates a role"
+            assert "CREATE DATABASE" not in text.upper(), f"{path.name} creates a db"
 
 
 def test_the_cases_run_against_the_clusters_own_node_and_database():
@@ -219,23 +301,21 @@ def test_the_node_and_its_peer_count_are_passed_as_settings():
 
 
 def test_every_case_has_an_expected_file():
-    from regression import spock as spock_suite
-
-    for path in spock_sql_files():
-        expected = spock_suite.EXPECTED_DIR / f"{path.stem}.out"
-        assert expected.exists(), f"{path.name} has no expected output"
+    for suite, _ in in_tree_suites():
+        for path in sorted(suite.sql_dir().glob("*.sql")):
+            expected = suite.expected_dir() / f"{path.stem}.out"
+            assert expected.exists(), f"{suite.name}/{path.name} has no expected output"
 
 
 def test_every_expected_line_asserts_something_true():
     """A healthy cluster prints only `name|true`. Anything naming a node is
     printed solely when that node is wrong, so it cannot appear here."""
-    from regression import spock as spock_suite
-
-    for path in sorted(spock_suite.EXPECTED_DIR.glob("*.out")):
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            assert line.endswith("|true"), f"{path.name}: {line}"
+    for suite, _ in in_tree_suites():
+        for path in sorted(suite.expected_dir().glob("*.out")):
+            for line in path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                assert line.endswith("|true"), f"{suite.name}/{path.name}: {line}"
 
 
 def test_the_cases_run_in_filename_order_because_they_depend_on_it():
@@ -250,7 +330,7 @@ def test_the_cases_run_in_filename_order_because_they_depend_on_it():
 def test_the_suite_cleans_up_after_itself():
     """These objects replicate, so leaving them behind leaves them on every
     node and the next run finds its own table already there."""
-    from regression import spock as spock_suite
+    from aspects.health_check import spock as spock_suite
 
     cleanup = (spock_suite.SQL_DIR / "08_cleanup.sql").read_text()
 
@@ -259,14 +339,61 @@ def test_the_suite_cleans_up_after_itself():
 
 
 def test_only_the_suites_own_schema_is_touched():
-    from regression import spock as spock_suite
+    for suite, schema in in_tree_suites():
+        joined = "\n".join(path.read_text()
+                            for path in sorted(suite.sql_dir().glob("*.sql")))
 
-    created = [path.read_text() for path in spock_sql_files()]
-    joined = "\n".join(created)
+        assert f"CREATE SCHEMA IF NOT EXISTS {schema}" in joined, suite.name
+        assert "DROP TABLE" not in joined.upper().replace(
+            f"DROP TABLE IF EXISTS {schema.upper()}", ""), suite.name
+        # Every DROP SCHEMA names the suite's own.
+        for match in re.finditer(r"DROP SCHEMA(?: IF EXISTS)? (\w+)", joined):
+            assert match.group(1) == schema, f"{suite.name} drops {match.group(1)}"
 
-    assert "CREATE SCHEMA IF NOT EXISTS spock_regress" in joined
-    assert "DROP TABLE" not in joined.upper().replace(
-        "DROP TABLE IF EXISTS SPOCK_REGRESS", "")
+
+def test_each_in_tree_suite_reads_the_node_from_its_own_setting():
+    """The runner sets <prefix>.node and <prefix>.node_count per session; a
+    case reading a different prefix would see an empty setting and compare
+    every peer against nothing."""
+    for suite, _ in in_tree_suites():
+        prefix = suite.settings_prefix
+        joined = "\n".join(path.read_text()
+                            for path in sorted(suite.sql_dir().glob("*.sql")))
+        for other, _ in in_tree_suites():
+            if other is not suite:
+                assert f"'{other.settings_prefix}." not in joined, (
+                    f"{suite.name} reads {other.name}'s setting")
+        assert f"current_setting('{prefix}.node')" in joined, suite.name
+
+
+def test_the_lolor_cases_create_remove_and_confirm_on_every_peer():
+    """The cases are the test; this pins their shape so an edit that drops
+    the cross-node confirmation is noticed."""
+    from aspects.health_check import lolor as lolor_suite
+
+    joined = "\n".join(path.read_text()
+                        for path in sorted(lolor_suite.SQL_DIR.glob("*.sql")))
+
+    assert "lo_from_bytea(0," in joined, "creates through the standard API"
+    assert "lo_put(" in joined and "lo_unlink(" in joined
+    assert "lolor_regress.await(" in joined, "waits for peers, never assumes"
+    assert "lo_get(" in joined, "reads through the peer's own lolor"
+    assert "lolor_regress.objects" in joined, "records the OID for cleanup"
+
+
+def test_lolor_cases_run_through_the_same_runner_as_spock():
+    plan = plan_with()
+    executor = ready(**{"diff -u": (True, "")})
+
+    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
+                                               "in-tree")
+
+    assert result.status == regression.PASSED
+    assert result.tests["total"] == 4
+    # Shell-quoted by the time it reaches the executor, so fragments.
+    assert any("SET lolor_regress.node" in c and "n1" in c
+               for c in executor.commands)
+    assert not executor.ran("git clone")
 
 
 # ---------------------------------------------------------------------------
@@ -381,11 +508,73 @@ def test_snowflake_needs_two_spock_nodes():
 # ---------------------------------------------------------------------------
 
 
-def test_ace_is_marked_as_not_testing_the_deployed_cluster():
-    """Its integration tests start their own three-node cluster with
-    testcontainers; a green result says nothing about this one."""
-    assert regression.suite_for("ace").targets_cluster is False
+def test_ace_integration_is_marked_as_not_testing_the_deployed_cluster():
+    """ACE's own tests start a three-node cluster with testcontainers; a green
+    result says nothing about this one. The ace check, by contrast, is the
+    binary pointed at these nodes."""
+    assert regression.suite_for("ace-integration").targets_cluster is False
+    assert regression.suite_for("ace").targets_cluster is True
     assert regression.suite_for("spock").targets_cluster is True
+
+
+def test_ace_runs_the_installed_binary_against_every_spock_node():
+    plan = plan_with(names=("n1", "n2", "n3"), ports=(5432, 5433, 5434))
+    plan.db_password = "secret"
+    executor = ready(**{"command -v ace": (True, "")})
+
+    result = regression.suite_for("ace").run(executor, plan, plan.node("n1"),
+                                             "installed")
+
+    assert result.status == regression.PASSED, result.detail
+    assert result.tests == {"total": 3, "passed": 3, "failed": 0}
+    service = executor.written[f"{regression.REGRESSION_ROOT}/ace/pg_service.conf"]
+    assert "[pgedge]" in service
+    for name in ("n1", "n2", "n3"):
+        assert f"[pgedge.{name}]" in service
+    assert "password=secret" in service
+    assert executor.ran("ACE_PGSERVICEFILE=")
+    for check in ("spock-diff", "schema-diff pgedge public",
+                  "repset-diff pgedge default"):
+        assert executor.ran(check), check
+
+
+def test_ace_leaves_standbys_out_of_the_cluster_it_compares():
+    """A standby holds the same data as its leader; comparing the two is
+    comparing a node with itself, and it is read-only besides."""
+    plan = plan_with(names=("n1", "n2"), ports=(5432, 5433))
+    plan.nodes.append(node("n1s1", 5434, role=ROLE_STANDBY, leader="n1"))
+
+    service = regression.suite_for("ace").service_content(plan)
+
+    assert "[pgedge.n1s1]" not in service
+    assert "[pgedge.n2]" in service
+
+
+def test_ace_reads_a_mismatch_in_its_own_words_even_on_exit_zero():
+    plan = plan_with()
+    executor = ready(**{
+        "command -v ace": (True, ""),
+        "repset-diff": (True, "INFO ✘ TABLES DO NOT MATCH\n"
+                              "WARN Found 12 differences between n1/n2"),
+    })
+
+    result = regression.suite_for("ace").run(executor, plan, plan.node("n1"),
+                                             "installed")
+
+    assert result.status == regression.FAILED
+    assert result.tests["failed"] == 1
+    assert "DO NOT MATCH" in result.output
+
+
+def test_a_host_without_the_ace_binary_is_skipped_naming_the_package():
+    plan = plan_with()
+    executor = ready(**{"command -v ace": (False, ""), "test -x": (False, "")})
+
+    result = regression.suite_for("ace").run(executor, plan, plan.node("n1"),
+                                             "installed")
+
+    assert result.status == regression.SKIPPED
+    assert "pgedge-ace" in result.detail
 
 
 def test_ace_runs_go_test_with_the_cache_defeated():
@@ -394,8 +583,8 @@ def test_ace_runs_go_test_with_the_cache_defeated():
     plan = plan_with()
     executor = ready(**{"go test": (True, "--- PASS: TestOne\n--- PASS: TestTwo\nok")})
 
-    result = regression.suite_for("ace").run(executor, plan, plan.node("n1"),
-                                             "main")
+    result = regression.suite_for("ace-integration").run(
+        executor, plan, plan.node("n1"), "main")
 
     assert result.status == regression.PASSED
     command = next(c for c in executor.commands if "go test" in c)
@@ -404,7 +593,7 @@ def test_ace_runs_go_test_with_the_cache_defeated():
 
 
 def test_ace_counts_what_go_test_reported():
-    suite = regression.suite_for("ace")
+    suite = regression.suite_for("ace-integration")
     output = "--- PASS: TestA\n--- FAIL: TestB\n--- SKIP: TestC\nFAIL"
 
     assert suite.parse(output) == {"total": 3, "passed": 1, "failed": 1,
@@ -417,8 +606,8 @@ def test_a_host_with_docker_installed_but_not_running_is_skipped():
     plan = plan_with()
     executor = ready(**{"docker info": (False, "Cannot connect to the daemon")})
 
-    result = regression.suite_for("ace").run(executor, plan, plan.node("n1"),
-                                             "main")
+    result = regression.suite_for("ace-integration").run(
+        executor, plan, plan.node("n1"), "main")
 
     assert result.status == regression.SKIPPED
     assert "Docker daemon" in result.detail
@@ -428,8 +617,8 @@ def test_a_host_without_go_is_skipped_naming_go():
     plan = plan_with()
     executor = ready(**{"command -v go": (False, "")})
 
-    result = regression.suite_for("ace").run(executor, plan, plan.node("n1"),
-                                             "main")
+    result = regression.suite_for("ace-integration").run(
+        executor, plan, plan.node("n1"), "main")
 
     assert result.status == regression.SKIPPED
     assert "go" in result.detail
@@ -470,7 +659,7 @@ def test_the_report_says_when_a_suite_tested_something_else():
 
 def test_a_skipped_suite_is_not_claimed_to_have_tested_anything():
     text = "\n".join(health_check.summary_lines(results(
-        ("ace", regression.SKIPPED, {}, False),
+        ("ace-integration", regression.SKIPPED, {}, False),
     )))
 
     assert "not against this cluster" not in text
@@ -479,6 +668,13 @@ def test_a_skipped_suite_is_not_claimed_to_have_tested_anything():
 # ---------------------------------------------------------------------------
 # making a skip actionable
 # ---------------------------------------------------------------------------
+
+
+class PgxsStandIn(regression.PgRegressSuite):
+    """A PGXS extension's suite, as snowflake's or lolor's upstream one would
+    be if run that way: the base class is still what any such suite gets."""
+    name = "pgxs-stand-in"
+    repo = "https://example.invalid/stand-in.git"
 
 
 def test_a_missing_pgxs_names_the_package_to_install():
@@ -490,8 +686,7 @@ def test_a_missing_pgxs_names_the_package_to_install():
         "FROM pg_extension WHERE extname": (True, "1\n"),
     })
 
-    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
-                                               "main")
+    result = PgxsStandIn().run(executor, plan, plan.node("n1"), "main")
 
     assert "pgedge-postgresql17-devel" in result.detail
     assert "--install-requirements" in result.detail
@@ -505,8 +700,7 @@ def test_the_debian_package_is_named_on_a_debian_host():
         "FROM pg_extension WHERE extname": (True, "1\n"),
     })
 
-    result = regression.suite_for("lolor").run(executor, plan, plan.node("n1"),
-                                               "main")
+    result = PgxsStandIn().run(executor, plan, plan.node("n1"), "main")
 
     assert "pgedge-postgresql-17-dev" in result.detail
 
@@ -533,7 +727,7 @@ def test_install_requirements_installs_it_and_runs_the_suite():
         "make installcheck": (True, "All 23 tests passed."),
     })
 
-    result = regression.suite_for("lolor").run(
+    result = PgxsStandIn().run(
         executor, plan, plan.node("n1"), "main",
         install_requirements=True, run_logger=RecordingLogger(),
     )
@@ -549,8 +743,8 @@ def test_go_and_docker_are_not_installed_behind_the_operators_back():
     plan = plan_with()
     executor = ready(**{"command -v go": (False, "")})
 
-    result = regression.suite_for("ace").run(executor, plan, plan.node("n1"),
-                                             "main", install_requirements=True)
+    result = regression.suite_for("ace-integration").run(
+        executor, plan, plan.node("n1"), "main", install_requirements=True)
 
     assert result.status == regression.SKIPPED
     assert not any("install" in c and "go" in c for c in executor.commands)
@@ -566,7 +760,7 @@ def test_a_run_where_every_suite_skipped_does_not_claim_success():
     """Nothing failing is not the same as something passing."""
     text = "\n".join(health_check.summary_lines(results(
         ("spock", regression.SKIPPED, {}, True),
-        ("ace", regression.SKIPPED, {}, False),
+        ("ace-integration", regression.SKIPPED, {}, False),
     )))
 
     assert "nothing was tested" in text
@@ -622,3 +816,107 @@ def test_a_failure_with_no_error_line_still_reports_cleanly():
 
     assert "... FAILED" in result.output
     assert result.tests == {"total": 1, "passed": 0, "failed": 1}
+
+
+# ---------------------------------------------------------------------------
+# upstream suites, fetched fresh every run
+# ---------------------------------------------------------------------------
+
+
+def upstream_ready(**extra):
+    replies = {
+        "pg_config --pgxs": (True, PGXS),
+        f"test -f {PGXS}": (True, ""),
+        "--pkglibdir": (True, "/usr/pgsql-17/lib\n"),
+        "test -f /usr/pgsql-17/lib/": (True, ""),
+    }
+    replies.update(extra)
+    return FakeExecutor(replies=replies)
+
+
+def test_spock_upstream_is_cloned_at_the_ref_on_every_run():
+    """Not cached, not copied from this repository: `git clone` at the ref,
+    so the cases are whatever the branch holds today."""
+    plan = plan_with()
+    executor = upstream_ready(**{"make regresscheck": (True, "All 40 tests passed.")})
+
+    result = regression.suite_for("spock-upstream").run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
+
+    assert result.status == regression.PASSED, result.detail
+    clone = next(c for c in executor.commands if "git clone" in c)
+    assert "--branch v5_STABLE" in clone and "pgEdge/spock" in clone
+    assert any("rm -rf" in c for c in executor.commands), "fresh, not reused"
+
+
+def test_spock_upstream_runs_regresscheck_and_never_install_or_check():
+    """`check` is `check: install regresscheck`; on a cluster host the install
+    half would replace the spock.so every node is running."""
+    plan = plan_with()
+    executor = upstream_ready()
+
+    regression.suite_for("spock-upstream").run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
+
+    makes = [c for c in executor.commands if "make " in c]
+    assert any("make regresscheck" in c for c in makes)
+    assert not any("make install" in c or "make check" in c for c in makes)
+
+
+def test_upstream_suites_run_as_the_database_user():
+    """pg_regress initdb's a scratch instance, and initdb refuses root."""
+    plan = plan_with()
+
+    class Recording(FakeExecutor):
+        users = []
+
+        def try_run(self, command, user="root", **kwargs):
+            # The suite itself, not the `command -v make` requirement probe.
+            if "make installcheck" in command or "make regresscheck" in command:
+                self.users.append(user)
+            return super().try_run(command, **kwargs)
+
+    executor = Recording(replies=upstream_ready().replies)
+    regression.suite_for("lolor-upstream").run(
+        executor, plan, plan.node("n1"), "main")
+
+    assert executor.users == ["postgres"]
+    assert any("chown -R postgres" in c for c in executor.commands)
+
+
+def test_upstream_suites_are_not_pointed_at_a_cluster_node():
+    """They start their own instance; PGHOST/PGPORT would make pg_regress's
+    temp-instance setup and the cluster disagree about where the server is."""
+    plan = plan_with()
+    executor = upstream_ready()
+
+    regression.suite_for("lolor-upstream").run(
+        executor, plan, plan.node("n1"), "main")
+
+    make = next(c for c in executor.commands if "make installcheck" in c)
+    assert "PGHOST" not in make and "PGPORT" not in make
+
+
+def test_an_upstream_suite_without_its_library_is_skipped_naming_it():
+    plan = plan_with()
+    executor = upstream_ready(**{"test -f /usr/pgsql-17/lib/": (False, "")})
+
+    result = regression.suite_for("spock-upstream").run(
+        executor, plan, plan.node("n1"), "v5_STABLE")
+
+    assert result.status == regression.SKIPPED
+    assert "spock.so" in result.detail
+
+
+def test_the_report_says_what_an_upstream_verdict_is_about():
+    text = "\n".join(health_check.summary_lines([
+        regression.SuiteResult(component="spock-upstream",
+                               status=regression.PASSED, ref="v5_STABLE",
+                               tests={"total": 40, "passed": 40, "failed": 0},
+                               targets_cluster=False,
+                               scope="a scratch instance on the host, with "
+                                     "the Spock library the nodes run"),
+    ]))
+
+    assert "spock-upstream ran against a scratch instance" in text
+    assert "not against this cluster" in text

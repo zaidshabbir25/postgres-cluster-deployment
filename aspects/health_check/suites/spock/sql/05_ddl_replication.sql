@@ -9,15 +9,20 @@
 -- value in both places.
 SET client_min_messages = warning;
 
-SELECT spock.replicate_ddl('CREATE SCHEMA IF NOT EXISTS spock_regress');
+-- Each call through a counted subquery: whatever replicate_ddl returns, a bare
+-- SELECT of it prints a row that no expected line matches.
+SELECT 'schema_ddl_sent|' || (count(*) = 1)::text
+FROM (SELECT spock.replicate_ddl('CREATE SCHEMA IF NOT EXISTS spock_regress'))
+     AS sent;
 
-SELECT spock.replicate_ddl($ddl$
+SELECT 'table_ddl_sent|' || (count(*) = 1)::text
+FROM (SELECT spock.replicate_ddl($ddl$
     CREATE TABLE spock_regress.basic (
         id integer PRIMARY KEY,
         label text,
         touched timestamptz DEFAULT now()
     )
-$ddl$);
+$ddl$)) AS sent;
 
 SELECT 'table_exists_locally|' ||
        (to_regclass('spock_regress.basic') IS NOT NULL)::text;

@@ -18,7 +18,7 @@ single-node cluster cannot run it.
 
 import shlex
 
-from regression.runner import Suite, extension_present
+from aspects.health_check.runner import Suite, extension_present
 
 
 class SnowflakeSuite(Suite):

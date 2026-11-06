@@ -57,13 +57,23 @@ run without a machine.
 it needs from the rest of `aspects` is imported *inside the function*, not at
 module scope. Preserve that if you extend it.
 
-`regression/` is a third layer with one module per component, holding the
-upstream test suites `--health_check` runs. Each subclasses `regression.runner.Suite`
-and answers three questions in order — can this run here, fetch it at which ref,
-run it how — and each works in its own directory under `/opt/pgedge/regression`.
-The important distinction encoded there is `targets_cluster`: spock, lolor and
-snowflake exercise the deployed cluster, while ACE's integration tests start
-their own containers and prove nothing about it.
+`aspects/health_check/` holds what `--health_check` runs, one module per
+component. Each subclasses `health_check.runner.Suite` and answers three
+questions in order — can this run here, put what it needs on the host, run it
+how — and each works in its own directory under `/opt/pgedge/regression`.
+spock and lolor are `InTreeSuite`s: their cases live in `suites/<name>/sql`
+beside fixed `expected/` files, run through psql and dblink against the live
+mesh, and create nothing but a schema of their own. `spock-upstream` and
+`lolor-upstream` are `PgRegressSuite`s: upstream's own cases, cloned fresh at
+the cluster's ref on every run and executed as the database user in a scratch
+instance with the installed library — only ever `regresscheck` for spock,
+since upstream's `check` would `make install` over the running `spock.so`. A
+component name expands to both halves (`GROUPS`). The distinction that matters
+is `targets_cluster` plus `scope`: spock, lolor, snowflake and ace (the
+installed binary's spock/schema/repset-diff) exercise the deployed cluster;
+the `-upstream` suites exercise the installed library; `ace-integration`
+starts its own containers, proves nothing about the cluster, and is left out
+of `all`.
 
 `deployment/cli.py` holds lifecycle commands (deploy, plan, status, remove) and
 `deployment/ops_cli.py` registers the day-two groups (node, spock, db, service,
@@ -140,6 +150,14 @@ Two things catch people out:
 answer stream built by `deployment_answers()`. Adding or reordering a prompt
 breaks every test in that file until the helper is updated to match — that is
 intentional, and the helper is the place to fix it.
+
+## Skills in this repository
+
+`.claude/skills/spock-pr-on-cluster/` validates a pgEdge/spock pull request
+against the cluster this tool has deployed, using `spock rebuild` to put the
+change on every node and the topology's own HA as test surface. It is the
+in-cluster counterpart of the sandbox `spock-pr-validation` skill, and refuses
+a cluster whose Spock major does not match the PR's base branch.
 
 ## Repository state
 

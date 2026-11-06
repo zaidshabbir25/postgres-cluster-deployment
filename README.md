@@ -1022,10 +1022,49 @@ the name default to the next free `nN`.
 
 ---
 
-## Component regression suites
+## Validating a Spock change on the deployed cluster
 
-Once a cluster is up, each component's own upstream test suite can be run
-against it:
+A pull request to Spock is usually tested in a throwaway two-node sandbox.
+That proves it compiles and its regression suite passes; it cannot show what
+the change does under Patroni failover, across three peers, beside lolor and
+snowflake, or on packaged PostgreSQL. The cluster this tool deploys can, and
+`spock rebuild` is how a change gets onto it:
+
+```bash
+./pg_cluster_ctl.sh spock version                           # what runs now
+./pg_cluster_ctl.sh spock rebuild --ref pull/626/head --yes # a PR
+./pg_cluster_ctl.sh spock rebuild --ref v5_STABLE --yes     # a branch, tag or sha
+```
+
+`--ref` takes anything git can fetch: a branch, a tag, a commit, or a GitHub
+pull request as `pull/<N>/head`. The command builds on every host against
+that host's own `pg_config` — packaged or source-built — then restarts
+PostgreSQL on every node one at a time through `patronictl`, runs
+`ALTER EXTENSION spock UPDATE` where the SQL version moved, and prints what
+each node loads before and after. A build that fails on any host restarts
+nothing: half a cluster on the new module is worse than all of it on the old.
+
+`spock version` shows three things per node that are easy to conflate:
+`loaded` (what the library reports), `extension` (what the catalog has
+created), and `available` (what the control file offers). A gap between the
+last two means an update is outstanding; nodes that disagree on the first is
+a cluster running two Spocks.
+
+The previous ref is recorded in the cluster state, so a source-built cluster
+goes back with the same command. A packaged cluster goes back by reinstalling
+the package, which the output spells out.
+
+The workflow around this — reading the PR, choosing scenarios the topology
+makes possible, before/after comparison, restore, report — is a Claude Code
+skill in [.claude/skills/spock-pr-on-cluster/](.claude/skills/spock-pr-on-cluster/SKILL.md).
+In a session in this repository: *"validate spock PR 626 on my cluster"*.
+The skill refuses a cluster whose Spock major does not match the PR's base
+branch; deploy `3-node-extensions-source` (Spock from `main`) for a PR
+against `main`.
+
+## Component health checks
+
+Once a cluster is up, each component can be asked whether it works *there*:
 
 ```bash
 ./pg_deploy_cluster.sh --health_check spock,lolor,snowflake,ace
@@ -1033,16 +1072,177 @@ against it:
 ./pg_cluster_ctl.sh ... # or: python3 -m deployment.cli health-check --components spock
 ```
 
-Each component is fetched into its own directory under
-`/opt/pgedge/regression/<component>`, at the branch or tag **this cluster was
-built from** — a cluster on spock v5.0.5 is tested by v5.0.5's tests, because a
-newer suite tests behaviour the installed extension does not have. Each is
-reported separately, and one failing suite neither stops the next nor disturbs
-its artefacts.
+Each component works in its own directory under
+`/opt/pgedge/regression/<component>` and is reported separately; one failing
+neither stops the next nor disturbs its artefacts.
 
 ```
 COMPONENT  REF        RESULT   DETAIL
 ---------  ---------  -------  ---------------------------------
+spock      in-tree    PASSED   8/8 passed
+lolor      in-tree    PASSED   4/4 passed
+snowflake  main       SKIPPED  needs the snowflake extension in postgres on n1
+ace        installed  FAILED   2/3 passed, 1 failed
+```
+
+### What each check actually tests
+
+This differs per component and changes how a result should be read.
+
+| component | what runs | runs against |
+|---|---|---|
+| spock | 8 cases in `aspects/health_check/suites/spock/`, via psql + dblink | **the deployed mesh** |
+| spock-upstream | upstream `tests/regress` (40+ cases), cloned fresh at the cluster's branch each run, `make regresscheck` | a scratch instance on the host, **with the Spock library the nodes run** |
+| lolor | 4 cases in `aspects/health_check/suites/lolor/`, the same way as spock | **the deployed mesh** |
+| lolor-upstream | upstream `sql/` + `expected/`, cloned fresh at lolor's ref each run, `make installcheck` | a scratch instance on the host, **with the lolor library the nodes run** |
+| snowflake | upstream `test/runner.py`, cloned fresh at snowflake's ref each run, driven by `EDGE_*` | **two deployed nodes**, through a shim |
+| ace | the installed `ace` binary: `spock-diff`, `schema-diff public`, `repset-diff default` | **the deployed nodes** |
+| ace-integration | upstream `tests/integration/*.go` via `go test` | **its own containers** — by name only, never in `all` |
+
+A component's name means everything that checks it: `--health_check spock`
+runs `spock` *and* `spock-upstream`, `lolor` runs both of its halves. Either
+half can be asked for alone by its full name; `upstream` means every
+`-upstream` suite; `all` is everything except `ace-integration`.
+
+### The upstream suites: fetched fresh, every run
+
+`spock-upstream`, `lolor-upstream` and `snowflake` are cloned at the start of
+every run, so the cases are whatever upstream has *today* for the line this
+cluster was built from — never a copy that drifts. The ref follows the
+cluster, not the newest commit anywhere: a spock50 cluster gets `v5_STABLE`,
+a spock60 one `main`, a source build the exact tag it named; lolor and
+snowflake get the tag of a source build or their default branch. A newer
+suite would test behaviour the installed extension does not have, and the
+failures it produced would be about version skew rather than the cluster.
+
+Read a `spock-upstream` or `lolor-upstream` verdict for what it is. Both
+suites start a scratch instance — spock's `regresscheck` target does it by
+hand, lolor's Makefile forces `--temp-instance` even for `installcheck` —
+with the **installed** library preloaded. So they prove the build your nodes
+run passes its own tests, on this host, in isolation. They do not touch the
+mesh; the in-tree `spock` and `lolor` cases are for that. The report prints
+the distinction under the table rather than leaving it to be inferred:
+
+```
+spock-upstream ran against a scratch instance on the host, with the Spock
+library the nodes run, not against this cluster.
+```
+
+Two mechanics worth knowing. The checkout is handed to the database user and
+`make` runs as that user, because pg_regress's `initdb` refuses to run as
+root. And for spock only `regresscheck` is ever invoked, never `check`:
+upstream's `check` is `check: install regresscheck`, and on a cluster host
+the `install` half would put the checkout's `spock.so` over the one every
+node is running.
+
+### spock and lolor: cases written for a cluster that is already running
+
+Neither upstream suite can be pointed *at* a deployed cluster, for reasons
+worth recording. Spock's `tests/regress` builds the thing it tests: `init.sql`
+creates the nodes and the subscription, after creating passwordless roles that
+only authenticate under the `trust` pg_hba upstream ships for its throwaway
+instance. Against a real cluster every connection as `super` fails and the
+thirty-eight cases after `init` fail with it. Worse, upstream's `check` target
+is `check: install regresscheck` — run on a cluster host it would install that
+checkout's `spock.so` over the one every node is running. lolor's Makefile
+forces `--temp-instance` even for `installcheck`, on purpose: its drop guard
+needs the library preloaded and its suite creates cluster-global roles. So it
+tests one node's library in a scratch instance, never objects travelling
+between the nodes — which is the only reason to run lolor in a multi-master
+cluster.
+
+So the cases here are this tool's own, and they ask the opposite question:
+given a cluster that is already cross-wired and already serving, does it work?
+**Nothing is created, initialised or torn down** — no instance, no node, no
+subscription, no role, no database, no change to `pg_hba`. The only objects
+that appear are a schema of the suite's own (`spock_regress`, `lolor_regress`)
+and what it needs inside, dropped again by the last case.
+
+| spock case | asks |
+|---|---|
+| `01_extension` | Spock and dblink installed, version consistent, entry points present |
+| `02_nodes` | every node agrees on the membership, and every peer knows us |
+| `03_subscriptions` | every subscription is replicating, on every node |
+| `04_slots` | each node's outbound slots are active and not hoarding WAL |
+| `05_ddl_replication` | `replicate_ddl` reaches every peer |
+| `06_dml` | insert, update and delete each reach every peer |
+| `07_bidirectional` | a write on a peer comes back to us |
+| `08_cleanup` | the schema is gone again, everywhere |
+
+| lolor case | asks |
+|---|---|
+| `01_extension` | lolor created, preloaded, `lolor.node` in 1..15, the `lo_*` functions swapped, storage tables present |
+| `02_node_identity` | every node's `lolor.node` is distinct and valid; lolor's tables are in a replication set on every node |
+| `03_replication` | a large object created here carries this node's id, lands in lolor's tables not the catalog, and reaches, updates on, and unlinks from every peer — read through each peer's own `lo_get` |
+| `04_cleanup` | any object the suite left is unlinked everywhere and the schema is gone |
+
+Three decisions make that work against a live cluster, and they are
+implemented once, in `InTreeSuite`:
+
+* **Peers are found through `spock.node_interface`**, where the deployment
+  registered them and where Spock's own procedures read them. Nothing is passed
+  in, so a wrong DSN there is itself a fault — and `02_nodes` is the first case
+  to trip over it.
+* **Peers are read through dblink in one session**, not by reconnecting, so
+  nothing depends on psql's handling of a conninfo in a variable and nothing
+  needs a password the suite does not already have.
+* **Output is values only** (`psql -A -t`), and every case prints fixed
+  `name|true` lines. Detail naming a node is printed *only when that node is
+  wrong*, so a healthy cluster matches a fixed expected file and a broken one
+  produces a diff that says which node and why.
+
+Each case waits for replication rather than assuming it, with its own timeout
+(180s, `--test-timeout` to change it). A case that exceeds it is that case's
+failure: the ones already run keep their results and the rest are still tried.
+
+```bash
+./pg_deploy_cluster.sh --health_check spock
+./pg_deploy_cluster.sh --health_check spock --tests 01_extension,02_nodes
+```
+
+```
+spock: 8 case(s) on n1 as postgres, 180s each
+  [1/8] 01_extension                 ok
+  [2/8] 02_nodes                     ok
+  [3/8] 03_subscriptions             FAILED — local_all_replicating|false
+```
+
+### ace: the binary doing its job
+
+ACE's own test suite starts a three-node cluster in containers and says
+nothing about the one you deployed. What does is ACE itself, so the `ace`
+check runs the installed binary's `spock-diff`, `schema-diff public` and
+`repset-diff default` against the Spock nodes. It writes a `pg_service.conf`
+in ACE's shape (`[cluster]` plus one `[cluster.node]` per node) and an
+`ace.yaml` into its own workspace, named through `ACE_PGSERVICEFILE`, so the
+operator's service file is untouched. Standbys are left out: a standby holds
+the same data as its leader, and comparing the two is comparing a node with
+itself. A check fails on a non-zero exit *or* on ACE's own words — `TABLES DO
+NOT MATCH`, `Found N differences` — and the JSON reports ACE writes are kept.
+
+`ace-integration` is the upstream Go suite, for when ACE itself is what you
+are validating. It needs Go and a running Docker daemon, takes twenty to
+forty-five minutes, and runs only when named — `all` never includes it, and
+the report says in so many words that it ran against containers it started.
+
+### Skips
+
+A suite that cannot run here is **skipped with the reason**, not failed, and
+the reason names the fix where there is one:
+
+```
+ace    installed  SKIPPED  needs the ace binary (pgedge-ace, or --pg-extensions pgedge-ace:source)
+lolor  in-tree    SKIPPED  needs the lolor extension in postgres on n1
+```
+
+`--install-requirements` installs what this tool can name — the `-devel`
+package a PGXS suite needs. Go and a Docker daemon are a larger decision and
+are left to you.
+
+A run where every suite skipped reports `nothing ran` rather than `succeeded`.
+Nothing failing is not the same as something passing.
+
+---
 spock      v5.0.5     PASSED   23/23 passed
 lolor      v1.2.3     FAILED   1/1 passed, 1 failed
 snowflake  main       SKIPPED  needs the snowflake extension in postgres on n1
@@ -1071,7 +1271,7 @@ as `super` fails, `init` fails, and the thirty-eight cases after it fail with
 it. Making them pass would mean lowering a running cluster's authentication and
 leaving a superuser behind.
 
-So the cases in `regression/suites/spock/` are this tool's own, and they ask
+So the cases in `aspects/health_check/suites/spock/` are this tool's own, and they ask
 the opposite question: given a cluster that is already cross-wired and already
 serving, does replication work? **Nothing is created, initialised or torn
 down** — no instance, no node, no subscription, no role, no database, no change
@@ -1245,6 +1445,8 @@ they do not.
 ./pg_cluster_ctl.sh spock sub-resync-table sub_n1_n2 public.orders --truncate
 ./pg_cluster_ctl.sh spock replicate-ddl 'ALTER TABLE orders ADD COLUMN note text'
 ./pg_cluster_ctl.sh spock sequence-convert           # to Snowflake sequences
+./pg_cluster_ctl.sh spock version                    # loaded / created / available, per node
+./pg_cluster_ctl.sh spock rebuild --ref pull/626/head   # see below
 ```
 
 > **Tables without a primary key.** Spock replicates `INSERT` for them but

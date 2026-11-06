@@ -30,7 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from aspects import (health, inventory, patroni_management, pg_extensions,
                      spock_management, state)
-from regression import runner as regression
+from aspects.health_check import runner as regression
 from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
 from deployment import (add_component, add_standby, cleanup, deploy_cluster,
@@ -491,7 +491,7 @@ def cmd_logging(args):
 
 
 def cmd_health_check(args):
-    """Run each named component's upstream regression suite."""
+    """Run each named component's health check against the cluster."""
     cluster = args.cluster or state.latest_cluster()
     if not cluster:
         print("No deployed clusters found. Deploy one before running its "

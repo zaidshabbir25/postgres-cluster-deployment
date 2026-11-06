@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ACE's integration tests.
+"""ACE's own integration tests — about ACE, not about this cluster.
 
 These are Go tests, and unlike the other three they do **not** examine the
 cluster this tool deployed. `tests/integration/main_test.go` brings up its own
@@ -20,13 +20,14 @@ with neither is reported as skipped, with which one was missing.
 import re
 import shlex
 
-from regression.runner import Suite
+from aspects.health_check.runner import Suite
 
 
-class AceSuite(Suite):
-    name = "ace"
+class AceIntegrationSuite(Suite):
+    name = "ace-integration"
     repo = "https://github.com/pgEdge/ace.git"
     targets_cluster = False
+    scope = "containers it started itself"
     requires = {
         "git": "to fetch the suite",
         "go": "the tests are Go; 1.26 or newer",
