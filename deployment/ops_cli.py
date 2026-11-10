@@ -701,7 +701,11 @@ def cmd_service(args):
             print(f"unknown service action {action!r}", file=sys.stderr)
             return EXIT_USAGE
 
-        ok, message = handler(executor, plan, node, component=args.component)
+        extra = {}
+        if action in ("restart", "reload"):
+            extra["preserve"] = not getattr(args, "discard_local_settings", False)
+        ok, message = handler(executor, plan, node, component=args.component,
+                              **extra)
         print(f"{'OK' if ok else 'FAILED'} {node.name}/{args.component}: {message}")
         return EXIT_OK if ok else EXIT_FAIL
 
@@ -1392,8 +1396,14 @@ def _register_service(subparsers, add_common):
     base("status", "service status for every node", with_component=False)
     base("start", "start a component")
     base("stop", "stop a component")
-    base("restart", "restart a component")
-    base("reload", "reload configuration without a restart")
+    for name, help_text in (("restart", "restart a component"),
+                            ("reload", "reload configuration without a restart")):
+        p = base(name, help_text)
+        p.add_argument(
+            "--discard-local-settings", action="store_true",
+            help="let Patroni drop settings typed into postgresql.conf by "
+                 "hand. By default they are moved into the scope's DCS first, "
+                 "so they survive and reach the standbys too")
     base("enable", "start on boot")
     base("disable", "do not start on boot")
 

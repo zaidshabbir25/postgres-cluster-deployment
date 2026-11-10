@@ -64,6 +64,34 @@ DDL_REPLICATION_GUCS = (
     "spock.allow_ddl_from_functions",
 )
 
+#: What every Spock node must report once it is up, and the value expected.
+#: Bootstrapped through the DCS (pg_server_management.SPOCK_PARAMETERS and
+#: patroni_management.LOG_PARAMETERS); checked here because a value in the
+#: DCS and a value the server is actually running are two different facts.
+REQUIRED_GUCS = {
+    "track_commit_timestamp": "on",
+    "spock.enable_ddl_replication": "on",
+    "spock.include_ddl_repset": "on",
+    "spock.allow_ddl_from_functions": "on",
+    "spock.conflict_log_level": "debug2",
+    "log_min_messages": "debug1",
+}
+
+
+def verify_gucs(executor, plan, node, wanted=None):
+    """What a node runs versus what it should. Returns [(guc, actual, wanted)]
+    for every setting that differs; empty means every one is in effect."""
+    wanted = wanted or REQUIRED_GUCS
+    mismatched = []
+    for guc, expected in wanted.items():
+        actual = pg_server_management.scalar(
+            executor, node.bin_dir, node.pg_port, plan.db_user,
+            f"SHOW {guc};", dbname=plan.db_name, node=node.name, default="")
+        if (actual or "").strip().lower() != str(expected).lower():
+            mismatched.append((guc, (actual or "").strip() or "(unset)",
+                               str(expected)))
+    return mismatched
+
 
 def zodan_script(spock_major, override=None):
     """Resolve the local zodan SQL file for a Spock major version."""
@@ -354,12 +382,27 @@ def load_zodremove(executor, plan, node, run_logger=None, branch=None):
 
 
 def enable_ddl_replication(executor, plan, node, run_logger=None):
-    """Turn on automatic DDL replication.
+    """Make sure automatic DDL replication is on, and say how it got there.
+
+    The settings arrive through the DCS at bootstrap, so on a cluster this
+    tool deployed there is nothing to do but confirm. ALTER SYSTEM is kept
+    only as the fallback for a node that does not report them — one Patroni
+    did not bootstrap, or an older cluster — and only for the settings that
+    are actually off: a value written to postgresql.auto.conf shadows the DCS
+    from then on, so it is not written when the DCS already did the job.
 
     Each ALTER SYSTEM is its own psql call — the server rejects ALTER SYSTEM
     inside a multi-statement batch sent as one simple query.
+    Returns the GUCs that had to be set this way; empty is the normal case.
     """
-    for guc in DDL_REPLICATION_GUCS:
+    wanted = {guc: "on" for guc in DDL_REPLICATION_GUCS}
+    missing = [guc for guc, _, _ in verify_gucs(executor, plan, node, wanted)]
+    if not missing:
+        if run_logger:
+            run_logger.node(node.name, "DDL replication on, from the DCS")
+        return []
+
+    for guc in missing:
         pg_server_management.psql(
             executor, node.bin_dir, node.pg_port, plan.db_user,
             f"ALTER SYSTEM SET {guc} = on;",
@@ -370,8 +413,10 @@ def enable_ddl_replication(executor, plan, node, run_logger=None):
         "SELECT pg_reload_conf();", dbname=plan.db_name, node=node.name,
     )
     if run_logger:
-        run_logger.node(node.name, "DDL replication enabled")
-    return list(DDL_REPLICATION_GUCS)
+        run_logger.node(node.name, f"DDL replication enabled with ALTER SYSTEM "
+                                   f"for {', '.join(missing)} — the DCS did "
+                                   f"not carry it")
+    return missing
 
 
 # ---------------------------------------------------------------------------

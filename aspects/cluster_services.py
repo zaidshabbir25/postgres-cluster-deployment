@@ -153,9 +153,30 @@ def stop(executor, plan, node, component="patroni"):
     return False, f"unknown component {component!r}"
 
 
-def restart(executor, plan, node, component="patroni"):
-    """Restart a component through the right mechanism."""
+def _keep_hand_edits(executor, plan, node, preserve):
+    """Before Patroni regenerates postgresql.conf: move what a person added
+    into the DCS, or say what is about to be lost. Returns (ok, note)."""
+    if not preserve:
+        return True, ""
+    ok, kept, message = patroni_management.preserve_local_overrides(
+        executor, plan, node)
+    if not ok:
+        return False, message
+    return True, (f" — {message}" if kept else "")
+
+
+def restart(executor, plan, node, component="patroni", preserve=True):
+    """Restart a component through the right mechanism.
+
+    Patroni rewrites postgresql.conf from the DCS every time PostgreSQL
+    starts, so a restart silently discards anything typed into that file. With
+    `preserve` (the default) those settings are moved into the scope's DCS
+    first, where they survive — and reach the standbys as well.
+    """
     if component == "postgres":
+        ok, note = _keep_hand_edits(executor, plan, node, preserve)
+        if not ok:
+            return False, f"not restarted: {note}"
         # patronictl restart is the supported path: it coordinates through the
         # DCS so the rest of the scope knows the restart is intentional.
         binary = _patronictl(executor, node)
@@ -164,12 +185,15 @@ def restart(executor, plan, node, component="patroni"):
             f"--force",
             node=node.name, timeout=600,
         )
-        return ok, output.strip() or f"PostgreSQL restarted on {node.name}"
+        return ok, (output.strip() or f"PostgreSQL restarted on {node.name}") + note
 
     if component == "patroni":
+        ok, note = _keep_hand_edits(executor, plan, node, preserve)
+        if not ok:
+            return False, f"not restarted: {note}"
         unit = patroni_management.unit_name(node.name)
         ok, output = service_management.restart(executor, unit, node=node.name)
-        return ok, output.strip() or f"{unit} restarted"
+        return ok, (output.strip() or f"{unit} restarted") + note
 
     if component == "etcd":
         ok, output = service_management.restart(
@@ -180,16 +204,23 @@ def restart(executor, plan, node, component="patroni"):
     return False, f"unknown component {component!r}"
 
 
-def reload(executor, plan, node, component="postgres"):
-    """Reload configuration without a restart."""
+def reload(executor, plan, node, component="postgres", preserve=True):
+    """Reload configuration without a restart.
+
+    A Patroni reload regenerates postgresql.conf just as a restart does, so
+    hand edits are kept the same way first.
+    """
     if component == "postgres":
+        ok, note = _keep_hand_edits(executor, plan, node, preserve)
+        if not ok:
+            return False, f"not reloaded: {note}"
         binary = _patronictl(executor, node)
         ok, output = executor.try_run(
             f"{binary} -c {node.config_file} reload {node.scope} {node.name} "
             f"--force",
             node=node.name,
         )
-        return ok, output.strip() or f"configuration reloaded on {node.name}"
+        return ok, (output.strip() or f"configuration reloaded on {node.name}") + note
 
     if component == "patroni":
         unit = patroni_management.unit_name(node.name)

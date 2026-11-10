@@ -88,11 +88,33 @@ def output_plugin_libraries_guc(pg_version, libraries=None, quoted=True):
     return {"output_plugin_libraries": f"'{value}'" if quoted else value}
 
 
+#: Spock's own settings, on from the first start of every node. They go into
+#: the DCS rather than being ALTER SYSTEMed after the fact, because the DCS is
+#: the only place that reaches every member of a scope — standbys included,
+#: and a node added months later — and because postgresql.auto.conf would
+#: shadow the DCS value for good.
+SPOCK_PARAMETERS = {
+    # Schema changes travel with the data: plain DDL is queued and replayed on
+    # every peer, including DDL issued from inside functions, and a table
+    # created that way lands in the default replication set.
+    "spock.enable_ddl_replication": "on",
+    "spock.include_ddl_repset": "on",
+    "spock.allow_ddl_from_functions": "on",
+    # Every conflict Spock resolves is written to the server log, at a level
+    # low enough not to drown a production log but visible once
+    # log_min_messages is lowered to read it.
+    "spock.conflict_log_level": "debug2",
+}
+
+
 def spock_guc_parameters(pg_version):
     """The GUCs every Spock node in a multi-master cluster needs.
 
     track_commit_timestamp is what lets Spock resolve conflicts by last-write;
-    without it a multi-master cluster cannot decide which side wins.
+    without it a multi-master cluster cannot decide which side wins. The
+    spock.* settings are SPOCK_PARAMETERS, and are safe to name here before
+    the library has loaded: shared_preload_libraries puts spock in place
+    before postgresql.conf's custom settings are checked.
     """
     params = {
         "wal_level": "logical",
@@ -105,6 +127,7 @@ def spock_guc_parameters(pg_version):
         "hot_standby_feedback": "on",
         "wal_log_hints": "on",  # required by pg_rewind, which Patroni uses
     }
+    params.update(SPOCK_PARAMETERS)
     params.update(output_plugin_libraries_guc(pg_version, quoted=False))
     return params
 

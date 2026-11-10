@@ -19,6 +19,7 @@ packaged single `patroni` unit, because a host may carry several nodes.
 """
 
 import json
+import re
 import shlex
 
 import yaml
@@ -93,7 +94,11 @@ LOG_PARAMETERS = {
     # Who, from where, in what transaction — the prefix you want when reading
     # one of these a week later.
     "log_line_prefix": "%m [%p] %q%u@%d/%a ",
-    "log_min_messages": "warning",
+    # debug1, so that conflict resolutions (logged at spock.conflict_log_level,
+    # debug2) and Spock's worker lifecycle are in the file when a replication
+    # question comes up. Lower it with --logging --set log_min_messages=warning
+    # on a cluster where the volume matters more than the detail.
+    "log_min_messages": "debug1",
     "log_min_error_statement": "error",
     "log_checkpoints": "on",
     "log_lock_waits": "on",
@@ -136,6 +141,134 @@ def apply_logging(executor, plan, node, overrides=None, node_name=None):
         node=node_name or node.name,
     )
     return ok, output.strip()
+
+
+# ---------------------------------------------------------------------------
+# Hand edits to postgresql.conf
+# ---------------------------------------------------------------------------
+
+#: Settings Patroni writes into postgresql.conf of its own accord, from its
+#: defaults or from the member's role, without their being in the DCS or the
+#: local YAML. Anything in the file that is neither here nor in those two is
+#: something a person added — and Patroni will drop it at the next start.
+PATRONI_OWN_PARAMETERS = frozenset({
+    "cluster_name", "listen_addresses", "port", "hot_standby",
+    "max_connections", "max_wal_senders", "max_replication_slots",
+    "max_prepared_transactions", "max_locks_per_transaction",
+    "track_commit_timestamp", "wal_level", "wal_log_hints",
+    "max_worker_processes", "wal_keep_segments", "wal_keep_size",
+    "hba_file", "ident_file", "unix_socket_directories",
+    "synchronous_standby_names", "synchronous_commit",
+    "shared_preload_libraries", "config_file", "data_directory",
+    # A replica's connection to its leader; never something to copy anywhere.
+    "primary_conninfo", "primary_slot_name", "restore_command",
+    "recovery_target_timeline", "recovery_target", "recovery_target_lsn",
+    "recovery_target_name", "recovery_target_time", "recovery_target_xid",
+    "recovery_target_action", "recovery_min_apply_delay",
+})
+
+_SETTING_LINE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*=\s*(.*?)\s*$")
+
+
+def parse_conf_settings(text):
+    """{name: value} from postgresql.conf text, quotes stripped, comments and
+    include lines ignored. Later lines win, as they do for the server."""
+    settings = {}
+    for raw in (text or "").splitlines():
+        line = raw.split("#", 1)[0].strip() if not raw.lstrip().startswith("#") else ""
+        if not line or line.lower().startswith("include"):
+            continue
+        match = _SETTING_LINE.match(line)
+        if not match:
+            continue
+        name, value = match.group(1).lower(), match.group(2)
+        if len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1].replace("''", "'")
+        settings[name] = value
+    return settings
+
+
+def local_overrides(executor, plan, node, node_name=None):
+    """Settings a person put into this node's postgresql.conf by hand.
+
+    Patroni regenerates that file from the DCS and its own YAML at every
+    start, restart and reload — the file's own header says so — and anything
+    else in it is gone afterwards. This is what would be lost: every setting
+    in the file that the DCS does not hold, the node's YAML does not hold,
+    and Patroni does not write of its own accord.
+    """
+    conf = f"{node.data_dir.rstrip('/')}/postgresql.conf"
+    ok, text = executor.try_run(f"cat {shlex.quote(conf)} 2>/dev/null",
+                                node=node_name or node.name)
+    if not ok or not text.strip():
+        return {}
+    in_file = parse_conf_settings(text)
+
+    managed = set(PATRONI_OWN_PARAMETERS)
+    managed |= {k.lower() for k in
+                configured_parameters(executor, node, node_name=node_name)}
+    # What this tool seeded the scope's DCS with, read from the leader's
+    # rendered config: the same facts even when show-config cannot answer
+    # (an older Patroni, a scope that has not published its config).
+    try:
+        leader = plan.node(node.leader) if node.leader else node
+        rendered = build_config(plan, leader)
+        seeded = (rendered.get("bootstrap", {}).get("dcs", {})
+                  .get("postgresql", {}).get("parameters") or {})
+        local = rendered.get("postgresql", {}).get("parameters") or {}
+    except Exception:
+        seeded, local = {}, {}
+    managed |= {k.lower() for k in seeded}
+    managed |= {k.lower() for k in local}
+
+    return {name: value for name, value in in_file.items()
+            if name not in managed}
+
+
+def preserve_local_overrides(executor, plan, node, node_name=None,
+                             run_logger=None):
+    """Move a node's hand-edited settings into its scope's DCS, so a restart
+    keeps them — and so its standbys get them too.
+
+    Returns (ok, kept, message). `kept` is the settings that were moved;
+    empty with ok=True means there was nothing to lose.
+    """
+    overrides = local_overrides(executor, plan, node, node_name=node_name)
+    if not overrides:
+        return True, {}, ""
+
+    binary = patronictl_binary(executor, node=node_name or node.name)
+    arguments = " ".join(
+        f"-s {shlex.quote(f'postgresql.parameters.{key}={value}')}"
+        for key, value in sorted(overrides.items())
+    )
+    ok, output = executor.try_run(
+        f"{binary} -c {shlex.quote(node.config_file)} edit-config "
+        f"{shlex.quote(node.scope)} --force {arguments} 2>&1",
+        node=node_name or node.name,
+    )
+    if not ok:
+        return False, {}, (
+            f"{len(overrides)} setting(s) in {node.name}'s postgresql.conf "
+            f"would be lost and could not be moved into the DCS: "
+            f"{output.strip()[:200]}")
+
+    # Verify rather than trust: an accepted edit-config that changed nothing
+    # would otherwise be reported as "kept".
+    now = {k.lower() for k in
+           configured_parameters(executor, node, node_name=node_name)}
+    missing = sorted(name for name in overrides if now and name not in now)
+    if missing:
+        return False, {}, (f"edit-config was accepted but the DCS does not "
+                           f"show {', '.join(missing)}")
+
+    names = ", ".join(sorted(overrides))
+    if run_logger:
+        run_logger.node(node.name, f"kept hand-set settings by moving them "
+                                   f"into the DCS for {node.scope}: {names}")
+    return True, overrides, (
+        f"kept {len(overrides)} setting(s) from postgresql.conf by moving "
+        f"them into the DCS for scope {node.scope}: {names}")
 
 
 def configured_parameters(executor, node, node_name=None):

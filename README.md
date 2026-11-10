@@ -392,12 +392,44 @@ pulling in a Go toolchain for etcd would double the prerequisites.
 12  Create Spock extensions        spock and dblink
 13  Load zodan procedures          the cross-wiring library
 14  Cross-wire Spock nodes         spock.add_node joins each node to every peer
-15  Enable DDL replication         schema changes propagate automatically
+15  Enable DDL replication         confirm the DCS settings are in effect everywhere
 16  Verify replication             node visibility and subscription state
 17  Collect health snapshot        seeds the dashboard and the report
 ```
 
 Steps 3–5 are replaced by a single source-build step in `--mode source`.
+
+### Settings every node starts with
+
+These go into the Patroni DCS at bootstrap (step 8), so every member of every
+scope — standbys, and a node added months later — runs them from its first
+start:
+
+| setting | value | why |
+|---|---|---|
+| `track_commit_timestamp` | `on` | last-write-wins conflict resolution needs commit times |
+| `spock.enable_ddl_replication` | `on` | plain DDL is queued and replayed on every peer |
+| `spock.include_ddl_repset` | `on` | a table created that way lands in the default replication set |
+| `spock.allow_ddl_from_functions` | `on` | DDL issued from inside a function replicates too |
+| `spock.conflict_log_level` | `debug2` | every resolved conflict is written to the server log |
+| `log_min_messages` | `debug1` | low enough for those conflict lines, and Spock's worker lifecycle, to appear |
+
+Step 15 then asks every Spock node what it is actually running, through
+`SHOW`, and fails the deployment if any answer differs: a value in the DCS and
+a value the server runs are two different facts, and only the second one
+matters. It does **not** `ALTER SYSTEM` on a node that already reports the
+settings — `postgresql.auto.conf` shadows the DCS for good, so that is kept
+as a fallback for a node Patroni did not bootstrap, applied only to the
+settings that are actually off.
+
+`log_min_messages` is a default, not a requirement: `--logging --set
+log_min_messages=warning` lowers it on a cluster where volume matters more
+than detail. On a cluster deployed before these defaults existed, set them
+through the DCS the same way the deployment does:
+
+```bash
+./pg_cluster_ctl.sh db guc-set spock.conflict_log_level debug2 --all-nodes
+```
 
 Every step is recorded whether it passes or fails, so a deployment that dies
 half way still leaves a report that says how far it got and a per-node
@@ -1494,6 +1526,32 @@ You cannot stop PostgreSQL directly on a Patroni-managed node — Patroni owns t
 postmaster and would treat it as a crash, restarting it or failing over. So
 `--component postgres` routes restarts and reloads through `patronictl`, and
 stopping postgres directly is refused with an explanation rather than attempted.
+
+**Patroni owns `postgresql.conf` too.** It regenerates the file from the DCS
+and its own YAML at every start, restart and reload — the file's own header
+says so — so a setting typed into it by hand is one restart away from
+vanishing. `service restart` and `service reload` therefore look first: any
+setting in the file that is in neither the DCS nor the node's YAML, and that
+Patroni does not write of its own accord, is moved into the scope's DCS
+before Patroni touches the file. It survives, and the scope's standbys get it
+as well. The result says what was kept:
+
+```
+OK n1/postgres: PostgreSQL restarted on n1 — kept 2 setting(s) from
+postgresql.conf by moving them into the DCS for scope pgedge-n1:
+shared_buffers, work_mem
+```
+
+If they cannot be moved (the DCS is unreachable, say), the restart does not
+happen — losing them silently is the one outcome that must not. To let
+Patroni drop them on purpose, pass `--discard-local-settings`.
+
+The place to put a setting in the first place is the DCS:
+
+```bash
+./pg_cluster_ctl.sh db guc-set work_mem 64MB            # one scope
+./pg_cluster_ctl.sh db guc-set work_mem 64MB --all-nodes
+```
 
 Moving a leader to its standby, testing an unplanned failure, and getting the
 old machine back afterwards are written up in
