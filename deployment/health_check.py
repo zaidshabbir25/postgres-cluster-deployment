@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run each component's upstream regression suite against a deployed cluster.
+"""Run each component's health check against a deployed cluster.
 
 This is `--health_check spock,lolor,snowflake,ace`. It loads the saved cluster,
 picks one host to run from, and gives each component its own workspace, its own
@@ -17,7 +17,7 @@ import time
 from aspects import pg_extensions, source_build, state
 from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
-from regression import runner as regression_runner
+from aspects.health_check import runner as regression_runner
 
 
 class HealthCheckError(RuntimeError):
@@ -46,12 +46,22 @@ def _executor_for(plan, host_name, cache, run_logger):
 def ref_for(plan, component):
     """The branch or tag whose tests match what this cluster is running.
 
-    Spock's cases ship with this tool rather than being fetched, so there is no
-    ref to choose; the version it reports is the extension's own.
+    Spock's and lolor's cases ship with this tool rather than being fetched,
+    so there is no ref to choose; ACE's check is the binary already on the
+    host. The version each reports is the component's own.
     """
-    if component == "spock":
+    if component in ("spock", "lolor"):
         return "in-tree"
+    if component == "ace":
+        return "installed"
+    if component == "spock-upstream":
+        # The branch the cluster's Spock came from: the tag or branch a source
+        # build named, else the branch its major is developed on.
+        return ((plan.source_build or {}).get("spock_branch")
+                or source_build.default_spock_branch(plan.spock_major))
 
+    # lolor-upstream, snowflake, ace-integration: the component's own ref.
+    component = component.replace("-upstream", "").replace("-integration", "")
     for item in pg_extensions.selections_of(plan):
         if item["name"] == component and item.get("ref"):
             return item["ref"]
@@ -105,7 +115,8 @@ def run(cluster_name, components, db_password=None, node_name=None,
                 f"{component} regression",
                 f"{suite.repo.rsplit('/', 1)[-1]}@{ref} in {suite.workspace()}"
                 + ("" if suite.targets_cluster
-                   else " — starts its own cluster, does not read this one"),
+                   else f" — against {suite.scope or 'its own environment'}, "
+                        f"not this cluster"),
             )
             result = suite.run(executor, plan, node, ref, run_logger=log,
                                install_requirements=install_requirements)
@@ -184,14 +195,14 @@ def summary_lines(results, log_dir=""):
         out.append("")
         out.append("  Every suite was skipped: nothing was tested.")
 
-    detached = [r.component for r in results if not r.targets_cluster
+    detached = [r for r in results if not r.targets_cluster
                 and r.status != "skipped"]
     if detached:
         out.append("")
-        out.append(
-            f"  {', '.join(detached)} ran against containers it started itself, "
-            f"not against this cluster."
-        )
+        for result in detached:
+            scope = result.scope or "something other than this cluster"
+            out.append(f"  {result.component} ran against {scope}, "
+                       f"not against this cluster.")
 
     failed = [r for r in results if r.status == "failed"]
     if failed:

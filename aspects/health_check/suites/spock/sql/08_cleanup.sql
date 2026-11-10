@@ -11,7 +11,9 @@ SELECT 'removed_from_repset|' || coalesce(
      WHERE to_regclass('spock_regress.basic') IS NOT NULL),
     'true');
 
-SELECT spock.replicate_ddl('DROP SCHEMA IF EXISTS spock_regress CASCADE');
+SELECT 'drop_ddl_sent|' || (count(*) = 1)::text
+FROM (SELECT spock.replicate_ddl('DROP SCHEMA IF EXISTS spock_regress CASCADE'))
+     AS sent;
 
 SELECT 'schema_gone_locally|' ||
        (to_regclass('spock_regress.basic') IS NULL)::text;

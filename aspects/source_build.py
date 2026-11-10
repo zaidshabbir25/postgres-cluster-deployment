@@ -203,6 +203,81 @@ def fetch_spock_source(executor, branch="main", node=None):
     return spock_dir, revision.strip()
 
 
+def fetch_spock_ref(executor, ref, node=None, checkout_dir=None):
+    """Check out Spock at *any* ref: a branch, a tag, a commit, or a GitHub
+    pull request as `pull/<N>/head`. Returns (dir, short_sha, describe).
+
+    `git clone --branch` takes only branches and tags, which is why this is
+    not fetch_spock_source: validating a pull request means building exactly
+    the commit under review, and that is reachable only as `pull/N/head` — a
+    ref `--branch` cannot name. Fetching the ref into a shallow clone of the
+    default branch covers every form in one path, including a bare commit,
+    which GitHub serves by hash.
+    """
+    spock_dir = checkout_dir or f"{BUILD_ROOT}/spock"
+    ref = str(ref).strip()
+    executor.run(f"mkdir -p {BUILD_ROOT}", node=node)
+    executor.run(f"rm -rf {shlex.quote(spock_dir)}", node=node)
+    executor.run(
+        f"git clone --depth 1 {SPOCK_REPO} {shlex.quote(spock_dir)}",
+        node=node, message="clone spock",
+    )
+    executor.run(
+        f"git -C {shlex.quote(spock_dir)} fetch --depth 1 origin "
+        f"{shlex.quote(ref)}",
+        node=node, message=f"fetch spock ref {ref}",
+    )
+    executor.run(
+        f"git -C {shlex.quote(spock_dir)} checkout -q FETCH_HEAD",
+        node=node, message=f"checkout {ref}",
+    )
+    _, revision = executor.try_run(
+        f"git -C {shlex.quote(spock_dir)} rev-parse --short HEAD", node=node
+    )
+    _, describe = executor.try_run(
+        f"git -C {shlex.quote(spock_dir)} describe --tags --always 2>/dev/null",
+        node=node,
+    )
+    return spock_dir, revision.strip(), describe.strip()
+
+
+def build_spock_against(executor, spock_dir, bin_dir, node=None, jobs=None):
+    """Build and install Spock via PGXS against whatever server `bin_dir` is.
+
+    build_spock assumes the source-built prefix. A packaged cluster has its
+    pg_config in /usr/pgsql-17/bin or /usr/lib/postgresql/17/bin instead, and
+    its spock.so belongs wherever that pg_config says — so the module is
+    verified under `pg_config --pkglibdir` rather than a guessed lib path.
+    """
+    jobs_flag = f"-j{jobs}" if jobs else "-j$(nproc)"
+    env = f"PATH={shlex.quote(bin_dir)}:$PATH USE_PGXS=1"
+
+    executor.try_run(f"cd {shlex.quote(spock_dir)} && {env} make clean", node=node)
+    executor.run(
+        f"cd {shlex.quote(spock_dir)} && {env} make {jobs_flag}",
+        node=node, message="make spock", timeout=3600,
+    )
+    executor.run(
+        f"cd {shlex.quote(spock_dir)} && {env} make install",
+        node=node, message="make install spock", timeout=900,
+    )
+
+    _, pkglibdir = executor.try_run(
+        f"{shlex.quote(bin_dir)}/pg_config --pkglibdir", node=node
+    )
+    module = f"{pkglibdir.strip() or '/unknown'}/spock.so"
+    ok, _ = executor.try_run(f"test -f {shlex.quote(module)}", node=node)
+    if not ok:
+        raise RuntimeError(
+            f"spock.so is missing at {module} after make install — the build "
+            f"produced no loadable module for the server at {bin_dir}"
+        )
+    _, checksum = executor.try_run(
+        f"md5sum {shlex.quote(module)} 2>/dev/null | cut -d' ' -f1", node=node
+    )
+    return module, checksum.strip()
+
+
 def apply_spock_patches(executor, source_dir, spock_dir, pg_major, node=None):
     """Apply Spock's core patches to the PostgreSQL tree, in numeric order.
 

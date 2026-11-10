@@ -143,13 +143,17 @@ Cleanup
                             effect, which --restart does one node at a time.
   --restart                 with --add-component, restart the nodes that need it
 
-  --health_check LIST       after a cluster is deployed, run each component's own
-                            regression suite against it and exit. Comma-separated:
-                            spock, lolor, snowflake, ace, or all. Each component
-                            works in its own directory under
+  --health_check LIST       after a cluster is deployed, check each component
+                            and exit. Comma-separated: spock, lolor, snowflake,
+                            ace, upstream, or all. A component name runs both
+                            the cases written for the running cluster and the
+                            component's own suite, cloned fresh at the cluster's
+                            ref (spock-upstream, lolor-upstream; either can be
+                            named alone). Each works in its own directory under
                             /opt/pgedge/regression and is reported separately.
-                            Note: ace's suite starts its own containers and does
-                            not read the deployed cluster.
+                            ace-integration (ACE's Go suite, in containers of
+                            its own) runs only when named; it never reads the
+                            deployed cluster.
   --node NAME               with --health_check, the Spock node to run against
   --stop-on-failure         with --health_check, skip the remaining suites once
                             one fails

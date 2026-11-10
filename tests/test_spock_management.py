@@ -347,3 +347,73 @@ def test_enable_ddl_replication_sets_each_guc_separately(deployed_plan):
 
 def test_sub_name_follows_zodans_convention():
     assert sm.sub_name("n1", "n3") == "sub_n1_n3"
+
+
+# ---------------------------------------------------------------------------
+# retargeting peers after a failover
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def retarget(monkeypatch, plan_factory):
+    """Run retarget_after_failover against a recorded psql, not a server."""
+    plan, _ = plan_factory(node_count=3)
+    plan.db_password = "secret"
+    calls = []
+    replies = {}
+
+    def fake_psql(executor, bin_dir, port, user, sql, **kwargs):
+        calls.append(sql)
+        for fragment, reply in replies.items():
+            if fragment in sql:
+                return reply
+        return 0, ""
+
+    monkeypatch.setattr(pg_server_management, "psql", fake_psql)
+
+    def run(**reply_overrides):
+        replies.update(reply_overrides)
+        return spock_management_retarget(plan), calls
+
+    def spock_management_retarget(plan):
+        return sm.retarget_after_failover(
+            lambda node: FakeExecutor({}), plan, plan.spock_nodes[0],
+            "10.0.0.9", 5434,
+        )
+
+    return run
+
+
+def test_every_peer_is_moved_onto_the_promoted_address(retarget):
+    results, calls = retarget()
+
+    assert all(entry["ok"] for entry in results)
+    # Two peers, four steps each, and the new location in the interface.
+    assert len(results) == 8
+    assert any("10.0.0.9" in sql and "5434" in sql for sql in calls)
+
+
+def test_the_subscription_is_restarted_rather_than_left_down(retarget):
+    """Without the enable, the peer keeps reporting 'down' until its apply
+    worker next cycles — which is what the operator is looking at."""
+    _, calls = retarget()
+
+    assert any("sub_enable" in sql for sql in calls)
+
+
+def test_an_interface_that_already_exists_is_not_a_failure(retarget):
+    """A cluster that has failed over to this address before already has the
+    interface. The switch is what matters, and it needs exactly this one."""
+    results, _ = retarget(
+        node_add_interface=(1, 'ERROR:  interface n1_promoted_5434 for node '
+                               'n1 already exists'))
+
+    assert all(entry["ok"] for entry in results)
+
+
+def test_a_real_failure_is_still_reported(retarget):
+    results, _ = retarget(
+        sub_alter_interface=(1, "ERROR:  subscription not found"))
+
+    failed = [entry for entry in results if not entry["ok"]]
+    assert failed and all(e["step"] == "switch interface" for e in failed)

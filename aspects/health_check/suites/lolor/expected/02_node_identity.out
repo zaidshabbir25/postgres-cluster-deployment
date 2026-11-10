@@ -1,0 +1,4 @@
+node_ids_are_distinct|true
+every_peer_has_a_valid_id|true
+storage_tables_replicated_locally|true
+storage_tables_replicated_on_every_peer|true

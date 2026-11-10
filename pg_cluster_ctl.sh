@@ -18,6 +18,8 @@
 #   ./pg_cluster_ctl.sh spock replication-begin
 #   ./pg_cluster_ctl.sh spock no-primary-key
 #   ./pg_cluster_ctl.sh spock lag
+#   ./pg_cluster_ctl.sh spock version
+#   ./pg_cluster_ctl.sh spock rebuild --ref pull/626/head   # validate a PR here
 #
 #   ./pg_cluster_ctl.sh db guc-show --pattern 'spock%'
 #   ./pg_cluster_ctl.sh db guc-set max_connections 200

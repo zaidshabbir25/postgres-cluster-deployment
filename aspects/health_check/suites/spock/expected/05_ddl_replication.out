@@ -1,3 +1,5 @@
+schema_ddl_sent|true
+table_ddl_sent|true
 table_exists_locally|true
 table_replicated_to_every_peer|true
 added_to_repset|true

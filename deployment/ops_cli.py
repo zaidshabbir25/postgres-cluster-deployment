@@ -25,11 +25,14 @@ from aspects import (
     cluster_services,
     consistency,
     db_operations,
+    failover_callback,
+    patroni_management,
     spock_operations,
     state,
 )
 from aspects.logging_setup import RunLogger, new_run_id
-from deployment import add_node, add_standby, node_access, remove_node
+from deployment import (add_node, add_standby, node_access, remove_node,
+                        spock_rebuild)
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
@@ -629,7 +632,18 @@ def cmd_service(args):
         svc = cluster_services
 
         if action == "status":
-            entries = svc.cluster_status(executor_for, plan)
+            # --node is accepted on every other action, so a status that
+            # silently ignored it would be the one place the flag lied.
+            if args.node:
+                try:
+                    only = _node(plan, args.node, spock_only=False)
+                except ValueError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return EXIT_USAGE
+                entries = [svc.status(executor_for(only), plan, only,
+                                      host=plan.host(only.host))]
+            else:
+                entries = svc.cluster_status(executor_for, plan)
             if args.json:
                 print(json.dumps(entries, indent=2, default=str))
             else:
@@ -690,6 +704,144 @@ def cmd_service(args):
         ok, message = handler(executor, plan, node, component=args.component)
         print(f"{'OK' if ok else 'FAILED'} {node.name}/{args.component}: {message}")
         return EXIT_OK if ok else EXIT_FAIL
+
+    return _with_pool(plan, run)
+
+
+def cmd_spock_version(args):
+    """What Spock every node loads, has created, and could update to."""
+    rows = spock_rebuild.versions(_resolve_cluster(args),
+                                  db_password=args.db_password)
+    if args.json:
+        print(json.dumps(rows, indent=2, default=str))
+        return EXIT_OK
+    print(_table(rows, ["node", "role", "loaded", "extension", "available",
+                        "checksum"]))
+    pending = [r["node"] for r in rows
+               if r["available"] and r["extension"]
+               and r["available"] != r["extension"]]
+    if pending:
+        print(f"\nextension update outstanding on {', '.join(pending)}: "
+              f"ALTER EXTENSION spock UPDATE (spock rebuild does this)")
+    loaded = {r["loaded"] for r in rows if r["loaded"]}
+    if len(loaded) > 1:
+        print(f"\nWARNING: nodes load different Spock builds: "
+              f"{', '.join(sorted(loaded))}")
+        return EXIT_FAIL
+    return EXIT_OK
+
+
+def cmd_spock_rebuild(args):
+    """Build Spock from a git ref onto every node of the running cluster."""
+    cluster = _resolve_cluster(args)
+    if cluster is None:
+        return EXIT_FAIL
+    if not args.yes:
+        print(f"This replaces the Spock every node of '{cluster}' is running "
+              f"with a build of {args.ref}, restarting PostgreSQL on each node "
+              f"in turn.")
+        answer = input("Type yes to continue: ").strip()
+        if answer != "yes":
+            print("Aborted.")
+            return EXIT_OK
+
+    result = spock_rebuild.rebuild(
+        cluster, args.ref, db_password=args.db_password,
+        restart=not args.no_restart, update_extension=not args.no_update,
+        jobs=args.jobs,
+    )
+
+    if result["outcome"] == "failed":
+        print(f"\nFAILED: {result.get('error')}", file=sys.stderr)
+        print(f"Log: {result['log_dir']}", file=sys.stderr)
+        return EXIT_FAIL
+
+    rows = []
+    for name, after in result["after"].items():
+        before = result["before"].get(name, {})
+        rows.append({
+            "node": name,
+            "role": after["role"],
+            "loaded": f"{before.get('loaded') or '-'} -> {after['loaded'] or '-'}",
+            "extension": f"{before.get('extension') or '-'} -> "
+                         f"{after['extension'] or '-'}",
+            "checksum": after["checksum"],
+        })
+    print(_table(rows, ["node", "role", "loaded", "extension", "checksum"]))
+
+    for host, build in result["builds"].items():
+        print(f"  {host}: {build['describe'] or build['revision']} "
+              f"({build['revision']})")
+    for warning in result["warnings"]:
+        print(f"  WARNING: {warning}")
+
+    previous = result.get("previous_ref")
+    if result["deploy_mode"] == "source" and previous and previous != "package":
+        print(f"\nTo go back: spock rebuild --ref {previous}")
+    elif result["deploy_mode"] != "source":
+        print("\nThis cluster installed Spock from packages. To go back, "
+              "reinstall the package on every host: "
+              "node command 'dnf reinstall -y <spock package>' --on all "
+              "(apt-get install --reinstall on Debian), then "
+              "service restart --component postgres on each node.")
+    print(f"Log: {result['log_dir']}")
+    return EXIT_OK if result["outcome"] == "succeeded" else EXIT_FAIL
+
+
+def cmd_auto_repair(args):
+    """Turn Patroni's own failover retargeting on or off, cluster-wide.
+
+    Enabling it on a running cluster means writing the callback onto every
+    member, naming it in each local patroni.yml, and reloading Patroni —
+    which re-reads that file without touching PostgreSQL. Nothing restarts and
+    no leader moves.
+    """
+    plan, _ = _load(args)
+
+    if args.on is None:
+        state_word = "on" if plan.auto_repair_failover else "off"
+        print(f"automatic failover repair is {state_word}")
+        if plan.auto_repair_failover:
+            print(f"  callback: {failover_callback.script_path('<node>')}")
+            print(f"  log:      {failover_callback.log_path('<node>')}")
+        return EXIT_OK
+
+    plan.auto_repair_failover = args.on
+
+    def run(executor_for):
+        failures = []
+        for node in plan.nodes:
+            executor = executor_for(node)
+            try:
+                if args.on:
+                    failover_callback.install(
+                        executor, plan, node,
+                        spock_name=failover_callback.spock_name_for(plan, node),
+                    )
+                else:
+                    failover_callback.remove(executor, node)
+                patroni_management.write_config(executor, plan, node)
+                ok, message = cluster_services.reload(
+                    executor, plan, node, component="patroni")
+                print(f"{'ok' if ok else 'FAILED'} {node.name}: {message}")
+                if not ok:
+                    failures.append(node.name)
+            except Exception as exc:              # noqa: BLE001 - reported
+                print(f"FAILED {node.name}: {exc}", file=sys.stderr)
+                failures.append(node.name)
+
+        if failures:
+            print(f"\n{len(failures)} node(s) not updated: "
+                  f"{', '.join(failures)}", file=sys.stderr)
+            return EXIT_FAIL
+
+        state.save(plan)
+        print(f"\nautomatic failover repair is "
+              f"{'on' if args.on else 'off'} for every node")
+        if args.on:
+            print("A promoted standby now retargets its peers itself; "
+                  "--repair-failover stays available for doing it by hand.")
+        return EXIT_OK
 
     return _with_pool(plan, run)
 
@@ -1115,6 +1267,36 @@ def _register_spock(subparsers, add_common):
         p = base(name, help_text)
         p.add_argument("subscription")
 
+    version = actions.add_parser(
+        "version", help="what Spock each node loads, has created, and could "
+                        "update to")
+    add_common(version)
+    version.add_argument("--json", action="store_true")
+    version.set_defaults(func=cmd_spock_version)
+
+    rebuilding = actions.add_parser(
+        "rebuild",
+        help="build Spock from a git ref onto every node of the running "
+             "cluster — for validating a pull request or commit against a "
+             "real topology",
+    )
+    add_common(rebuilding)
+    rebuilding.add_argument(
+        "--ref", required=True,
+        help="branch, tag, commit, or a GitHub pull request as pull/<N>/head")
+    rebuilding.add_argument(
+        "--no-restart", action="store_true",
+        help="install only; every node keeps running the old module until it "
+             "restarts")
+    rebuilding.add_argument(
+        "--no-update", action="store_true",
+        help="skip ALTER EXTENSION spock UPDATE after the restart")
+    rebuilding.add_argument("--jobs", type=int, default=None,
+                            help="make -j value [nproc]")
+    rebuilding.add_argument("--yes", action="store_true",
+                            help="skip the confirmation prompt")
+    rebuilding.set_defaults(func=cmd_spock_rebuild)
+
     for name, help_text in (("sub-add-repset", "add a repset to a subscription"),
                             ("sub-remove-repset",
                              "remove a repset from a subscription")):
@@ -1225,6 +1407,18 @@ def _register_service(subparsers, add_common):
     p = base("reinit", "rebuild a member from its leader", with_component=False)
     p.add_argument("member", help="member to rebuild")
     p.add_argument("--yes", action="store_true")
+
+    auto = actions.add_parser(
+        "auto-repair",
+        help="retarget Spock peers automatically when a standby is promoted",
+    )
+    add_common(auto)
+    switch = auto.add_mutually_exclusive_group()
+    switch.add_argument("--on", dest="on", action="store_true", default=None,
+                        help="install the Patroni callback on every node")
+    switch.add_argument("--off", dest="on", action="store_false",
+                        help="remove it")
+    auto.set_defaults(func=cmd_auto_repair)
 
 
 def _register_package(subparsers, add_common):
