@@ -159,6 +159,15 @@ change on every node and the topology's own HA as test surface. It is the
 in-cluster counterpart of the sandbox `spock-pr-validation` skill, and refuses
 a cluster whose Spock major does not match the PR's base branch.
 
+`--health_check <components> --pr <link>` (`deployment/pr_validation.py`)
+is the laptop-side driver for a cluster *already deployed from the PR's
+branch*: it rebuilds nothing, runs the suites, then starts `claude -p` with a
+prompt naming both skills and an allow-list of this repository's scripts
+only, and reads the JSON verdict line Claude is told to end with. `decide`
+makes ALL GOOD require both halves. If you are the Claude that prompt
+started, the cluster is the harness: no rebuild, no `pg_ctl`, drop what you
+create.
+
 ## Repository state
 
 Feature work has been split across several long-lived branches (`gui-interface`

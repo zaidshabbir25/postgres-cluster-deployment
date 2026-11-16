@@ -34,7 +34,8 @@ from aspects.health_check import runner as regression
 from aspects.logging_setup import RunLogger, new_run_id
 from aspects.ssh_executor import build_executor
 from deployment import (add_component, add_standby, cleanup, deploy_cluster,
-                        health_check, ops_cli, server_logging, topology)
+                        health_check, ops_cli, pr_validation, server_logging,
+                        topology)
 from reports import report_generator
 
 EXIT_OK = 0
@@ -508,6 +509,9 @@ def cmd_health_check(args):
               file=sys.stderr)
         return EXIT_USAGE
 
+    if getattr(args, "pr", None):
+        return _validate_change(args, cluster, components)
+
     result = health_check.run(
         cluster_name=cluster, components=components,
         db_password=args.db_password, node_name=args.node,
@@ -524,6 +528,35 @@ def cmd_health_check(args):
 
     print(f"\nLogs: {result.get('log_dir')}")
     return EXIT_OK if result["outcome"] == "succeeded" else EXIT_FAIL
+
+
+def _validate_change(args, cluster, components):
+    """--health_check ... --pr: the suites on the cluster as deployed, then
+    Claude on this machine reviewing the change and trying to break it."""
+    try:
+        change = pr_validation.parse_change(args.pr)
+    except ValueError as exc:
+        print(f"--pr: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    result = pr_validation.run(
+        cluster, components, change,
+        db_password=args.db_password, node_name=args.node,
+        inventory_path=args.inventory,
+        tests=_split_list(args.tests), test_timeout=args.test_timeout,
+        install_requirements=args.install_requirements,
+        review=not getattr(args, "no_review", False),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        print(f"\n{result['verdict']}")
+        for line in pr_validation.summary_lines(result):
+            print(line)
+    print(f"\nLogs: {result.get('log_dir')}")
+    if result["outcome"] != "succeeded":
+        return EXIT_FAIL
+    return EXIT_OK if result["verdict"] == pr_validation.ALL_GOOD else EXIT_FAIL
 
 
 def cmd_remove(args):
@@ -809,6 +842,16 @@ def build_parser():
              "it, so a slow host may need more")
     checking.add_argument("--stop-on-failure", action="store_true",
                           help="do not run the remaining suites after one fails")
+    checking.add_argument(
+        "--pr", "--PR", metavar="LINK",
+        help="validate a Spock change the cluster was deployed from: a pull "
+             "request link or number, or a commit or branch of pgEdge/spock. "
+             "Runs the suites, then Claude Code on this machine reads the PR, "
+             "reviews it and tries to break it on the running cluster; prints "
+             "ALL GOOD or every failure. Nothing is rebuilt")
+    checking.add_argument(
+        "--no-review", action="store_true",
+        help="with --pr, only the suites; do not start Claude")
     checking.add_argument("--json", action="store_true")
     checking.set_defaults(func=cmd_health_check)
 

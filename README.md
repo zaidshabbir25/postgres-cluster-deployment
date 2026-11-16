@@ -651,6 +651,22 @@ ace         main (branch or tag)       github.com/pgEdge/ace              /usr/l
   Sources are cloned and compiled under /opt/pgedge/build; only the results are installed.
 ```
 
+A compile runs for ten to forty minutes per host, so the deployment shows
+that it is alive rather than going quiet: each configure and make writes to
+`/opt/pgedge/build/build.log` on the host, and once a minute the console
+prints the step, the time it has taken, and the last line of that log.
+
+```
+    n1: make PostgreSQL … 4m00s  gcc -O2 ... -c heapam.c
+    n1: make PostgreSQL … 5m00s  gcc -O2 ... -c nbtree.c
+    n1: make PostgreSQL done in 5m41s
+```
+
+A step that fails stops with the last sixty lines of the log; one that is
+still running after its limit is a timeout, not a wait. When the host is
+done the whole log is copied to `logs/<run-id>/<host>-build.log` beside
+`deploy.log`.
+
 The version column says where its number came from, because the difference
 matters. `expected` is a pin from `configuration/config<major>.env` — a
 reference point, not a gate: the deployment installs what the channel offers
@@ -1086,6 +1102,11 @@ The previous ref is recorded in the cluster state, so a source-built cluster
 goes back with the same command. A packaged cluster goes back by reinstalling
 the package, which the output spells out.
 
+For a cluster deployed from the PR's branch already, there is nothing to
+rebuild: `./pg_deploy_cluster.sh --health_check spock --pr <link>` runs the
+suites and has Claude review and attack the change, described under
+[component health checks](#validating-a-spock-pull-request-on-the-cluster).
+
 The workflow around this — reading the PR, choosing scenarios the topology
 makes possible, before/after comparison, restore, report — is a Claude Code
 skill in [.claude/skills/spock-pr-on-cluster/](.claude/skills/spock-pr-on-cluster/SKILL.md).
@@ -1116,6 +1137,60 @@ lolor      in-tree    PASSED   4/4 passed
 snowflake  main       SKIPPED  needs the snowflake extension in postgres on n1
 ace        installed  FAILED   2/3 passed, 1 failed
 ```
+
+### Validating a Spock pull request on the cluster
+
+With a cluster deployed from the branch under review, `--pr` turns the
+health check into a verdict on the change. Nothing is rebuilt:
+
+```bash
+./pg_deploy_cluster.sh --health_check spock --pr https://github.com/pgEdge/spock/pull/626
+./pg_deploy_cluster.sh --health_check spock,lolor --pr 626 --no-review
+```
+
+The run, in order: read the PR from GitHub and refuse it if its base branch
+is another Spock major than the cluster runs, since the cluster then cannot
+be carrying the change; check every node loads the same build; run the
+named suites; then start Claude Code on this machine with the PR, the
+cluster's node list and the suite results, and the two skills to follow.
+Claude reads the change the way `spock-pr-validation` does, and tries to
+break it on the running cluster the way
+[spock-pr-on-cluster](.claude/skills/spock-pr-on-cluster/SKILL.md) does:
+the PR's own trigger verified on every peer, under failover where a node
+has a standby, on the apply side, through an apply worker restart, inside
+transactions, with the feature GUC off, in a loop, from a non-superuser,
+with `diff all` and a log grep after each. It is allowed only the
+read-and-scenario sub-commands of this repository's scripts and GitHub:
+no `node add`, no `spock rebuild`, no `package`, no shell to the hosts,
+no `pg_ctl`, no docker or initdb on the laptop. Every call it makes carries
+`--cluster <name>` so it reaches the cluster this run is about and not
+whichever was deployed last, and it must confirm the node list before the
+first scenario. It drops what it creates, writes `claude-report.md` beside
+the log and ends with a verdict line naming the cluster and the nodes the
+scenarios ran on. A verdict that names another cluster, nodes this one
+does not have, or no node at all is not accepted: the result is
+`INCONCLUSIVE`, whatever the verdict said.
+
+```
+ALL GOOD
+
+COMPONENT       RESULT  DETAIL
+--------------  ------  ------------
+spock           PASSED  8/8 passed
+spock-upstream  PASSED  41/41 passed
+
+  Review: PASS — the queued DDL reached every peer and survived a switchover (9 scenario(s))
+  Claude's report: logs/pgedge-pr-626-20261110T101500/claude-report.md
+  Report: logs/pgedge-pr-626-20261110T101500/report.md
+```
+
+`ALL GOOD` needs both halves: every suite passed and Claude found nothing.
+Otherwise every failed suite and every finding is listed, the verdict is
+`FAIL`, and the exit code is non-zero. A review that could not reach the
+behaviour the PR is about, or a Claude that did not answer, is
+`INCONCLUSIVE`, never good. `--no-review` runs only the suites. Claude Code
+must be on this machine's PATH as `claude`, or named in `CLAUDE_CMD`; a
+review may take up to `CLAUDE_PR_TIMEOUT` seconds (an hour by default).
 
 ### What each check actually tests
 

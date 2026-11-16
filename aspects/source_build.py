@@ -15,6 +15,9 @@ prerequisites.
 
 import re
 import shlex
+import time
+
+from aspects.ssh_executor import CommandFailed
 
 from aspects import (etcd_management, package_management, pg_server_management,
                      platform_detect, service_management)
@@ -91,6 +94,102 @@ def make_venv_reachable(executor, venv, node=None):
     if target.startswith(INSTALL_ROOT):
         executor.try_run(f"chmod a+rx {shlex.quote(target)}", node=node)
     return venv
+
+
+#: Where a host keeps the output of its compiles. One file per build run,
+#: appended step by step, so a failure is read from the step that failed and
+#: a success leaves the whole thing for the record.
+BUILD_LOG = f"{BUILD_ROOT}/build.log"
+
+#: How often, in seconds, a running compile reports what it is doing.
+PROGRESS_INTERVAL = 60
+
+
+def start_build_log(executor, node=None, title=""):
+    """Begin a fresh build log on the host, with a line saying what for."""
+    executor.run(f"mkdir -p {BUILD_ROOT}", node=node)
+    executor.run(
+        f"rm -f {BUILD_LOG} && printf '%s\\n' {shlex.quote(f'# {title}')} "
+        f"> {BUILD_LOG}", node=node, message="start build log")
+    return BUILD_LOG
+
+
+def run_logged(executor, command, message, node=None, timeout=3600,
+               run_logger=None, log=BUILD_LOG, interval=None):
+    """Run a long compile on the host, its output into the build log, with a
+    progress line here every so often.
+
+    A `make` over SSH used to be one blocking call: nothing on the console
+    for twenty minutes, then a megabyte of output into the node transcript.
+    Instead the command is started in the background on the host writing to
+    `log`, and this side polls — is it still running, what was its last
+    line — and prints that at intervals, so a long build is distinguishable
+    from a hung one. When it finishes the exit code is read from a status
+    file written beside the log; a non-zero one raises CommandFailed with
+    the tail of the log, exactly as the blocking call did.
+    """
+    interval = interval or PROGRESS_INTERVAL
+    status = f"{log}.status"
+    tag = f"==== {message} ===="
+    # Run in a subshell so its exit code is the command's, then publish the
+    # code by rename: a reader never sees an empty status file.
+    wrapped = (f"( {command} ) >> {log} 2>&1; "
+               f"echo $? > {status}.tmp && mv {status}.tmp {status}")
+    executor.run(
+        f"rm -f {shlex.quote(status)} && "
+        f"printf '\\n%s\\n' {shlex.quote(tag)} >> {shlex.quote(log)} && "
+        f"nohup bash -c {shlex.quote(wrapped)} >/dev/null 2>&1 &",
+        node=node, message=f"start: {message}")
+
+    started = time.monotonic()
+    while True:
+        done, text = executor.try_run(
+            f"test -f {shlex.quote(status)} && cat {shlex.quote(status)}",
+            node=node)
+        if done:
+            code = int(text.strip() or 0)
+            break
+        elapsed = int(time.monotonic() - started)
+        if elapsed > timeout:
+            executor.try_run(f"pkill -f {shlex.quote(command[:60])}", node=node)
+            raise TimeoutError(
+                f"[{getattr(executor, 'host', node)}] {message} still running "
+                f"after {timeout}s; see {log} on the host")
+        time.sleep(interval)
+        if run_logger:
+            _, last = executor.try_run(
+                f"tail -n 1 {shlex.quote(log)} 2>/dev/null | cut -c1-110",
+                node=node)
+            run_logger.info(f"    {node}: {message} … {elapsed // 60}m"
+                            f"{elapsed % 60:02d}s  {last.strip()}")
+
+    duration = time.monotonic() - started
+    if code != 0:
+        _, tail = executor.try_run(f"tail -n 60 {shlex.quote(log)}", node=node)
+        raise CommandFailed(getattr(executor, "host", node), message, code,
+                            f"(last 60 lines of {log})\n{tail}")
+    if run_logger:
+        run_logger.info(f"    {node}: {message} done in "
+                        f"{int(duration) // 60}m{int(duration) % 60:02d}s")
+    return code
+
+
+def fetch_build_log(executor, run_logger, node=None, log=BUILD_LOG):
+    """Copy the host's build log into the run's log directory, as
+    `<node>-build.log`, so it is beside deploy.log afterwards."""
+    if run_logger is None:
+        return None
+    ok, text = executor.try_run(f"cat {shlex.quote(log)}", node=node)
+    if not ok:
+        return None
+    path = run_logger.root / f"{node}-build.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        # The copy is a convenience; the log is still on the host.
+        return None
+    return str(path)
 
 
 def install_dir(pg_major):
@@ -308,50 +407,47 @@ def apply_spock_patches(executor, source_dir, spock_dir, pg_major, node=None):
     return len(patches), names
 
 
-def build_postgresql(executor, source_dir, pg_major, node=None, jobs=None):
-    """configure, make, make install — including contrib for dblink."""
+def build_postgresql(executor, source_dir, pg_major, node=None, jobs=None,
+                     run_logger=None):
+    """configure, make, make install — including contrib for dblink.
+
+    Each step's output goes to the host's build log, with progress here."""
     prefix = install_dir(pg_major)
     jobs_flag = f"-j{jobs}" if jobs else "-j$(nproc)"
+    src = shlex.quote(source_dir)
 
-    executor.run(
-        f"cd {shlex.quote(source_dir)} && ./configure "
-        f"--prefix={shlex.quote(prefix)} "
-        f"--with-openssl --with-libxml --with-libxslt --with-icu "
-        f"--enable-thread-safety",
-        node=node, message="configure PostgreSQL", timeout=1800,
-    )
-    executor.run(
-        f"cd {shlex.quote(source_dir)} && make {jobs_flag}",
-        node=node, message="make PostgreSQL", timeout=5400,
-    )
-    executor.run(
-        f"cd {shlex.quote(source_dir)} && make install",
-        node=node, message="make install PostgreSQL", timeout=1800,
-    )
-    # zodan's cross-wiring runs through dblink, which lives in contrib.
-    executor.run(
-        f"cd {shlex.quote(source_dir)}/contrib && make {jobs_flag} && make install",
-        node=node, message="build and install contrib", timeout=3600,
-    )
+    steps = [
+        ("configure PostgreSQL",
+         f"cd {src} && ./configure --prefix={shlex.quote(prefix)} "
+         f"--with-openssl --with-libxml --with-libxslt --with-icu "
+         f"--enable-thread-safety", 1800),
+        ("make PostgreSQL", f"cd {src} && make {jobs_flag}", 5400),
+        ("make install PostgreSQL", f"cd {src} && make install", 1800),
+        # zodan's cross-wiring runs through dblink, which lives in contrib.
+        ("build and install contrib",
+         f"cd {src}/contrib && make {jobs_flag} && make install", 3600),
+    ]
+    for message, command, timeout in steps:
+        run_logged(executor, command, message, node=node, timeout=timeout,
+                   run_logger=run_logger)
     make_reachable(executor, prefix, node=node)
     return prefix
 
 
-def build_spock(executor, spock_dir, pg_major, node=None, jobs=None):
+def build_spock(executor, spock_dir, pg_major, node=None, jobs=None,
+                run_logger=None):
     """Build Spock against the freshly installed server via PGXS."""
     prefix = install_dir(pg_major)
     jobs_flag = f"-j{jobs}" if jobs else "-j$(nproc)"
     env = f"PATH={prefix}/bin:$PATH USE_PGXS=1"
+    src = shlex.quote(spock_dir)
 
-    executor.try_run(f"cd {shlex.quote(spock_dir)} && {env} make clean", node=node)
-    executor.run(
-        f"cd {shlex.quote(spock_dir)} && {env} make {jobs_flag}",
-        node=node, message="make spock", timeout=3600,
-    )
-    executor.run(
-        f"cd {shlex.quote(spock_dir)} && {env} make install",
-        node=node, message="make install spock", timeout=900,
-    )
+    executor.try_run(f"cd {src} && {env} make clean", node=node)
+    run_logged(executor, f"cd {src} && {env} make {jobs_flag}", "make spock",
+               node=node, timeout=3600, run_logger=run_logger)
+    run_logged(executor, f"cd {src} && {env} make install",
+               "make install spock", node=node, timeout=900,
+               run_logger=run_logger)
 
     ok, _ = executor.try_run(
         f"test -f {prefix}/lib/spock.so || test -f {prefix}/lib/postgresql/spock.so",
@@ -553,6 +649,11 @@ def build_major(executor, host, plan, pg_version, spock_branch=None,
     _, message = install_build_dependencies(executor, host.family, node=host.name)
     say(message)
     ensure_postgres_user(executor, plan.db_user, host.family, node=host.name)
+    start_build_log(executor, node=host.name,
+                    title=f"PostgreSQL {pg_version} + Spock {spock_branch} on "
+                          f"{host.name}")
+    say(f"compile output goes to {BUILD_LOG} on the host; progress every "
+        f"{PROGRESS_INTERVAL}s here")
 
     source_dir = fetch_postgres_source(executor, pg_version, node=host.name)
     spock_dir, revision = fetch_spock_source(executor, spock_branch, node=host.name)
@@ -565,14 +666,18 @@ def build_major(executor, host, plan, pg_version, spock_branch=None,
         f"from branch {spock_branch}")
 
     prefix = build_postgresql(executor, source_dir, pg_major, node=host.name,
-                              jobs=jobs)
+                              jobs=jobs, run_logger=run_logger)
     details["prefix"] = prefix
     say(f"PostgreSQL {pg_version} installed to {prefix}")
 
     details["spock_module"] = build_spock(executor, spock_dir, pg_major,
-                                          node=host.name, jobs=jobs)
+                                          node=host.name, jobs=jobs,
+                                          run_logger=run_logger)
     register_library_path(executor, pg_major, node=host.name)
     make_reachable(executor, prefix, node=host.name)
+    details["build_log"] = fetch_build_log(executor, run_logger, node=host.name)
+    if details["build_log"]:
+        say(f"build log copied to {details['build_log']}")
     return details
 
 
@@ -586,7 +691,10 @@ def rebuild_spock(executor, host, plan, pg_major, spock_branch,
     """
     spec = plan.source_build or {}
     spock_dir, revision = fetch_spock_source(executor, spock_branch, node=host.name)
+    start_build_log(executor, node=host.name,
+                    title=f"Spock {spock_branch} on {host.name}")
     module = build_spock(executor, spock_dir, pg_major, node=host.name,
+                         run_logger=run_logger,
                          jobs=spec.get("jobs"))
     make_reachable(executor, install_dir(pg_major), node=host.name)
     if run_logger:
@@ -621,6 +729,12 @@ def build_host(executor, host, plan, run_logger=None):
         run_logger.info(f"    {host.name}: {message}")
 
     ensure_postgres_user(executor, plan.db_user, family, node=host.name)
+    start_build_log(executor, node=host.name,
+                    title=f"PostgreSQL {pg_version} + Spock {spock_branch} on "
+                          f"{host.name}")
+    if run_logger:
+        run_logger.info(f"    {host.name}: compile output goes to {BUILD_LOG} "
+                        f"on the host; progress every {PROGRESS_INTERVAL}s here")
 
     source_dir = fetch_postgres_source(executor, pg_version, node=host.name)
     spock_dir, revision = fetch_spock_source(executor, spock_branch, node=host.name)
@@ -634,14 +748,18 @@ def build_host(executor, host, plan, run_logger=None):
         run_logger.info(f"    {host.name}: applied {count} Spock patch(es)")
 
     prefix = build_postgresql(executor, source_dir, plan.pg_major,
-                              node=host.name, jobs=jobs)
+                              node=host.name, jobs=jobs, run_logger=run_logger)
     details["prefix"] = prefix
     if run_logger:
         run_logger.info(f"    {host.name}: PostgreSQL {pg_version} installed to {prefix}")
 
     details["spock_module"] = build_spock(executor, spock_dir, plan.pg_major,
-                                          node=host.name, jobs=jobs)
+                                          node=host.name, jobs=jobs,
+                                          run_logger=run_logger)
     register_paths(executor, plan.pg_major, node=host.name)
+    details["build_log"] = fetch_build_log(executor, run_logger, node=host.name)
+    if run_logger and details["build_log"]:
+        run_logger.info(f"    {host.name}: build log copied to {details['build_log']}")
 
     details["patroni"] = install_patroni_from_pip(executor, family, node=host.name)
     details["etcd"] = install_etcd_from_release(

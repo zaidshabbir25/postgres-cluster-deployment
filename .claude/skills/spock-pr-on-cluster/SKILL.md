@@ -75,8 +75,16 @@ Only those can fail over, and that is a scenario the sandbox cannot run.
 
 ## 3. Baseline on the current build
 
-Run everything you will run again after the rebuild, so the comparison is
-like for like. Keep every output under `validation/<pr-or-sha>/before/`.
+When the cluster was deployed from the PR's branch already, steps 4 and 7
+do not apply and `./pg_deploy_cluster.sh --health_check spock --pr <N>`
+runs the suites and then starts a headless Claude with this skill to do
+steps 1, 3, 5 and 6. If that is how you were started, the prompt says so:
+rebuild nothing, treat the current build as the "after" side, and end with
+the verdict line the prompt asks for.
+
+Run everything you will run again after the rebuild, so the comparison
+is like for like. Keep every output under
+`validation/<pr-or-sha>/before/`.
 
 ```bash
 ./pg_deploy_cluster.sh --health_check spock                 # the in-tree suite

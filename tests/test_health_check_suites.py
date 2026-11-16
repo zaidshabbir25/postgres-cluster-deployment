@@ -920,3 +920,23 @@ def test_the_report_says_what_an_upstream_verdict_is_about():
 
     assert "spock-upstream ran against a scratch instance" in text
     assert "not against this cluster" in text
+
+
+def test_the_auto_ddl_notice_is_dropped_before_the_comparison(deployed_plan):
+    """With spock.enable_ddl_replication on, every CREATE in a case prints
+    `INFO:  DDL statement replicated.` through psql, whatever
+    client_min_messages says; the expected files must hold either way."""
+    from aspects.health_check import runner as hc_runner
+    executor = FakeExecutor()
+    suite = hc_runner.suite_for("spock", tests=["06_dml"])
+    node = deployed_plan.spock_nodes[0]
+
+    suite._run_one(executor, deployed_plan, node, "06_dml", "/r")
+
+    commands = executor.commands
+    psql = next(i for i, c in enumerate(commands) if "06_dml.sql" in c and "psql" in c)
+    strip = next(i for i, c in enumerate(commands)
+                 if "sed -i" in c and "DDL statement replicated" in c
+                 and "06_dml.out" in c)
+    diff = next(i for i, c in enumerate(commands) if "diff -u" in c)
+    assert psql < strip < diff

@@ -39,6 +39,9 @@ PASSED = "passed"
 FAILED = "failed"
 SKIPPED = "skipped"
 
+#: sed script dropping the notice Spock emits for each DDL it auto-replicates.
+AUTO_DDL_NOTICE = r"/INFO:  DDL statement replicated\.$/d"
+
 
 @dataclass
 class SuiteResult:
@@ -340,6 +343,16 @@ class InTreeSuite(Suite):
             if "Timeout" in type(exc).__name__:
                 return f"TIMED OUT after {self.test_timeout}s"
             return f"FAILED ({type(exc).__name__})"
+
+        # A cluster with automatic DDL replication on announces every DDL it
+        # replicates at INFO, which psql prints whatever client_min_messages
+        # says. The cases create helpers and tables deliberately, and whether
+        # DDL replicates is asked by content (05) rather than by the notice,
+        # so the line is dropped before the comparison: the expected files
+        # must hold on a cluster with the setting off as well as on.
+        executor.try_run(
+            f"sed -i -E {shlex.quote(AUTO_DDL_NOTICE)} {shlex.quote(actual)}",
+            node=node.name)
 
         same, _ = executor.try_run(
             f"diff -u {shlex.quote(expected)} {shlex.quote(actual)} "

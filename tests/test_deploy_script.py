@@ -848,3 +848,23 @@ def test_a_topology_does_not_combine_with_changing_a_cluster(script, inventory):
 
     assert code != 0
     assert "does not combine" in output
+
+
+def test_health_check_passes_the_pull_request_through(script, inventory):
+    code, output = run(script, inventory, "--health_check", "spock",
+                       "--pr", "https://github.com/pgEdge/spock/pull/626",
+                       "--no-review", facts=SOURCE_60)
+
+    assert code == 0, output
+    check = line(output, "CHECK:")
+    assert "--pr https://github.com/pgEdge/spock/pull/626" in check
+    assert "--no-review" in check
+    assert "nothing" in output and "rebuilt" in output, "says it does not rebuild"
+
+
+def test_pr_without_a_value_is_refused(script, inventory):
+    code, output = run(script, inventory, "--health_check", "spock", "--pr",
+                       facts=SOURCE_60)
+
+    assert code != 0
+    assert "--pr needs" in output
