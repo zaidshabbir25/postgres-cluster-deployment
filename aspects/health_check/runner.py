@@ -599,12 +599,13 @@ class PgRegressSuite(Suite):
 
 
 def _load_suites():
-    from aspects.health_check import (ace, ace_integration, lolor,
+    from aspects.health_check import (ace, ace_integration, failover, lolor,
                                       lolor_upstream, snowflake, spock,
                                       spock_upstream)
 
     return {
         spock.SpockSuite.name: spock.SpockSuite,
+        failover.FailoverSuite.name: failover.FailoverSuite,
         spock_upstream.SpockUpstreamSuite.name: spock_upstream.SpockUpstreamSuite,
         lolor.LolorSuite.name: lolor.LolorSuite,
         lolor_upstream.LolorUpstreamSuite.name: lolor_upstream.LolorUpstreamSuite,
@@ -650,9 +651,12 @@ GROUPS = {
     "lolor": ("lolor", "lolor-upstream"),
 }
 
-#: Never part of 'all': it starts containers of its own, takes most of an
-#: hour, and says nothing about this cluster. By name only.
-BY_NAME_ONLY = ("ace-integration",)
+#: Never part of 'all'. ace-integration starts containers of its own, takes
+#: most of an hour, and says nothing about this cluster. failover stops the
+#: leader of a scope and hands it back: it tests this cluster, but a run of
+#: 'all' must not fail a leader over without having been asked to. By name
+#: only, both.
+BY_NAME_ONLY = ("ace-integration", "failover")
 
 
 def known_components():

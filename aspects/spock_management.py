@@ -710,10 +710,16 @@ def subscription_status(executor, plan, node):
 
 
 def replication_slots(executor, plan, node):
-    """Logical and physical slots, with the WAL each is holding back."""
+    """Logical and physical slots, with the WAL each is holding back.
+
+    `active` is spelled out as 't'/'f' rather than cast: a boolean cast to
+    text is 'true'/'false', which is not what psql prints for a bare boolean
+    column, and a parser expecting one spelling reads every slot as idle.
+    """
     code, output = pg_server_management.psql(
         executor, node.bin_dir, node.pg_port, plan.db_user,
-        "SELECT slot_name || '|' || slot_type || '|' || active::text || '|' || "
+        "SELECT slot_name || '|' || slot_type || '|' || "
+        "CASE WHEN active THEN 't' ELSE 'f' END || '|' || "
         "coalesce(pg_size_pretty(pg_wal_lsn_diff("
         "pg_current_wal_lsn(), restart_lsn)), '0') "
         "FROM pg_replication_slots ORDER BY slot_name;",
@@ -730,7 +736,7 @@ def replication_slots(executor, plan, node):
                 {
                     "name": parts[0],
                     "type": parts[1],
-                    "active": parts[2] == "t",
+                    "active": parts[2].strip().lower() in ("t", "true"),
                     "retained_wal": parts[3],
                 }
             )

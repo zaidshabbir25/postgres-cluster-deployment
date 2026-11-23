@@ -521,7 +521,7 @@ def build_config(plan, node):
 
     if is_leader:
         parameters = pg_server_management.spock_guc_parameters(
-            plan.pg_version or plan.pg_major
+            plan.pg_version or plan.pg_major, spock_major=plan.spock_major
         )
         # Set here rather than after the fact: logging_collector is read at
         # startup, so a node that bootstraps without it needs a restart to

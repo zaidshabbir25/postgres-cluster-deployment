@@ -107,14 +107,41 @@ SPOCK_PARAMETERS = {
 }
 
 
-def spock_guc_parameters(pg_version):
+def native_slot_sync_gucs(pg_version, spock_major):
+    """What lets a standby carry copies of the leader's Spock slots.
+
+    A promoted standby serves its peers only if it holds the `spk_*` slots
+    their apply workers connect to. Spock 5 copies them with a worker of its
+    own on every PostgreSQL version. Spock 6 does not register that worker on
+    PostgreSQL 18 and yields to PostgreSQL's own slot synchronization on 17,
+    so on either version a Spock 6 standby gets no copies at all unless
+    `sync_replication_slots` is on — and the first unplanned failover leaves
+    the promoted node without a slot and every peer looping on "replication
+    slot does not exist". Spock 6 creates its slots with the FAILOVER flag,
+    which is what the native worker copies; the other two requirements,
+    `hot_standby_feedback` and a `dbname` in `primary_conninfo`, are already
+    met (set here, and written by Patroni). The setting is harmless on a
+    leader: the slotsync worker only runs in recovery, so it takes effect on
+    a member the moment that member becomes a standby.
+    """
+    if str(spock_major) != "60":
+        return {}
+    major = major_of(pg_version)
+    if not major or int(major) < 17:
+        return {}
+    return {"sync_replication_slots": "on"}
+
+
+def spock_guc_parameters(pg_version, spock_major=None):
     """The GUCs every Spock node in a multi-master cluster needs.
 
     track_commit_timestamp is what lets Spock resolve conflicts by last-write;
     without it a multi-master cluster cannot decide which side wins. The
     spock.* settings are SPOCK_PARAMETERS, and are safe to name here before
     the library has loaded: shared_preload_libraries puts spock in place
-    before postgresql.conf's custom settings are checked.
+    before postgresql.conf's custom settings are checked. `spock_major`
+    decides whether the standbys' slot copies come from PostgreSQL's own slot
+    sync (native_slot_sync_gucs).
     """
     params = {
         "wal_level": "logical",
@@ -129,6 +156,7 @@ def spock_guc_parameters(pg_version):
     }
     params.update(SPOCK_PARAMETERS)
     params.update(output_plugin_libraries_guc(pg_version, quoted=False))
+    params.update(native_slot_sync_gucs(pg_version, spock_major))
     return params
 
 

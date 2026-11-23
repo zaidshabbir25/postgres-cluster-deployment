@@ -59,8 +59,8 @@ def ready(**extra):
 
 def test_every_component_is_known():
     assert regression.known_components() == [
-        "ace", "ace-integration", "lolor", "lolor-upstream", "snowflake",
-        "spock", "spock-upstream"]
+        "ace", "ace-integration", "failover", "lolor", "lolor-upstream",
+        "snowflake", "spock", "spock-upstream"]
 
 
 def test_all_means_everything_but_the_by_name_only_suites():
@@ -71,6 +71,7 @@ def test_all_means_everything_but_the_by_name_only_suites():
         "ace", "lolor", "lolor-upstream", "snowflake", "spock",
         "spock-upstream"]
     assert "ace-integration" in regression.known_components()
+    assert "failover" in regression.known_components()
 
 
 def test_a_component_name_runs_both_the_cluster_check_and_upstream():
@@ -169,6 +170,7 @@ def test_in_tree_and_installed_checks_have_no_ref_to_follow():
 
     assert health_check.ref_for(plan, "lolor") == "in-tree"
     assert health_check.ref_for(plan, "spock") == "in-tree"
+    assert health_check.ref_for(plan, "failover") == "in-tree"
     assert health_check.ref_for(plan, "ace") == "installed"
 
 

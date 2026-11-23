@@ -413,6 +413,7 @@ start:
 | `spock.allow_ddl_from_functions` | `on` | DDL issued from inside a function replicates too |
 | `spock.conflict_log_level` | `debug2` | every resolved conflict is written to the server log |
 | `log_min_messages` | `debug1` | low enough for those conflict lines, and Spock's worker lifecycle, to appear |
+| `sync_replication_slots` | `on` — **spock60 on PostgreSQL 17+ only** | Spock 6 registers no failover-slots worker on 18 and yields to PostgreSQL's own on 17, so without this a standby carries no copy of the `spk_*` slots and the first unplanned failover leaves the promoted node with nothing for its peers to connect to. Spock 5 copies them with its own worker and is left alone. Harmless on a leader: the slotsync worker only runs in recovery |
 
 Step 15 then asks every Spock node what it is actually running, through
 `SHOW`, and fails the deployment if any answer differs: a value in the DCS and
@@ -1205,11 +1206,13 @@ This differs per component and changes how a result should be read.
 | snowflake | upstream `test/runner.py`, cloned fresh at snowflake's ref each run, driven by `EDGE_*` | **two deployed nodes**, through a shim |
 | ace | the installed `ace` binary: `spock-diff`, `schema-diff public`, `repset-diff default` | **the deployed nodes** |
 | ace-integration | upstream `tests/integration/*.go` via `go test` | **its own containers** — by name only, never in `all` |
+| failover | 4 scenarios in `aspects/health_check/failover.py`: the standby's slot copies, an unplanned failover, a switchover back, cleanup | **the deployed scope and its peers** — by name only, never in `all`, because it stops a leader |
 
 A component's name means everything that checks it: `--health_check spock`
 runs `spock` *and* `spock-upstream`, `lolor` runs both of its halves. Either
 half can be asked for alone by its full name; `upstream` means every
-`-upstream` suite; `all` is everything except `ace-integration`.
+`-upstream` suite; `all` is everything except `ace-integration` and
+`failover`.
 
 ### The upstream suites: fetched fresh, every run
 
@@ -1331,6 +1334,72 @@ NOT MATCH`, `Found N differences` — and the JSON reports ACE writes are kept.
 are validating. It needs Go and a running Docker daemon, takes twenty to
 forty-five minutes, and runs only when named — `all` never includes it, and
 the report says in so many words that it ran against containers it started.
+
+### failover: a scope is failed over and handed back
+
+Every other check takes the cluster as it stands. `--health_check failover`
+changes it: it stops Patroni on the leader of a scope that has a standby,
+waits for the standby to be promoted, checks what the promotion left behind,
+restarts the old leader, and then switches the scope back to its Spock node
+with `patronictl switchover`, so the cluster ends in the shape it began. It
+runs only when named, never as part of `all`: the scope has no leader for
+the seconds a promotion takes, and a run of `all` must not do that unasked.
+
+```bash
+./pg_deploy_cluster.sh --health_check failover
+./pg_deploy_cluster.sh --health_check failover --node n2        # fail n2's scope over instead
+./pg_deploy_cluster.sh --health_check failover --tests 01_standby_slots
+```
+
+The scope exercised is the one of the node the check runs on (`--node`) if
+that node has a standby, else the first Spock node that has one. A cluster
+with no standby is skipped with the `add-standby` command that adds one.
+
+A spock60 cluster on PostgreSQL 17 or later deployed before this tool set
+`sync_replication_slots` fails the first case with `0 of N spk_* slots` and
+names the fix. It goes through the DCS, so one command reaches every member
+of the scope, and the slotsync worker starts on the standby at the next
+reload with no restart:
+
+```bash
+./pg_cluster_ctl.sh db guc-set sync_replication_slots on --node n1
+```
+
+| failover case | asks |
+|---|---|
+| `01_standby_slots` | before anything is stopped: does the standby carry a copy of every `spk_*` slot the peers connect to, and is each copy permanent? Spock keeps those copies for this moment; a temporary copy is dropped at promotion and the peers loop on "replication slot does not exist" afterwards, so the state is reported here, with the count and how many are temporary, rather than discovered as a mystery after the failover |
+| `02_unplanned_failover` | 100 rows are written and confirmed on every peer; Patroni is stopped on the leader; the standby must be promoted and accept writes; it must have the `spk_*` slots (if not, the case stops here — pointing the peers at it would only produce the loop); the old leader is started again and must rejoin as a replica, before anything is written, since a strict synchronous scope holds every commit until a standby streams; then the peers must replicate from the new primary; the 100 rows must be there; 20 rows written on it must reach every peer and 10 written on each peer must come back |
+| `03_switchover_back` | the planned path, with the same checks, switching to the Spock node's own member so the scope is restored — or to the standby and back, when nothing failed over before it |
+| `04_cleanup` | the suite's schema is gone again on every peer |
+
+How the peers are retargeted depends on the cluster. With automatic failover
+repair on (`auto-repair on`), the `on_role_change` callback on the promoted
+member does it and the suite only waits, reporting
+`peers_retargeted_by_callback|true` and how long it took. With it off, the
+suite retargets them itself through the same interface naming the callback
+uses, and reports `peers_retargeted_by_hand`. A callback that has not done
+it within half the timeout is reported as `peers_retargeted_by_callback|false`
+and the suite repairs by hand so the remaining checks can still be asked.
+
+Two refusals protect the cluster. A leader whose standby is not streaming is
+left alone, with `nothing was stopped` in the verdict: taking it down would
+leave the scope with no leader. And whatever a case finds after the stop,
+the old leader is started again before the case ends, so the scope is never
+left a member short. Each wait — promotion, rejoin, a row arriving — is
+bounded by `--test-timeout` (300s); a failover that takes longer is the
+finding.
+
+```
+failover: 4 scenario(s) on scope pgedge-n1, 300s per wait
+  stopping Patroni on n1; expecting n1s1 to be promoted
+  [1/4] 01_standby_slots             ok
+  [2/4] 02_unplanned_failover        FAILED — n1s1 has 0 spk_* slot(s) after promotion, 2 needed — the standby's copies did not survive
+  [3/4] 03_switchover_back           ok
+  [4/4] 04_cleanup                   ok
+```
+
+Each check's line is in the suite's output in the run log, as
+`name|true` or `name|false` with the figure that decided it.
 
 ### Skips
 

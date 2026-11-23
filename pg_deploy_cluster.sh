@@ -153,7 +153,11 @@ Cleanup
                             /opt/pgedge/regression and is reported separately.
                             ace-integration (ACE's Go suite, in containers of
                             its own) runs only when named; it never reads the
-                            deployed cluster.
+                            deployed cluster. failover also runs only when
+                            named: it stops the leader of a scope that has a
+                            standby, checks the promotion (Spock slots, peers
+                            retargeted, rows kept and replicating both ways),
+                            then switches the scope back.
   --node NAME               with --health_check, the Spock node to run against
   --stop-on-failure         with --health_check, skip the remaining suites once
                             one fails
@@ -816,6 +820,13 @@ if [[ -n "$HEALTH_CHECK" ]]; then
   say "ace starts its own containers: it tests the ACE binary, not this"
   say "cluster — use 'ace table-diff' for that.${RESET}"
   say ""
+  if [[ ",$HEALTH_CHECK," == *,failover,* ]]; then
+    say "${BOLD}failover stops the leader of a scope that has a standby${RESET}${DIM}, waits"
+    say "for Patroni to promote the standby, checks the mesh, and switches the"
+    say "scope back. The scope has no leader for the seconds a promotion"
+    say "takes.${RESET}"
+    say ""
+  fi
 
   exec python3 -m deployment.cli health-check \
     --components "$HEALTH_CHECK" \

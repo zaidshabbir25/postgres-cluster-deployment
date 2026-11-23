@@ -476,7 +476,7 @@ def replication_lag(executor, plan, node):
     """Per-slot replication lag, in bytes and pretty form."""
     return pg.dict_rows(
         executor, node.bin_dir, node.pg_port, plan.db_user,
-        "SELECT slot_name, slot_type, active::text, "
+        "SELECT slot_name, slot_type, active, "
         "  coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), "
         "           restart_lsn)::text, '0'), "
         "  coalesce(pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), "
@@ -498,7 +498,11 @@ def wait_for_lag_below(executor, plan, node, max_bytes=1024, timeout=600,
     worst = None
     for _ in range(attempts):
         slots = replication_lag(executor, plan, node) or []
-        active = [s for s in slots if s["active"] == "t"]
+        # psql prints a bare boolean as t/f; a cast would print true/false.
+        # Either spelling is read, so no slot is mistaken for an idle one and
+        # the wait returns at once with nothing to wait for.
+        active = [s for s in slots
+                  if str(s["active"] or "").strip().lower() in ("t", "true")]
         if not active:
             return True, 0
         try:

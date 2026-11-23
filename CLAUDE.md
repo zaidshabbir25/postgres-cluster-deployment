@@ -73,7 +73,13 @@ is `targets_cluster` plus `scope`: spock, lolor, snowflake and ace (the
 installed binary's spock/schema/repset-diff) exercise the deployed cluster;
 the `-upstream` suites exercise the installed library; `ace-integration`
 starts its own containers, proves nothing about the cluster, and is left out
-of `all`.
+of `all`. `failover` (`health_check/failover.py`) is the one suite that
+changes the cluster: it stops Patroni on the leader of a scope with a standby,
+checks the promotion (the `spk_*` slot copies, peers retargeted by the
+callback or by hand, rows kept and replicating both ways, the old leader
+rejoining), then switches the scope back. By name only, like
+`ace-integration`, but because it is disruptive rather than irrelevant. Its
+waits go through `_now`/`_sleep` so tests run a simulated clock.
 
 `deployment/cli.py` holds lifecycle commands (deploy, plan, status, remove) and
 `deployment/ops_cli.py` registers the day-two groups (node, spock, db, service,

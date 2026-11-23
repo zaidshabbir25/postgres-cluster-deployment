@@ -142,3 +142,54 @@ def test_verify_compares_case_insensitively(deployed_plan):
     assert sm.verify_gucs(executor, deployed_plan, a_node(), wanted={
         "spock.conflict_log_level": "debug2",
         "track_commit_timestamp": "on"}) == []
+
+
+# ---------------------------------------------------------------------------
+# standbys' slot copies: who makes them depends on the Spock major
+# ---------------------------------------------------------------------------
+
+
+def _parameters(plan):
+    config = patroni_management.build_config(plan, plan.spock_nodes[0])
+    return config["bootstrap"]["dcs"]["postgresql"]["parameters"]
+
+
+@pytest.mark.parametrize("pg_version", ["17.11", "18.7", "19beta3"])
+def test_a_spock6_scope_on_pg17_or_later_turns_native_slot_sync_on(
+        deployed_plan, pg_version):
+    """Spock 6 registers no failover-slots worker on 18 and yields to
+    PostgreSQL's own on 17, so without this a standby carries no copy of
+    the spk_* slots and a promotion leaves the peers with nothing to
+    connect to. The DCS carries it so every member, present and future,
+    has it the moment it becomes a standby."""
+    deployed_plan.spock_major = "60"
+    deployed_plan.pg_version = pg_version
+
+    assert _parameters(deployed_plan)["sync_replication_slots"] == "on"
+    assert _parameters(deployed_plan)["hot_standby_feedback"] == "on"
+
+
+def test_a_spock5_scope_keeps_spocks_own_worker(deployed_plan):
+    """Spock 5 copies the slots itself on every version; turning native sync
+    on would make it stand aside, which is a change of mechanism no one
+    asked for."""
+    deployed_plan.spock_major = "50"
+    deployed_plan.pg_version = "18.7"
+
+    assert "sync_replication_slots" not in _parameters(deployed_plan)
+
+
+def test_a_spock6_scope_on_pg16_has_no_native_sync_to_turn_on(deployed_plan):
+    deployed_plan.spock_major = "60"
+    deployed_plan.pg_version = "16.9"
+
+    assert "sync_replication_slots" not in _parameters(deployed_plan)
+
+
+def test_the_slot_sync_decision_is_made_in_one_place():
+    gucs = pg_server_management.native_slot_sync_gucs
+    assert gucs("18.7", "60") == {"sync_replication_slots": "on"}
+    assert gucs("17", "60") == {"sync_replication_slots": "on"}
+    assert gucs("16.9", "60") == {}
+    assert gucs("18.7", "50") == {}
+    assert gucs("", "60") == {}
