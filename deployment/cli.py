@@ -351,13 +351,6 @@ def _repair_failover(plan, node_name):
             log.error(f"scope {node.scope} has no leader — nothing to retarget onto")
             return EXIT_FAIL
 
-        if leader_name == node.name:
-            log.info(
-                f"{node.name} is still the leader of {node.scope}; peers already "
-                f"point at the right address. Nothing to do."
-            )
-            return EXIT_OK
-
         try:
             promoted = plan.node(leader_name)
         except KeyError:
@@ -367,11 +360,33 @@ def _repair_failover(plan, node_name):
             )
             return EXIT_FAIL
 
-        log.info(
-            f"{node.scope} has failed over: {leader_name} now leads, so "
-            f"{node.name}'s peers must replicate from "
-            f"{promoted.address}:{promoted.pg_port}"
+        # Where the leader is says nothing about where the peers point: a
+        # scope that failed over and was switched back has its Spock node
+        # leading again while every peer still names the standby. Ask them.
+        stale = spock_management.stale_peers(
+            executor_for, plan, node, promoted.address, promoted.pg_port,
+            addresses=(promoted.advertise_address,),
         )
+        if leader_name == node.name and not stale:
+            log.info(
+                f"{node.name} is still the leader of {node.scope}, and every "
+                f"peer points at it. Nothing to do."
+            )
+            return EXIT_OK
+
+        if leader_name == node.name:
+            log.info(
+                f"{node.name} leads {node.scope} again, but "
+                + ", ".join(f"{peer} still points at {where or 'nothing'}"
+                            for peer, where in stale)
+                + f" — retargeting at {promoted.address}:{promoted.pg_port}"
+            )
+        else:
+            log.info(
+                f"{node.scope} has failed over: {leader_name} now leads, so "
+                f"{node.name}'s peers must replicate from "
+                f"{promoted.address}:{promoted.pg_port}"
+            )
 
         results = spock_management.retarget_after_failover(
             executor_for, plan, node, promoted.address, promoted.pg_port,

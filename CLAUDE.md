@@ -165,6 +165,30 @@ change on every node and the topology's own HA as test surface. It is the
 in-cluster counterpart of the sandbox `spock-pr-validation` skill, and refuses
 a cluster whose Spock major does not match the PR's base branch.
 
+`.claude/skills/failover-deep-test/` is the exploratory counterpart of the
+`failover` health-check suite: eleven scenarios on the deployed cluster
+(idle-primary slot copies, failover under pgbench load, the promoted standby
+serving the mesh, the switchover guard, two failovers in a row, a postmaster
+crash, standby loss under strict sync, restore), each finding filed as a Spock
+bug, a bug in this tool, or a topology limitation. Disruptive, by request only.
+
+`.claude/skills/spock-deep-test/` does the same for the multi-master layer,
+starting where the in-tree `spock` suite stops: DDL and DML from every node,
+the four conflict shapes and `spock.resolutions`, delta-apply, Snowflake,
+no-PK and partitioned tables, pgbench from every node at once, a peer down
+while the others write, apply-side exceptions, repset filtering, repair and
+read-only mode, resync, restore. Never together with `failover-deep-test`.
+
+`lolor-deep-test`, `snowflake-deep-test` and `ace-deep-test` follow the same
+shape for the optional components: each starts where the component's health
+check stops (lolor's API, big and many objects, concurrent updates and
+unlink races, the drop guard; Snowflake's identity bits, uniqueness under
+concurrent inserts from every node, a tight loop, sequence conversion, a
+promoted standby; ACE's detection of every planted divergence by both the
+host binary and this tool's `diff`, scoping, repair semantics, schema and
+repset drift, a big table). All five skills report node names only and file
+each finding as a component bug, a bug in this tool, or a topology limitation.
+
 `--health_check <components> --pr <link>` (`deployment/pr_validation.py`)
 is the laptop-side driver for a cluster *already deployed from the PR's
 branch*: it rebuilds nothing, runs the suites, then starts `claude -p` with a

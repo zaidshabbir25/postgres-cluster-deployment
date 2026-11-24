@@ -677,7 +677,10 @@ def cmd_service(args):
             return EXIT_OK
 
         if action == "switchover":
-            ok, message = svc.switchover(executor, plan, node, args.candidate)
+            ok, message = svc.switchover(
+                executor, plan, node, args.candidate,
+                executor_for=executor_for,
+                force=getattr(args, "force", False))
             print(f"{'OK' if ok else 'FAILED'}: {message}")
             return EXIT_OK if ok else EXIT_FAIL
 
@@ -1413,6 +1416,9 @@ def _register_service(subparsers, add_common):
     p = base("switchover", "hand a scope's leadership to a standby",
              with_component=False)
     p.add_argument("--candidate", help="standby to promote [the first one]")
+    p.add_argument("--force", action="store_true",
+                   help="switch over even if the candidate does not yet carry "
+                        "copies of the Spock slots its peers connect to")
 
     p = base("reinit", "rebuild a member from its leader", with_component=False)
     p.add_argument("member", help="member to rebuild")

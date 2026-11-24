@@ -411,6 +411,18 @@ def test_an_interface_that_already_exists_is_not_a_failure(retarget):
     assert all(entry["ok"] for entry in results)
 
 
+def test_spocks_own_wording_for_a_taken_name_is_tolerated_too(retarget):
+    """What a second run of the failover suite met on a live cluster: Spock
+    says 'already has interface named', not 'already exists', and the
+    retarget scored a healthy repair as failed."""
+    results, calls = retarget(
+        node_add_interface=(1, 'ERROR:  node "n1" already has interface '
+                               'named "n1_promoted_5434"'))
+
+    assert all(entry["ok"] for entry in results)
+    assert any("sub_alter_interface" in sql for sql in calls), "still switched"
+
+
 def test_a_real_failure_is_still_reported(retarget):
     results, _ = retarget(
         sub_alter_interface=(1, "ERROR:  subscription not found"))

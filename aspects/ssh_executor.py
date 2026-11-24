@@ -53,6 +53,11 @@ _UNASKED = object()
 _PASSPHRASES = {}
 
 
+#: How often the transport pings a quiet connection. Short enough that a
+#: stalled channel is noticed in well under a minute.
+KEEPALIVE_SECONDS = 15
+
+
 class SSHExecutor:
     """A connected host. Commands run through sudo unless a user is given."""
 
@@ -128,6 +133,13 @@ class SSHExecutor:
                     allow_agent=use_agent,
                 )
                 self._client = client
+                # A channel that stalls on a dead or idle-dropped connection
+                # otherwise blocks for the whole command timeout before anyone
+                # notices. Keepalives make the transport fail within seconds
+                # instead, and the retry loop in exec_run reconnects.
+                transport = getattr(client, "get_transport", lambda: None)()
+                if transport is not None:
+                    transport.set_keepalive(KEEPALIVE_SECONDS)
                 self._emit(f"connected to {self.username}@{self.host}:{self.port}")
                 return self
             except paramiko.PasswordRequiredException as exc:

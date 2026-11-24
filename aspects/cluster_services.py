@@ -14,7 +14,9 @@ Components:
     etcd      the DCS, on the hosts that are members
 """
 
-from aspects import etcd_management, patroni_management, service_management
+import shlex
+
+from aspects import (etcd_management, patroni_management, service_management, spock_management)
 
 COMPONENTS = ("patroni", "postgres", "etcd")
 
@@ -253,7 +255,18 @@ def logs(executor, plan, node, component="patroni", lines=50):
             executor, etcd_management.UNIT, lines=lines, node=node.name
         )
     if component == "postgres":
-        # Patroni logs the postmaster's output into its own journal.
+        # The server writes its own files under the data directory once
+        # logging_collector is on, which every node is deployed with. Only a
+        # node that has never collected a line falls back to Patroni's
+        # journal, where the postmaster's early output lands.
+        directory = patroni_management.log_directory_for(node)
+        _, output = executor.try_run(
+            f"newest=$(ls -t {shlex.quote(directory)}/*.log 2>/dev/null | head -n 1); "
+            f"[ -n \"$newest\" ] && tail -n {int(lines)} \"$newest\"",
+            node=node.name,
+        )
+        if (output or "").strip():
+            return output.strip()
         return patroni_management.logs(executor, node.name, lines=lines)
     return f"unknown component {component!r}"
 
@@ -263,8 +276,38 @@ def logs(executor, plan, node, component="patroni", lines=50):
 # ---------------------------------------------------------------------------
 
 
-def switchover(executor, plan, node, candidate=None):
-    """Hand a scope's leadership to a standby, without data loss."""
+def missing_slot_copies(executor, plan, candidate, spock_node):
+    """Why promoting `candidate` would strand the peers, or '' if it would
+    not: the member must carry a permanent copy of every spk_* slot the
+    peers connect to. Spock copies them to a standby a minute or so after
+    it starts streaming; a member promoted before that leads a scope whose
+    peers loop on "replication slot does not exist", and the standby it
+    leaves behind drops its own copies as surplus — nothing is left."""
+    peers = [n for n in plan.spock_nodes if n.name != spock_node.name]
+    if not peers:
+        return ""
+    count, temporary = spock_management.failover_slot_copies(
+        executor, plan, candidate)
+    if count >= len(peers) and temporary == 0:
+        return ""
+    return (
+        f"{candidate.name} carries {count} of {len(peers)} spk_* slot "
+        f"copies" + (f" ({temporary} temporary)" if temporary else "")
+        + f": promoted now, it would have no slot for {spock_node.name}'s "
+        f"peers to connect to, and {spock_node.name}'s own copies would be "
+        f"dropped. Wait for the copies (spock.failover_slots_naptime, or "
+        f"sync_replication_slots on PostgreSQL 17+), or pass --force"
+    )
+
+
+def switchover(executor, plan, node, candidate=None, executor_for=None,
+               force=False):
+    """Hand a scope's leadership to a standby, without data loss.
+
+    `executor_for` reaches the candidate, which may live on another host;
+    with it the candidate's slot copies are checked first, and a member
+    that would strand the peers is refused unless `force`.
+    """
     if not node.is_spock:
         return False, f"{node.name} is not a scope leader"
     if not node.standbys:
@@ -273,6 +316,16 @@ def switchover(executor, plan, node, candidate=None):
             f"with: add-standby --leader {node.name}"
         )
     candidate = candidate or node.standbys[0]
+    if executor_for is not None and not force:
+        try:
+            member = plan.node(candidate)
+        except KeyError:
+            member = None
+        if member is not None:
+            reason = missing_slot_copies(
+                executor_for(member), plan, member, node)
+            if reason:
+                return False, f"refused: {reason}"
     ok, output = patroni_management.switchover(
         executor, node, candidate, node_name=node.name
     )

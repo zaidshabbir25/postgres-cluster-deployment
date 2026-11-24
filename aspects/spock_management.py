@@ -772,6 +772,67 @@ def streaming_peers(executor, plan, node):
     return peers
 
 
+def failover_slot_copies(executor, plan, node):
+    """How many spk_* logical slots a member holds, and how many of those
+    are temporary. On a standby these are the copies Spock's failover worker
+    (or PostgreSQL's slot sync) keeps for a promotion; a temporary copy is
+    dropped at promotion, and a missing one was never made."""
+    value = pg_server_management.scalar(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        "SELECT count(*) || '|' || count(*) FILTER (WHERE temporary) "
+        "FROM pg_replication_slots "
+        "WHERE slot_type = 'logical' AND slot_name LIKE 'spk\\_%';",
+        dbname=plan.db_name, node=node.name, default="",
+    )
+    parts = (value or "").strip().split("|")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return 0, 0
+
+
+def subscription_target(executor, plan, peer, subscription):
+    """The host and port a peer's subscription connects to right now, read
+    from the interface it is bound to. None when the subscription or its
+    interface cannot be read."""
+    dsn = pg_server_management.scalar(
+        executor, peer.bin_dir, peer.pg_port, plan.db_user,
+        f"SELECT i.if_dsn FROM spock.subscription s "
+        f"JOIN spock.node_interface i ON i.if_id = s.sub_origin_if "
+        f"WHERE s.sub_name = {_lit(subscription)};",
+        dbname=plan.db_name, node=peer.name, default="",
+    )
+    if not (dsn or "").strip():
+        return None
+    fields = dict(
+        part.split("=", 1) for part in dsn.split() if "=" in part
+    )
+    return fields.get("host", ""), fields.get("port", "5432")
+
+
+def stale_peers(executor_for, plan, spock_node, address, port,
+                addresses=None):
+    """Peers whose subscription to `spock_node` does not point at the
+    member that leads its scope. Returns [(peer_name, 'host:port' | None)].
+
+    Spock's peers hold whatever DSN they were last given; nothing moves them
+    when a scope changes leader, in either direction. So after a failover
+    *and* after the switch back, the only way to know is to ask each peer.
+    """
+    wanted = {str(a) for a in (addresses or ()) if a} | {str(address)}
+    stale = []
+    for peer in plan.spock_nodes:
+        if peer.name == spock_node.name:
+            continue
+        target = subscription_target(
+            executor_for(peer), plan, peer, sub_name(spock_node.name, peer.name))
+        if target is None:
+            stale.append((peer.name, None))
+        elif target[0] not in wanted or str(target[1]) != str(port):
+            stale.append((peer.name, f"{target[0]}:{target[1]}"))
+    return stale
+
+
 def is_in_recovery(executor, plan, node):
     value = pg_server_management.scalar(
         executor, node.bin_dir, node.pg_port, plan.db_user,
@@ -850,6 +911,11 @@ def verify_replication(executor_for, plan, run_logger=None, timeout=180):
 # ---------------------------------------------------------------------------
 
 
+# How spock.node_add_interface refuses a name that is already taken. Any of
+# these means the interface is there, which is all the retargeting needs.
+INTERFACE_EXISTS_PHRASES = ("already has interface", "already exists")
+
+
 def retarget_after_failover(executor_for, plan, spock_node, new_address,
                             new_port, run_logger=None):
     """Point the cluster's subscriptions at a promoted standby.
@@ -879,9 +945,11 @@ def retarget_after_failover(executor_for, plan, spock_node, new_address,
             # A cluster that has failed over to this address before already has
             # the interface, and saying so is not a failure: the switch below
             # is what matters and it needs exactly this interface to exist.
+            # Spock words the refusal 'node "n1" already has interface named
+            # "..."'; older builds said 'already exists'.
             (f"SELECT spock.node_add_interface({_lit(spock_node.name)}, "
              f"{_lit(interface)}, {_lit(new_dsn)});", "add interface",
-             ("already exists",)),
+             INTERFACE_EXISTS_PHRASES),
             (f"SELECT spock.sub_alter_interface({_lit(subscription)}, "
              f"{_lit(interface)});", "switch interface", ()),
             # immediate := true restarts the apply worker now; without it the

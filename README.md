@@ -1116,6 +1116,42 @@ The skill refuses a cluster whose Spock major does not match the PR's base
 branch; deploy `3-node-extensions-source` (Spock from `main`) for a PR
 against `main`.
 
+A second skill, [.claude/skills/failover-deep-test/](.claude/skills/failover-deep-test/SKILL.md),
+goes further than the `failover` health check on a cluster that has a
+standby: *"test failover in depth on my cluster"* or `/failover-deep-test`
+in a Claude Code session here. It checks the slot copies on an idle
+primary, fails over under pgbench load, writes through the promoted
+standby, waits for the old leader to rejoin and regain its copies, tries
+the switchover guard, fails over twice in a row, kills a postmaster, stops
+the standby under synchronous mode, and restores the scope, reporting each
+finding as a Spock bug, a bug in this tool, or a limitation of the
+topology. It stops Patroni and promotes the standby, so not on a cluster
+anyone is using.
+
+[.claude/skills/spock-deep-test/](.claude/skills/spock-deep-test/SKILL.md)
+is the multi-master counterpart: *"test spock in depth on my cluster"* or
+`/spock-deep-test`. It writes DDL and DML from every node, forces the four
+conflict shapes and checks `spock.resolutions` and convergence, exercises
+delta-apply counters, Snowflake sequences, no-primary-key and partitioned
+tables, runs pgbench from every node at once, takes a peer down while the
+others write, breaks the apply on one node and recovers it, filters by
+replication set, uses repair mode, read-only mode and table resync, and
+restores everything. Not at the same time as the failover skill.
+
+Three more do the same for the optional components, each starting where
+its health check stops:
+[lolor-deep-test](.claude/skills/lolor-deep-test/SKILL.md) (the whole
+large-object API from every node, 64 MiB and thousand-object batches,
+concurrent updates and an update racing an unlink, the drop guard, space
+after unlink), [snowflake-deep-test](.claude/skills/snowflake-deep-test/SKILL.md)
+(the node id in every id, fifty thousand concurrent inserts per node with
+no duplicate, a million-id loop, converting a serial table, ids minted by
+a promoted standby) and [ace-deep-test](.claude/skills/ace-deep-test/SKILL.md)
+(every kind of planted row, schema and repset divergence detected by both
+the `ace` binary and `diff`, scoping by predicate and bucket, repair with
+and without truncation, dry run, rerun, a million-row table). Invoke them
+as `/lolor-deep-test`, `/snowflake-deep-test`, `/ace-deep-test`.
+
 ## Component health checks
 
 Once a cluster is up, each component can be asked whether it works *there*:
@@ -1891,6 +1927,24 @@ promoted address, switches the subscription to it and re-enables it. The status
 output and the dashboard both flag the condition when they see a Spock node
 reporting a non-leader Patroni role, so you are told before you have to go
 looking.
+
+The repair asks each peer where its subscription actually points rather than
+assuming from where the leader is. A scope that failed over and was then
+switched back has `n1` leading again while every peer still names `n1s1`;
+the same command moves them home, and says "nothing to do" only when every
+peer already points at the leader.
+
+**Switching back needs the slot copies first.** Spock keeps a copy of each
+`spk_*` slot on the standby so that a promotion has something for the peers
+to connect to. A member that has just rejoined its scope has no copies yet —
+the worker's first pass comes a minute or so after it starts streaming. A
+switchover to it in that window promotes a member with no slots, and the
+member it demotes then drops its own copies as surplus: the scope's whole
+outbound replication is gone, and only recreating the slots by hand brings
+it back. `service switchover` therefore refuses a candidate that does not
+carry a permanent copy of every slot, naming how many it has; `--force`
+overrides, and the failover health check waits for the copies before each
+of its switchovers.
 
 ### Version pins
 

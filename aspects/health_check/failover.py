@@ -644,6 +644,7 @@ class FailoverSuite(Suite):
         if state not in SERVING_STATES:
             raise CheckFailed(f"{target.name} is {state or 'absent'}, not "
                               f"streaming; no switchover attempted")
+        self.wait_for_slot_copies(target, checks)
 
         phase = f"before-switchover-{target.name}"
         self.sql(leader, f"DELETE FROM {TABLE};")
@@ -666,7 +667,9 @@ class FailoverSuite(Suite):
                        f"{leader.name} in {seconds}s"))
         self.check_mesh(subject, target, phase, checks)
         if target.name != subject.name:
-            # Came in with the Spock node leading; hand it back.
+            # Came in with the Spock node leading; hand it back — once it
+            # carries the copies again.
+            self.wait_for_slot_copies(subject, checks)
             ok, output = patroni_management.switchover(
                 self.executor_for(target), target, subject.name,
                 node_name=target.name)
@@ -679,6 +682,37 @@ class FailoverSuite(Suite):
         checks.append(("scope_led_by_its_spock_node",
                        leader_now is not None and leader_now.name == subject.name,
                        f"leader is {leader_now.name if leader_now else 'none'}"))
+
+    def wait_for_slot_copies(self, member, checks):
+        """A member is switched to only once it carries a permanent copy of
+        every spk_* slot. Promoted earlier — which is seconds after it
+        rejoins, when the worker's first pass has not run — it leads a scope
+        with no slot for the peers, and the member it demotes drops its own
+        copies as surplus. The whole scope's outbound replication is gone
+        then, and only recreating the slots by hand brings it back."""
+        peers = self.peers(self._plan, member if member.is_spock
+                           else self._plan.node(member.leader))
+        wanted = len(peers)
+
+        def ready():
+            count, temporary = self.spock_slots(member)
+            return count >= wanted and temporary == 0 and count
+
+        try:
+            count, seconds = self.wait(
+                f"spk_* slot copies on {member.name} before switching to it",
+                ready)
+        except CheckFailed:
+            count, temporary = self.spock_slots(member)
+            checks.append(("candidate_carries_spock_slots", False,
+                           f"{member.name}: {count} of {wanted}"
+                           + (f", {temporary} temporary" if temporary else "")))
+            raise CheckFailed(
+                f"{member.name} carries {count} of {wanted} spk_* slot copies "
+                f"after {self.test_timeout}s; switching to it would strand "
+                f"the peers, so no switchover was attempted")
+        checks.append(("candidate_carries_spock_slots", True,
+                       f"{member.name}: {count} after {seconds}s"))
 
     def case_cleanup(self, subject, checks):
         leader = self.leader_member(subject) or subject
