@@ -39,6 +39,9 @@ PASSED = "passed"
 FAILED = "failed"
 SKIPPED = "skipped"
 
+#: sed script dropping the notice Spock emits for each DDL it auto-replicates.
+AUTO_DDL_NOTICE = r"/INFO:  DDL statement replicated\.$/d"
+
 
 @dataclass
 class SuiteResult:
@@ -341,6 +344,16 @@ class InTreeSuite(Suite):
                 return f"TIMED OUT after {self.test_timeout}s"
             return f"FAILED ({type(exc).__name__})"
 
+        # A cluster with automatic DDL replication on announces every DDL it
+        # replicates at INFO, which psql prints whatever client_min_messages
+        # says. The cases create helpers and tables deliberately, and whether
+        # DDL replicates is asked by content (05) rather than by the notice,
+        # so the line is dropped before the comparison: the expected files
+        # must hold on a cluster with the setting off as well as on.
+        executor.try_run(
+            f"sed -i -E {shlex.quote(AUTO_DDL_NOTICE)} {shlex.quote(actual)}",
+            node=node.name)
+
         same, _ = executor.try_run(
             f"diff -u {shlex.quote(expected)} {shlex.quote(actual)} "
             f"> {shlex.quote(results)}/{name}.diff 2>&1", node=node.name)
@@ -586,12 +599,13 @@ class PgRegressSuite(Suite):
 
 
 def _load_suites():
-    from aspects.health_check import (ace, ace_integration, lolor,
+    from aspects.health_check import (ace, ace_integration, failover, lolor,
                                       lolor_upstream, snowflake, spock,
                                       spock_upstream)
 
     return {
         spock.SpockSuite.name: spock.SpockSuite,
+        failover.FailoverSuite.name: failover.FailoverSuite,
         spock_upstream.SpockUpstreamSuite.name: spock_upstream.SpockUpstreamSuite,
         lolor.LolorSuite.name: lolor.LolorSuite,
         lolor_upstream.LolorUpstreamSuite.name: lolor_upstream.LolorUpstreamSuite,
@@ -637,9 +651,12 @@ GROUPS = {
     "lolor": ("lolor", "lolor-upstream"),
 }
 
-#: Never part of 'all': it starts containers of its own, takes most of an
-#: hour, and says nothing about this cluster. By name only.
-BY_NAME_ONLY = ("ace-integration",)
+#: Never part of 'all'. ace-integration starts containers of its own, takes
+#: most of an hour, and says nothing about this cluster. failover stops the
+#: leader of a scope and hands it back: it tests this cluster, but a run of
+#: 'all' must not fail a leader over without having been asked to. By name
+#: only, both.
+BY_NAME_ONLY = ("ace-integration", "failover")
 
 
 def known_components():

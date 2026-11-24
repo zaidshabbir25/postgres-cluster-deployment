@@ -14,7 +14,9 @@ Components:
     etcd      the DCS, on the hosts that are members
 """
 
-from aspects import etcd_management, patroni_management, service_management
+import shlex
+
+from aspects import (etcd_management, patroni_management, service_management, spock_management)
 
 COMPONENTS = ("patroni", "postgres", "etcd")
 
@@ -153,9 +155,30 @@ def stop(executor, plan, node, component="patroni"):
     return False, f"unknown component {component!r}"
 
 
-def restart(executor, plan, node, component="patroni"):
-    """Restart a component through the right mechanism."""
+def _keep_hand_edits(executor, plan, node, preserve):
+    """Before Patroni regenerates postgresql.conf: move what a person added
+    into the DCS, or say what is about to be lost. Returns (ok, note)."""
+    if not preserve:
+        return True, ""
+    ok, kept, message = patroni_management.preserve_local_overrides(
+        executor, plan, node)
+    if not ok:
+        return False, message
+    return True, (f" — {message}" if kept else "")
+
+
+def restart(executor, plan, node, component="patroni", preserve=True):
+    """Restart a component through the right mechanism.
+
+    Patroni rewrites postgresql.conf from the DCS every time PostgreSQL
+    starts, so a restart silently discards anything typed into that file. With
+    `preserve` (the default) those settings are moved into the scope's DCS
+    first, where they survive — and reach the standbys as well.
+    """
     if component == "postgres":
+        ok, note = _keep_hand_edits(executor, plan, node, preserve)
+        if not ok:
+            return False, f"not restarted: {note}"
         # patronictl restart is the supported path: it coordinates through the
         # DCS so the rest of the scope knows the restart is intentional.
         binary = _patronictl(executor, node)
@@ -164,12 +187,15 @@ def restart(executor, plan, node, component="patroni"):
             f"--force",
             node=node.name, timeout=600,
         )
-        return ok, output.strip() or f"PostgreSQL restarted on {node.name}"
+        return ok, (output.strip() or f"PostgreSQL restarted on {node.name}") + note
 
     if component == "patroni":
+        ok, note = _keep_hand_edits(executor, plan, node, preserve)
+        if not ok:
+            return False, f"not restarted: {note}"
         unit = patroni_management.unit_name(node.name)
         ok, output = service_management.restart(executor, unit, node=node.name)
-        return ok, output.strip() or f"{unit} restarted"
+        return ok, (output.strip() or f"{unit} restarted") + note
 
     if component == "etcd":
         ok, output = service_management.restart(
@@ -180,16 +206,23 @@ def restart(executor, plan, node, component="patroni"):
     return False, f"unknown component {component!r}"
 
 
-def reload(executor, plan, node, component="postgres"):
-    """Reload configuration without a restart."""
+def reload(executor, plan, node, component="postgres", preserve=True):
+    """Reload configuration without a restart.
+
+    A Patroni reload regenerates postgresql.conf just as a restart does, so
+    hand edits are kept the same way first.
+    """
     if component == "postgres":
+        ok, note = _keep_hand_edits(executor, plan, node, preserve)
+        if not ok:
+            return False, f"not reloaded: {note}"
         binary = _patronictl(executor, node)
         ok, output = executor.try_run(
             f"{binary} -c {node.config_file} reload {node.scope} {node.name} "
             f"--force",
             node=node.name,
         )
-        return ok, output.strip() or f"configuration reloaded on {node.name}"
+        return ok, (output.strip() or f"configuration reloaded on {node.name}") + note
 
     if component == "patroni":
         unit = patroni_management.unit_name(node.name)
@@ -222,7 +255,18 @@ def logs(executor, plan, node, component="patroni", lines=50):
             executor, etcd_management.UNIT, lines=lines, node=node.name
         )
     if component == "postgres":
-        # Patroni logs the postmaster's output into its own journal.
+        # The server writes its own files under the data directory once
+        # logging_collector is on, which every node is deployed with. Only a
+        # node that has never collected a line falls back to Patroni's
+        # journal, where the postmaster's early output lands.
+        directory = patroni_management.log_directory_for(node)
+        _, output = executor.try_run(
+            f"newest=$(ls -t {shlex.quote(directory)}/*.log 2>/dev/null | head -n 1); "
+            f"[ -n \"$newest\" ] && tail -n {int(lines)} \"$newest\"",
+            node=node.name,
+        )
+        if (output or "").strip():
+            return output.strip()
         return patroni_management.logs(executor, node.name, lines=lines)
     return f"unknown component {component!r}"
 
@@ -232,8 +276,38 @@ def logs(executor, plan, node, component="patroni", lines=50):
 # ---------------------------------------------------------------------------
 
 
-def switchover(executor, plan, node, candidate=None):
-    """Hand a scope's leadership to a standby, without data loss."""
+def missing_slot_copies(executor, plan, candidate, spock_node):
+    """Why promoting `candidate` would strand the peers, or '' if it would
+    not: the member must carry a permanent copy of every spk_* slot the
+    peers connect to. Spock copies them to a standby a minute or so after
+    it starts streaming; a member promoted before that leads a scope whose
+    peers loop on "replication slot does not exist", and the standby it
+    leaves behind drops its own copies as surplus — nothing is left."""
+    peers = [n for n in plan.spock_nodes if n.name != spock_node.name]
+    if not peers:
+        return ""
+    count, temporary = spock_management.failover_slot_copies(
+        executor, plan, candidate)
+    if count >= len(peers) and temporary == 0:
+        return ""
+    return (
+        f"{candidate.name} carries {count} of {len(peers)} spk_* slot "
+        f"copies" + (f" ({temporary} temporary)" if temporary else "")
+        + f": promoted now, it would have no slot for {spock_node.name}'s "
+        f"peers to connect to, and {spock_node.name}'s own copies would be "
+        f"dropped. Wait for the copies (spock.failover_slots_naptime, or "
+        f"sync_replication_slots on PostgreSQL 17+), or pass --force"
+    )
+
+
+def switchover(executor, plan, node, candidate=None, executor_for=None,
+               force=False):
+    """Hand a scope's leadership to a standby, without data loss.
+
+    `executor_for` reaches the candidate, which may live on another host;
+    with it the candidate's slot copies are checked first, and a member
+    that would strand the peers is refused unless `force`.
+    """
     if not node.is_spock:
         return False, f"{node.name} is not a scope leader"
     if not node.standbys:
@@ -242,6 +316,16 @@ def switchover(executor, plan, node, candidate=None):
             f"with: add-standby --leader {node.name}"
         )
     candidate = candidate or node.standbys[0]
+    if executor_for is not None and not force:
+        try:
+            member = plan.node(candidate)
+        except KeyError:
+            member = None
+        if member is not None:
+            reason = missing_slot_copies(
+                executor_for(member), plan, member, node)
+            if reason:
+                return False, f"refused: {reason}"
     ok, output = patroni_management.switchover(
         executor, node, candidate, node_name=node.name
     )

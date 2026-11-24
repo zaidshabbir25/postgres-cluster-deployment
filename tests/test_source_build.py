@@ -285,3 +285,110 @@ def test_build_host_defaults_the_branch_from_the_spock_major(source_plan, host,
     sb.build_host(FakeExecutor(), host, source_plan)
 
     assert captured["branch"] == "v5_STABLE"
+
+
+# ---------------------------------------------------------------------------
+# the build log and the progress while a compile runs
+# ---------------------------------------------------------------------------
+
+
+class SlowBuild(FakeExecutor):
+    """A host on which the compile is still running for the first N polls."""
+
+    host = "builder"
+
+    def __init__(self, polls_until_done=2, exit_code=0, **replies):
+        super().__init__(replies=replies)
+        self.polls = polls_until_done
+        self.exit_code = exit_code
+
+    def _answer(self, command):
+        if ".status" in command and command.startswith("test -f"):
+            self.commands.append(command)
+            if self.polls > 0:
+                self.polls -= 1
+                return False, ""
+            return True, f"{self.exit_code}\n"
+        if command.startswith("tail -n 1 "):
+            self.commands.append(command)
+            return True, "gcc -O2 ... -c heapam.c\n"
+        if command.startswith("tail -n 60 "):
+            self.commands.append(command)
+            return True, "heapam.c:12: error: boom\nmake: *** [heapam.o] Error 1\n"
+        return super()._answer(command)
+
+
+def test_a_compile_runs_in_the_background_writing_the_build_log(monkeypatch):
+    monkeypatch.setattr(sb.time, "sleep", lambda *_: None)
+    executor = SlowBuild(polls_until_done=0)
+
+    sb.run_logged(executor, "cd /src && make -j4", "make PostgreSQL",
+                  node="n1", timeout=10)
+
+    start = next(c for c in executor.commands if "nohup" in c)
+    assert "make -j4" in start and sb.BUILD_LOG in start
+    assert "==== make PostgreSQL ====" in start, "a header per step in the log"
+    assert ".status" in start, "exit code written beside the log"
+
+
+def test_progress_is_reported_while_the_compile_runs(monkeypatch):
+    """A twenty-minute make must look different from a hang: the last line of
+    the build log, with the elapsed time, at intervals."""
+    monkeypatch.setattr(sb.time, "sleep", lambda *_: None)
+    executor = SlowBuild(polls_until_done=3)
+    logger = RecordingLogger()
+
+    sb.run_logged(executor, "cd /src && make", "make PostgreSQL", node="n1",
+                  timeout=10, run_logger=logger, interval=1)
+
+    progress = [m for m in logger.infos if "make PostgreSQL …" in m]
+    assert len(progress) == 3
+    assert "heapam.c" in progress[0]
+    assert logger.said("make PostgreSQL done in")
+
+
+def test_a_failed_compile_raises_with_the_tail_of_the_log(monkeypatch):
+    monkeypatch.setattr(sb.time, "sleep", lambda *_: None)
+    executor = SlowBuild(polls_until_done=1, exit_code=2)
+
+    with pytest.raises(sb.CommandFailed) as caught:
+        sb.run_logged(executor, "cd /src && make", "make PostgreSQL",
+                      node="n1", timeout=10, interval=1)
+
+    assert caught.value.exit_code == 2
+    assert "heapam.c:12: error: boom" in caught.value.output
+    assert "last 60 lines" in caught.value.output
+
+
+def test_a_compile_that_never_finishes_is_a_timeout_not_a_hang(monkeypatch):
+    monkeypatch.setattr(sb.time, "sleep", lambda *_: None)
+    clock = iter(range(0, 10_000, 100))
+    monkeypatch.setattr(sb.time, "monotonic", lambda: next(clock))
+    executor = SlowBuild(polls_until_done=10_000)
+
+    with pytest.raises(TimeoutError, match="still running after 300s"):
+        sb.run_logged(executor, "cd /src && make", "make PostgreSQL",
+                      node="n1", timeout=300, interval=1)
+
+
+def test_build_host_opens_the_log_first_and_copies_it_home_last(
+        source_plan, host, monkeypatch, tmp_path):
+    monkeypatch.setattr(sb.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(sb, "install_patroni_from_pip", lambda *a, **k: "patroni 4")
+    monkeypatch.setattr(sb, "install_etcd_from_release", lambda *a, **k: "etcd 3.5")
+    monkeypatch.setattr(sb, "register_paths", lambda *a, **k: "/opt/pgedge/pg17")
+    executor = SlowBuild(polls_until_done=0, **{
+        f"cat {sb.BUILD_LOG}": (True, "# PostgreSQL 17.11\n==== make PostgreSQL ====\nok\n")})
+    logger = RecordingLogger()
+    logger.root = tmp_path
+
+    details = sb.build_host(executor, host, source_plan, run_logger=logger)
+
+    commands = executor.commands
+    opened = next(i for i, c in enumerate(commands) if "start build log" in c
+                  or (f"> {sb.BUILD_LOG}" in c and "rm -f" in c))
+    configure = next(i for i, c in enumerate(commands) if "./configure" in c)
+    assert opened < configure
+    assert details["build_log"] == str(tmp_path / "local-build.log")
+    assert "==== make PostgreSQL ====" in (tmp_path / "local-build.log").read_text()
+    assert logger.said("compile output goes to")

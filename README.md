@@ -392,12 +392,45 @@ pulling in a Go toolchain for etcd would double the prerequisites.
 12  Create Spock extensions        spock and dblink
 13  Load zodan procedures          the cross-wiring library
 14  Cross-wire Spock nodes         spock.add_node joins each node to every peer
-15  Enable DDL replication         schema changes propagate automatically
+15  Enable DDL replication         confirm the DCS settings are in effect everywhere
 16  Verify replication             node visibility and subscription state
 17  Collect health snapshot        seeds the dashboard and the report
 ```
 
 Steps 3–5 are replaced by a single source-build step in `--mode source`.
+
+### Settings every node starts with
+
+These go into the Patroni DCS at bootstrap (step 8), so every member of every
+scope — standbys, and a node added months later — runs them from its first
+start:
+
+| setting | value | why |
+|---|---|---|
+| `track_commit_timestamp` | `on` | last-write-wins conflict resolution needs commit times |
+| `spock.enable_ddl_replication` | `on` | plain DDL is queued and replayed on every peer |
+| `spock.include_ddl_repset` | `on` | a table created that way lands in the default replication set |
+| `spock.allow_ddl_from_functions` | `on` | DDL issued from inside a function replicates too |
+| `spock.conflict_log_level` | `debug2` | every resolved conflict is written to the server log |
+| `log_min_messages` | `debug1` | low enough for those conflict lines, and Spock's worker lifecycle, to appear |
+| `sync_replication_slots` | `on` — **spock60 on PostgreSQL 17+ only** | Spock 6 registers no failover-slots worker on 18 and yields to PostgreSQL's own on 17, so without this a standby carries no copy of the `spk_*` slots and the first unplanned failover leaves the promoted node with nothing for its peers to connect to. Spock 5 copies them with its own worker and is left alone. Harmless on a leader: the slotsync worker only runs in recovery |
+
+Step 15 then asks every Spock node what it is actually running, through
+`SHOW`, and fails the deployment if any answer differs: a value in the DCS and
+a value the server runs are two different facts, and only the second one
+matters. It does **not** `ALTER SYSTEM` on a node that already reports the
+settings — `postgresql.auto.conf` shadows the DCS for good, so that is kept
+as a fallback for a node Patroni did not bootstrap, applied only to the
+settings that are actually off.
+
+`log_min_messages` is a default, not a requirement: `--logging --set
+log_min_messages=warning` lowers it on a cluster where volume matters more
+than detail. On a cluster deployed before these defaults existed, set them
+through the DCS the same way the deployment does:
+
+```bash
+./pg_cluster_ctl.sh db guc-set spock.conflict_log_level debug2 --all-nodes
+```
 
 Every step is recorded whether it passes or fails, so a deployment that dies
 half way still leaves a report that says how far it got and a per-node
@@ -618,6 +651,22 @@ ace         main (branch or tag)       github.com/pgEdge/ace              /usr/l
 
   Sources are cloned and compiled under /opt/pgedge/build; only the results are installed.
 ```
+
+A compile runs for ten to forty minutes per host, so the deployment shows
+that it is alive rather than going quiet: each configure and make writes to
+`/opt/pgedge/build/build.log` on the host, and once a minute the console
+prints the step, the time it has taken, and the last line of that log.
+
+```
+    n1: make PostgreSQL … 4m00s  gcc -O2 ... -c heapam.c
+    n1: make PostgreSQL … 5m00s  gcc -O2 ... -c nbtree.c
+    n1: make PostgreSQL done in 5m41s
+```
+
+A step that fails stops with the last sixty lines of the log; one that is
+still running after its limit is a timeout, not a wait. When the host is
+done the whole log is copied to `logs/<run-id>/<host>-build.log` beside
+`deploy.log`.
 
 The version column says where its number came from, because the difference
 matters. `expected` is a pin from `configuration/config<major>.env` — a
@@ -1054,6 +1103,11 @@ The previous ref is recorded in the cluster state, so a source-built cluster
 goes back with the same command. A packaged cluster goes back by reinstalling
 the package, which the output spells out.
 
+For a cluster deployed from the PR's branch already, there is nothing to
+rebuild: `./pg_deploy_cluster.sh --health_check spock --pr <link>` runs the
+suites and has Claude review and attack the change, described under
+[component health checks](#validating-a-spock-pull-request-on-the-cluster).
+
 The workflow around this — reading the PR, choosing scenarios the topology
 makes possible, before/after comparison, restore, report — is a Claude Code
 skill in [.claude/skills/spock-pr-on-cluster/](.claude/skills/spock-pr-on-cluster/SKILL.md).
@@ -1061,6 +1115,42 @@ In a session in this repository: *"validate spock PR 626 on my cluster"*.
 The skill refuses a cluster whose Spock major does not match the PR's base
 branch; deploy `3-node-extensions-source` (Spock from `main`) for a PR
 against `main`.
+
+A second skill, [.claude/skills/failover-deep-test/](.claude/skills/failover-deep-test/SKILL.md),
+goes further than the `failover` health check on a cluster that has a
+standby: *"test failover in depth on my cluster"* or `/failover-deep-test`
+in a Claude Code session here. It checks the slot copies on an idle
+primary, fails over under pgbench load, writes through the promoted
+standby, waits for the old leader to rejoin and regain its copies, tries
+the switchover guard, fails over twice in a row, kills a postmaster, stops
+the standby under synchronous mode, and restores the scope, reporting each
+finding as a Spock bug, a bug in this tool, or a limitation of the
+topology. It stops Patroni and promotes the standby, so not on a cluster
+anyone is using.
+
+[.claude/skills/spock-deep-test/](.claude/skills/spock-deep-test/SKILL.md)
+is the multi-master counterpart: *"test spock in depth on my cluster"* or
+`/spock-deep-test`. It writes DDL and DML from every node, forces the four
+conflict shapes and checks `spock.resolutions` and convergence, exercises
+delta-apply counters, Snowflake sequences, no-primary-key and partitioned
+tables, runs pgbench from every node at once, takes a peer down while the
+others write, breaks the apply on one node and recovers it, filters by
+replication set, uses repair mode, read-only mode and table resync, and
+restores everything. Not at the same time as the failover skill.
+
+Three more do the same for the optional components, each starting where
+its health check stops:
+[lolor-deep-test](.claude/skills/lolor-deep-test/SKILL.md) (the whole
+large-object API from every node, 64 MiB and thousand-object batches,
+concurrent updates and an update racing an unlink, the drop guard, space
+after unlink), [snowflake-deep-test](.claude/skills/snowflake-deep-test/SKILL.md)
+(the node id in every id, fifty thousand concurrent inserts per node with
+no duplicate, a million-id loop, converting a serial table, ids minted by
+a promoted standby) and [ace-deep-test](.claude/skills/ace-deep-test/SKILL.md)
+(every kind of planted row, schema and repset divergence detected by both
+the `ace` binary and `diff`, scoping by predicate and bucket, repair with
+and without truncation, dry run, rerun, a million-row table). Invoke them
+as `/lolor-deep-test`, `/snowflake-deep-test`, `/ace-deep-test`.
 
 ## Component health checks
 
@@ -1085,6 +1175,60 @@ snowflake  main       SKIPPED  needs the snowflake extension in postgres on n1
 ace        installed  FAILED   2/3 passed, 1 failed
 ```
 
+### Validating a Spock pull request on the cluster
+
+With a cluster deployed from the branch under review, `--pr` turns the
+health check into a verdict on the change. Nothing is rebuilt:
+
+```bash
+./pg_deploy_cluster.sh --health_check spock --pr https://github.com/pgEdge/spock/pull/626
+./pg_deploy_cluster.sh --health_check spock,lolor --pr 626 --no-review
+```
+
+The run, in order: read the PR from GitHub and refuse it if its base branch
+is another Spock major than the cluster runs, since the cluster then cannot
+be carrying the change; check every node loads the same build; run the
+named suites; then start Claude Code on this machine with the PR, the
+cluster's node list and the suite results, and the two skills to follow.
+Claude reads the change the way `spock-pr-validation` does, and tries to
+break it on the running cluster the way
+[spock-pr-on-cluster](.claude/skills/spock-pr-on-cluster/SKILL.md) does:
+the PR's own trigger verified on every peer, under failover where a node
+has a standby, on the apply side, through an apply worker restart, inside
+transactions, with the feature GUC off, in a loop, from a non-superuser,
+with `diff all` and a log grep after each. It is allowed only the
+read-and-scenario sub-commands of this repository's scripts and GitHub:
+no `node add`, no `spock rebuild`, no `package`, no shell to the hosts,
+no `pg_ctl`, no docker or initdb on the laptop. Every call it makes carries
+`--cluster <name>` so it reaches the cluster this run is about and not
+whichever was deployed last, and it must confirm the node list before the
+first scenario. It drops what it creates, writes `claude-report.md` beside
+the log and ends with a verdict line naming the cluster and the nodes the
+scenarios ran on. A verdict that names another cluster, nodes this one
+does not have, or no node at all is not accepted: the result is
+`INCONCLUSIVE`, whatever the verdict said.
+
+```
+ALL GOOD
+
+COMPONENT       RESULT  DETAIL
+--------------  ------  ------------
+spock           PASSED  8/8 passed
+spock-upstream  PASSED  41/41 passed
+
+  Review: PASS — the queued DDL reached every peer and survived a switchover (9 scenario(s))
+  Claude's report: logs/pgedge-pr-626-20261110T101500/claude-report.md
+  Report: logs/pgedge-pr-626-20261110T101500/report.md
+```
+
+`ALL GOOD` needs both halves: every suite passed and Claude found nothing.
+Otherwise every failed suite and every finding is listed, the verdict is
+`FAIL`, and the exit code is non-zero. A review that could not reach the
+behaviour the PR is about, or a Claude that did not answer, is
+`INCONCLUSIVE`, never good. `--no-review` runs only the suites. Claude Code
+must be on this machine's PATH as `claude`, or named in `CLAUDE_CMD`; a
+review may take up to `CLAUDE_PR_TIMEOUT` seconds (an hour by default).
+
 ### What each check actually tests
 
 This differs per component and changes how a result should be read.
@@ -1098,11 +1242,13 @@ This differs per component and changes how a result should be read.
 | snowflake | upstream `test/runner.py`, cloned fresh at snowflake's ref each run, driven by `EDGE_*` | **two deployed nodes**, through a shim |
 | ace | the installed `ace` binary: `spock-diff`, `schema-diff public`, `repset-diff default` | **the deployed nodes** |
 | ace-integration | upstream `tests/integration/*.go` via `go test` | **its own containers** — by name only, never in `all` |
+| failover | 4 scenarios in `aspects/health_check/failover.py`: the standby's slot copies, an unplanned failover, a switchover back, cleanup | **the deployed scope and its peers** — by name only, never in `all`, because it stops a leader |
 
 A component's name means everything that checks it: `--health_check spock`
 runs `spock` *and* `spock-upstream`, `lolor` runs both of its halves. Either
 half can be asked for alone by its full name; `upstream` means every
-`-upstream` suite; `all` is everything except `ace-integration`.
+`-upstream` suite; `all` is everything except `ace-integration` and
+`failover`.
 
 ### The upstream suites: fetched fresh, every run
 
@@ -1224,6 +1370,72 @@ NOT MATCH`, `Found N differences` — and the JSON reports ACE writes are kept.
 are validating. It needs Go and a running Docker daemon, takes twenty to
 forty-five minutes, and runs only when named — `all` never includes it, and
 the report says in so many words that it ran against containers it started.
+
+### failover: a scope is failed over and handed back
+
+Every other check takes the cluster as it stands. `--health_check failover`
+changes it: it stops Patroni on the leader of a scope that has a standby,
+waits for the standby to be promoted, checks what the promotion left behind,
+restarts the old leader, and then switches the scope back to its Spock node
+with `patronictl switchover`, so the cluster ends in the shape it began. It
+runs only when named, never as part of `all`: the scope has no leader for
+the seconds a promotion takes, and a run of `all` must not do that unasked.
+
+```bash
+./pg_deploy_cluster.sh --health_check failover
+./pg_deploy_cluster.sh --health_check failover --node n2        # fail n2's scope over instead
+./pg_deploy_cluster.sh --health_check failover --tests 01_standby_slots
+```
+
+The scope exercised is the one of the node the check runs on (`--node`) if
+that node has a standby, else the first Spock node that has one. A cluster
+with no standby is skipped with the `add-standby` command that adds one.
+
+A spock60 cluster on PostgreSQL 17 or later deployed before this tool set
+`sync_replication_slots` fails the first case with `0 of N spk_* slots` and
+names the fix. It goes through the DCS, so one command reaches every member
+of the scope, and the slotsync worker starts on the standby at the next
+reload with no restart:
+
+```bash
+./pg_cluster_ctl.sh db guc-set sync_replication_slots on --node n1
+```
+
+| failover case | asks |
+|---|---|
+| `01_standby_slots` | before anything is stopped: does the standby carry a copy of every `spk_*` slot the peers connect to, and is each copy permanent? Spock keeps those copies for this moment; a temporary copy is dropped at promotion and the peers loop on "replication slot does not exist" afterwards, so the state is reported here, with the count and how many are temporary, rather than discovered as a mystery after the failover |
+| `02_unplanned_failover` | 100 rows are written and confirmed on every peer; Patroni is stopped on the leader; the standby must be promoted and accept writes; it must have the `spk_*` slots (if not, the case stops here — pointing the peers at it would only produce the loop); the old leader is started again and must rejoin as a replica, before anything is written, since a strict synchronous scope holds every commit until a standby streams; then the peers must replicate from the new primary; the 100 rows must be there; 20 rows written on it must reach every peer and 10 written on each peer must come back |
+| `03_switchover_back` | the planned path, with the same checks, switching to the Spock node's own member so the scope is restored — or to the standby and back, when nothing failed over before it |
+| `04_cleanup` | the suite's schema is gone again on every peer |
+
+How the peers are retargeted depends on the cluster. With automatic failover
+repair on (`auto-repair on`), the `on_role_change` callback on the promoted
+member does it and the suite only waits, reporting
+`peers_retargeted_by_callback|true` and how long it took. With it off, the
+suite retargets them itself through the same interface naming the callback
+uses, and reports `peers_retargeted_by_hand`. A callback that has not done
+it within half the timeout is reported as `peers_retargeted_by_callback|false`
+and the suite repairs by hand so the remaining checks can still be asked.
+
+Two refusals protect the cluster. A leader whose standby is not streaming is
+left alone, with `nothing was stopped` in the verdict: taking it down would
+leave the scope with no leader. And whatever a case finds after the stop,
+the old leader is started again before the case ends, so the scope is never
+left a member short. Each wait — promotion, rejoin, a row arriving — is
+bounded by `--test-timeout` (300s); a failover that takes longer is the
+finding.
+
+```
+failover: 4 scenario(s) on scope pgedge-n1, 300s per wait
+  stopping Patroni on n1; expecting n1s1 to be promoted
+  [1/4] 01_standby_slots             ok
+  [2/4] 02_unplanned_failover        FAILED — n1s1 has 0 spk_* slot(s) after promotion, 2 needed — the standby's copies did not survive
+  [3/4] 03_switchover_back           ok
+  [4/4] 04_cleanup                   ok
+```
+
+Each check's line is in the suite's output in the run log, as
+`name|true` or `name|false` with the figure that decided it.
 
 ### Skips
 
@@ -1495,6 +1707,32 @@ postmaster and would treat it as a crash, restarting it or failing over. So
 `--component postgres` routes restarts and reloads through `patronictl`, and
 stopping postgres directly is refused with an explanation rather than attempted.
 
+**Patroni owns `postgresql.conf` too.** It regenerates the file from the DCS
+and its own YAML at every start, restart and reload — the file's own header
+says so — so a setting typed into it by hand is one restart away from
+vanishing. `service restart` and `service reload` therefore look first: any
+setting in the file that is in neither the DCS nor the node's YAML, and that
+Patroni does not write of its own accord, is moved into the scope's DCS
+before Patroni touches the file. It survives, and the scope's standbys get it
+as well. The result says what was kept:
+
+```
+OK n1/postgres: PostgreSQL restarted on n1 — kept 2 setting(s) from
+postgresql.conf by moving them into the DCS for scope pgedge-n1:
+shared_buffers, work_mem
+```
+
+If they cannot be moved (the DCS is unreachable, say), the restart does not
+happen — losing them silently is the one outcome that must not. To let
+Patroni drop them on purpose, pass `--discard-local-settings`.
+
+The place to put a setting in the first place is the DCS:
+
+```bash
+./pg_cluster_ctl.sh db guc-set work_mem 64MB            # one scope
+./pg_cluster_ctl.sh db guc-set work_mem 64MB --all-nodes
+```
+
 Moving a leader to its standby, testing an unplanned failure, and getting the
 old machine back afterwards are written up in
 [doc/failover_switchover.md](doc/failover_switchover.md) — including the
@@ -1689,6 +1927,24 @@ promoted address, switches the subscription to it and re-enables it. The status
 output and the dashboard both flag the condition when they see a Spock node
 reporting a non-leader Patroni role, so you are told before you have to go
 looking.
+
+The repair asks each peer where its subscription actually points rather than
+assuming from where the leader is. A scope that failed over and was then
+switched back has `n1` leading again while every peer still names `n1s1`;
+the same command moves them home, and says "nothing to do" only when every
+peer already points at the leader.
+
+**Switching back needs the slot copies first.** Spock keeps a copy of each
+`spk_*` slot on the standby so that a promotion has something for the peers
+to connect to. A member that has just rejoined its scope has no copies yet —
+the worker's first pass comes a minute or so after it starts streaming. A
+switchover to it in that window promotes a member with no slots, and the
+member it demotes then drops its own copies as surplus: the scope's whole
+outbound replication is gone, and only recreating the slots by hand brings
+it back. `service switchover` therefore refuses a candidate that does not
+carry a permanent copy of every slot, naming how many it has; `--force`
+overrides, and the failover health check waits for the copies before each
+of its switchovers.
 
 ### Version pins
 

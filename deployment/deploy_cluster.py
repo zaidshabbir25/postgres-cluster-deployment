@@ -701,12 +701,37 @@ class ClusterDeployer:
         return f"{len(joined)} nodes cross-wired in a full mesh"
 
     def step_ddl_replication(self):
+        """Confirm every node runs the settings the DCS was given.
+
+        The DDL, conflict-logging and log-level settings were bootstrapped
+        through the DCS, so this is a check, not a change. A node reporting
+        something else means the DCS value did not take — the one thing a
+        config file cannot tell you — and that is a failed deployment, not a
+        note in the log.
+        """
+        fallbacks = []
+        wrong = []
         for node in self.plan.spock_nodes:
             executor = self.executor_for_node(node)
-            spock_management.enable_ddl_replication(
+            fallbacks += spock_management.enable_ddl_replication(
                 executor, self.plan, node, run_logger=self.log
             )
-        return "automatic DDL replication enabled on all Spock nodes"
+            for guc, actual, wanted in spock_management.verify_gucs(
+                    executor, self.plan, node):
+                if guc in spock_management.DDL_REPLICATION_GUCS:
+                    continue  # just handled above
+                wrong.append(f"{node.name}: {guc} is {actual}, expected {wanted}")
+        if wrong:
+            raise RuntimeError(
+                "settings bootstrapped through the DCS are not in effect — "
+                + "; ".join(wrong)
+            )
+        count = len(spock_management.REQUIRED_GUCS)
+        if fallbacks:
+            return (f"{count} settings in effect on every Spock node; "
+                    f"{len(set(fallbacks))} had to be set with ALTER SYSTEM")
+        return (f"{count} settings in effect on every Spock node, from the "
+                f"DCS: DDL replication, conflict logging, log level")
 
     def step_verify(self):
         """Prove replication actually works before calling the deployment done."""

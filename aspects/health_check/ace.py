@@ -141,14 +141,19 @@ class AceSuite(Suite):
         for label, arguments in self.CHECKS:
             command = arguments.format(cluster=plan.cluster_name)
             log = f"{self.output_dir()}/{label}.log"
-            # Run from the output dir so ACE's JSON reports land there; the
-            # config lives beside the service file, named explicitly. Output
-            # goes to the log and is then read back: a pipe would hide ACE's
-            # exit status, and PIPESTATUS is bash's alone.
+            # Run from the workspace: ACE reads ace.yaml from the working
+            # directory and nowhere else, so running from the output dir
+            # fails every check with "config file not found". Its JSON
+            # reports land in the working directory too, and are moved into
+            # the output dir afterwards. Output goes to the log and is then
+            # read back: a pipe would hide ACE's exit status, and PIPESTATUS
+            # is bash's alone.
             ok, output = executor.try_run(
-                f"cd {shlex.quote(self.output_dir())} && {env} "
+                f"cd {shlex.quote(self.workspace())} && {env} "
                 f"{binary} {command} --dbname {shlex.quote(plan.db_name)} "
                 f"--quiet > {shlex.quote(log)} 2>&1; rc=$?; "
+                f"mv -f {shlex.quote(self.workspace())}/*.json "
+                f"{shlex.quote(self.output_dir())}/ 2>/dev/null; "
                 f"cat {shlex.quote(log)}; exit $rc",
                 node=node.name, timeout=self.test_timeout,
             )

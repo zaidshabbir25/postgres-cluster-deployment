@@ -70,4 +70,7 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
   fi
 fi
 
+if [[ -x "$VENV_DIR/bin/python3" ]]; then
+  exec "$VENV_DIR/bin/python3" -m deployment.cli "$@"
+fi
 exec python3 -m deployment.cli "$@"

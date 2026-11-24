@@ -153,7 +153,11 @@ Cleanup
                             /opt/pgedge/regression and is reported separately.
                             ace-integration (ACE's Go suite, in containers of
                             its own) runs only when named; it never reads the
-                            deployed cluster.
+                            deployed cluster. failover also runs only when
+                            named: it stops the leader of a scope that has a
+                            standby, checks the promotion (Spock slots, peers
+                            retargeted, rows kept and replicating both ways),
+                            then switches the scope back.
   --node NAME               with --health_check, the Spock node to run against
   --stop-on-failure         with --health_check, skip the remaining suites once
                             one fails
@@ -164,6 +168,14 @@ Cleanup
                             that has named ones (spock: basic, copy, ...)
   --test-timeout N          with --health_check, seconds one case may take
                             before it is called timed out                  [300]
+  --pr LINK                 with --health_check, validate the Spock change the
+                            cluster was deployed from: a pull request link or
+                            number, or a commit or branch of pgEdge/spock. The
+                            suites run, then Claude Code on this machine reads
+                            the PR, reviews it and tries to break it on the
+                            running cluster. Prints ALL GOOD, or every failure
+                            and finding. Nothing is rebuilt
+  --no-review               with --pr, only the suites; do not start Claude
 
   --cleanup                 scrub every host in the inventory and exit: Patroni
                             units, etcd state, data directories, cluster config
@@ -579,6 +591,7 @@ CLEANUP=false
 CLEANUP_ARGS=()
 ADD_NODE=""
 HEALTH_CHECK=""
+HEALTH_PR=""
 HEALTH_ARGS=()
 ADD_COMPONENT=""
 COMPONENT_ARGS=()
@@ -633,6 +646,11 @@ while [[ $# -gt 0 ]]; do
         [[ $# -ge 2 ]] || die "--node needs a node name"
         HEALTH_ARGS+=("$1" "$2"); shift 2
       fi ;;
+    --pr|--PR)
+      [[ $# -ge 2 ]] || die "--pr needs a pull request link or number (e.g. --pr https://github.com/pgEdge/spock/pull/626)"
+      HEALTH_PR="$2"; HEALTH_ARGS+=("--pr" "$2"); shift 2 ;;
+    --no-review)
+      HEALTH_ARGS+=("$1"); shift ;;
     --remove-node)
       [[ $# -ge 2 ]] || die "--remove-node needs a node name (e.g. --remove-node n3)"
       REMOVE_NODE="$2"; INTERACTIVE=false; shift 2 ;;
@@ -783,8 +801,16 @@ if [[ -n "$HEALTH_CHECK" ]]; then
   say "   Spock      : spock${FACT_SPOCK_MAJOR} (${FACT_BRANCH})"
   say "   Spock nodes: ${FACT_SPOCK:-none}"
   say "   Components : $HEALTH_CHECK"
+  [[ -z "$HEALTH_PR" ]] || say "   Change     : $HEALTH_PR"
   rule
   say ""
+  if [[ -n "$HEALTH_PR" ]]; then
+    say "${DIM}The cluster is taken as deployed from the branch under review; nothing"
+    say "is rebuilt. The suites run, then Claude Code on this machine reads the"
+    say "change and tries to break it on the running cluster through"
+    say "pg_cluster_ctl.sh, leaving the cluster as it found it.${RESET}"
+    say ""
+  fi
   say "${DIM}Each component's suite is fetched at the ref this cluster was built"
   say "from, into its own directory under /opt/pgedge/regression, and reported"
   say "separately. A suite that cannot run here is skipped with the reason."
@@ -794,6 +820,13 @@ if [[ -n "$HEALTH_CHECK" ]]; then
   say "ace starts its own containers: it tests the ACE binary, not this"
   say "cluster — use 'ace table-diff' for that.${RESET}"
   say ""
+  if [[ ",$HEALTH_CHECK," == *,failover,* ]]; then
+    say "${BOLD}failover stops the leader of a scope that has a standby${RESET}${DIM}, waits"
+    say "for Patroni to promote the standby, checks the mesh, and switches the"
+    say "scope back. The scope has no leader for the seconds a promotion"
+    say "takes.${RESET}"
+    say ""
+  fi
 
   exec python3 -m deployment.cli health-check \
     --components "$HEALTH_CHECK" \

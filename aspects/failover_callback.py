@@ -120,12 +120,13 @@ while IFS='|' read -r peer peer_dsn; do
   }}
 
   run_sql "SELECT spock.sub_disable('$sub', true);" || rc=1
-  # 'already exists' is the expected answer when this scope has failed over to
-  # this instance before. The switch below is what matters.
+  # An interface that is already there is the expected answer when this scope
+  # has failed over to this instance before. Spock says 'already has interface
+  # named'; older builds said 'already exists'. The switch below is what matters.
   out=$("$PSQL" -At -d "$peer_dsn" \\
         -c "SELECT spock.node_add_interface('$NODE', '$IFACE', '$NEW_DSN');" 2>&1) \\
     || case "$out" in
-         *"already exists"*) echo "   interface already present" ;;
+         *"already has interface"*|*"already exists"*) echo "   interface already present" ;;
          *) echo "   add interface failed: $out"; rc=1 ;;
        esac
   run_sql "SELECT spock.sub_alter_interface('$sub', '$IFACE');" || rc=1

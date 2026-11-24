@@ -73,7 +73,13 @@ is `targets_cluster` plus `scope`: spock, lolor, snowflake and ace (the
 installed binary's spock/schema/repset-diff) exercise the deployed cluster;
 the `-upstream` suites exercise the installed library; `ace-integration`
 starts its own containers, proves nothing about the cluster, and is left out
-of `all`.
+of `all`. `failover` (`health_check/failover.py`) is the one suite that
+changes the cluster: it stops Patroni on the leader of a scope with a standby,
+checks the promotion (the `spk_*` slot copies, peers retargeted by the
+callback or by hand, rows kept and replicating both ways, the old leader
+rejoining), then switches the scope back. By name only, like
+`ace-integration`, but because it is disruptive rather than irrelevant. Its
+waits go through `_now`/`_sleep` so tests run a simulated clock.
 
 `deployment/cli.py` holds lifecycle commands (deploy, plan, status, remove) and
 `deployment/ops_cli.py` registers the day-two groups (node, spock, db, service,
@@ -158,6 +164,39 @@ against the cluster this tool has deployed, using `spock rebuild` to put the
 change on every node and the topology's own HA as test surface. It is the
 in-cluster counterpart of the sandbox `spock-pr-validation` skill, and refuses
 a cluster whose Spock major does not match the PR's base branch.
+
+`.claude/skills/failover-deep-test/` is the exploratory counterpart of the
+`failover` health-check suite: eleven scenarios on the deployed cluster
+(idle-primary slot copies, failover under pgbench load, the promoted standby
+serving the mesh, the switchover guard, two failovers in a row, a postmaster
+crash, standby loss under strict sync, restore), each finding filed as a Spock
+bug, a bug in this tool, or a topology limitation. Disruptive, by request only.
+
+`.claude/skills/spock-deep-test/` does the same for the multi-master layer,
+starting where the in-tree `spock` suite stops: DDL and DML from every node,
+the four conflict shapes and `spock.resolutions`, delta-apply, Snowflake,
+no-PK and partitioned tables, pgbench from every node at once, a peer down
+while the others write, apply-side exceptions, repset filtering, repair and
+read-only mode, resync, restore. Never together with `failover-deep-test`.
+
+`lolor-deep-test`, `snowflake-deep-test` and `ace-deep-test` follow the same
+shape for the optional components: each starts where the component's health
+check stops (lolor's API, big and many objects, concurrent updates and
+unlink races, the drop guard; Snowflake's identity bits, uniqueness under
+concurrent inserts from every node, a tight loop, sequence conversion, a
+promoted standby; ACE's detection of every planted divergence by both the
+host binary and this tool's `diff`, scoping, repair semantics, schema and
+repset drift, a big table). All five skills report node names only and file
+each finding as a component bug, a bug in this tool, or a topology limitation.
+
+`--health_check <components> --pr <link>` (`deployment/pr_validation.py`)
+is the laptop-side driver for a cluster *already deployed from the PR's
+branch*: it rebuilds nothing, runs the suites, then starts `claude -p` with a
+prompt naming both skills and an allow-list of this repository's scripts
+only, and reads the JSON verdict line Claude is told to end with. `decide`
+makes ALL GOOD require both halves. If you are the Claude that prompt
+started, the cluster is the harness: no rebuild, no `pg_ctl`, drop what you
+create.
 
 ## Repository state
 

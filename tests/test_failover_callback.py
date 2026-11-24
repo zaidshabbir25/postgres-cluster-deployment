@@ -154,6 +154,18 @@ def test_an_interface_that_already_exists_is_tolerated(staged):
     assert "add interface failed" not in log
 
 
+def test_spocks_own_wording_for_a_taken_name_is_tolerated_too(staged):
+    """The message Spock really prints on a second failover to the same
+    member; the script used to log it as a failure."""
+    commands, log = staged(
+        fail_with='ERROR:  node "n1" already has interface named "n1_promoted_5435"',
+    )("primary")
+
+    assert "already present" in log
+    assert "add interface failed" not in log
+    assert "sub_alter_interface" in commands
+
+
 def test_every_run_is_logged_with_what_it_was_called_with(staged):
     _, log = staged()("primary")
 

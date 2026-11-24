@@ -46,11 +46,11 @@ def _executor_for(plan, host_name, cache, run_logger):
 def ref_for(plan, component):
     """The branch or tag whose tests match what this cluster is running.
 
-    Spock's and lolor's cases ship with this tool rather than being fetched,
-    so there is no ref to choose; ACE's check is the binary already on the
+    Spock's, lolor's and the failover scenarios ship with this tool rather
+    than being fetched, so there is no ref to choose; ACE's check is the binary already on the
     host. The version each reports is the component's own.
     """
-    if component in ("spock", "lolor"):
+    if component in ("spock", "lolor", "failover"):
         return "in-tree"
     if component == "ace":
         return "installed"
