@@ -94,6 +94,21 @@ def test_only_leaders_carry_a_bootstrap_block(plan_factory):
     assert leader["bootstrap"]["dcs"]["slots"] == {"n1s1": {"type": "physical"}}
 
 
+def test_patroni_is_told_to_leave_spocks_slots_alone(plan_factory):
+    """Seen live: after kill -9 of a leader, Patroni's first heartbeat
+    landed before the peer's apply worker retried, found the spk_* slot
+    inactive and unknown, and dropped it. Replication to that peer was
+    gone until the slot was recreated by hand. Every scope carries a Spock
+    node, so every scope's DCS must carry the exemption."""
+    plan, _ = plan_factory(node_count=2, standby_of=["n1"])
+
+    for name in ("n1", "n2"):
+        ignored = pm.build_config(plan, plan.node(name))["bootstrap"]["dcs"]["ignore_slots"]
+        assert {"type": "logical", "plugin": "spock_output"} in ignored
+        assert all("name" not in entry for entry in ignored), \
+            "matched by plugin, so a slot for any database or peer is covered"
+
+
 def test_spock_gucs_reach_the_dcs(deployed_plan):
     parameters = pm.build_config(deployed_plan, deployed_plan.node("n1")) \
         ["bootstrap"]["dcs"]["postgresql"]["parameters"]

@@ -496,6 +496,11 @@ def etcd3_settings(endpoints):
     return settings
 
 
+# Every logical slot Spock creates uses its own output plugin, on every node
+# and in every database, so one pattern covers them all.
+IGNORED_SLOTS = ({"type": "logical", "plugin": "spock_output"},)
+
+
 def build_config(plan, node):
     """Render one node's Patroni configuration as a dict.
 
@@ -549,6 +554,15 @@ def build_config(plan, node):
                 "use_slots": True,
                 "parameters": parameters,
             },
+            # Patroni drops any slot on the leader that it does not know
+            # about and that nobody holds open. Spock's provider slots are
+            # held open by the peers' apply workers, so they survive as long
+            # as the mesh runs — but for the seconds after a crash restart or
+            # a promotion, before a peer has retried, they are inactive and
+            # unknown, and a heartbeat in that window deletes them. Then the
+            # peer's subscription is down for good and the standby's copy
+            # follows. Telling Patroni whose slots these are closes the race.
+            "ignore_slots": list(IGNORED_SLOTS),
         }
         if node.standbys:
             # Permanent physical slots keep the leader from discarding WAL a

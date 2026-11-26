@@ -415,6 +415,17 @@ start:
 | `log_min_messages` | `debug1` | low enough for those conflict lines, and Spock's worker lifecycle, to appear |
 | `sync_replication_slots` | `on` — **spock60 on PostgreSQL 17+ only** | Spock 6 registers no failover-slots worker on 18 and yields to PostgreSQL's own on 17, so without this a standby carries no copy of the `spk_*` slots and the first unplanned failover leaves the promoted node with nothing for its peers to connect to. Spock 5 copies them with its own worker and is left alone. Harmless on a leader: the slotsync worker only runs in recovery |
 
+Beside those parameters the same DCS block tells Patroni to leave Spock's
+slots alone (`ignore_slots: type logical, plugin spock_output`). Patroni
+drops any slot on a leader that it did not create and nobody holds open.
+The peers' apply workers hold the `spk_*` slots open while the mesh runs,
+but for the seconds after a crash restart or a promotion, before a peer
+has retried, they are inactive, and a heartbeat in that window deleted
+one on a live cluster: the peer's subscription stayed down until the slot
+was recreated by hand. A cluster deployed before this line needs the entry
+added once per scope with `patronictl edit-config`; it takes effect on the
+next heartbeat, with no restart.
+
 Step 15 then asks every Spock node what it is actually running, through
 `SHOW`, and fails the deployment if any answer differs: a value in the DCS and
 a value the server runs are two different facts, and only the second one
@@ -1810,12 +1821,22 @@ Row counts:
 ```
 
 A full-table hash would be simpler but can only answer "same or not" — it cannot
-tell you which rows, which is the answer you actually need.
+tell you which rows, which is the answer you actually need. The drill-down
+lists at most 5000 rows per differing bucket; a bucket past that is reported
+as capped, with the `--buckets` value to rerun with, rather than passed off
+as the whole list.
 
 `diff repair` resyncs a table through Spock's own `sub_resync_table`, so the copy
 goes over the existing subscription rather than a side channel. It **overwrites**
 the target nodes' copy, and asks for confirmation before doing so. In a
 multi-master cluster there is no authoritative node, so you choose the source.
+With `--no-truncate` it merges instead: a diff names the rows that are missing
+or different on the target, and only those are written from the source, over
+dblink and in Spock's repair mode so the writes do not travel on round the
+mesh. Rows the target alone holds survive. (Spock's own resync without a
+truncate is not a merge — it COPYs into the non-empty table and fails on the
+first duplicate key — so the tool does the merge itself.) A target that already
+agrees is left alone and says so.
 
 ## Dashboard
 

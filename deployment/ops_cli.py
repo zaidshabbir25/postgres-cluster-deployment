@@ -1539,5 +1539,8 @@ def _register_diff(subparsers, add_common):
     p.add_argument("--source", required=True, help="node to copy from")
     p.add_argument("--targets", help="comma-separated; default: every other node")
     p.add_argument("--no-truncate", action="store_true",
-                   help="merge instead of replacing the target's copy")
+                   help="merge instead of replacing the target's copy: only "
+                        "the rows a diff finds missing or different are "
+                        "written from the source, rows only on the target "
+                        "are kept")
     p.add_argument("--yes", action="store_true")

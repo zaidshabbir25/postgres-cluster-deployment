@@ -305,8 +305,11 @@ def rows(executor, bin_dir, port, user, sql, dbname="postgres", node=None,
     if code != 0:
         return None
     result = []
-    for line in output.strip().splitlines():
-        if not line.strip():
+    # Not output.strip(): Python counts \x1f as whitespace, so a strip would
+    # eat the separator that ends a last row whose final column is NULL, and
+    # that row would come back one field short.
+    for line in output.splitlines():
+        if not line.strip(" \t\r"):
             continue
         result.append(line.split(separator))
     return result

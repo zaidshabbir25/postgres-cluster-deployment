@@ -40,6 +40,10 @@ CANDIDATES = ("ace", "/usr/local/bin/ace", "/usr/bin/ace")
 #: process exits zero.
 MISMATCH = re.compile(r"DO NOT MATCH|Found \d+ differences|MISMATCH", re.I)
 
+#: What ACE says when the schema or replication set it was pointed at holds
+#: no tables. Nothing to compare is not a disagreement.
+NOTHING_TO_COMPARE = re.compile(r"no tables? (?:were )?found|no tables to compare", re.I)
+
 
 class AceSuite(Suite):
     name = "ace"
@@ -120,9 +124,11 @@ class AceSuite(Suite):
             f"sed -i 's/^default_cluster:.*/default_cluster: "
             f"\"{plan.cluster_name}\"/' {shlex.quote(config)}",
             node=node.name)
+        # ACE runs as the database user and writes its task store under HOME
+        # and its diff files beside the config, so the whole workspace has to
+        # be that user's, not root's from the mkdir above.
         executor.try_run(
-            f"chown {plan.db_user} {shlex.quote(config)} "
-            f"{shlex.quote(self.service_file())}", node=node.name)
+            f"chown -R {plan.db_user} {shlex.quote(workspace)}", node=node.name)
         if run_logger:
             run_logger.info(
                 f"    ace: {binary} against {len(plan.spock_nodes)} node(s) "
@@ -155,12 +161,15 @@ class AceSuite(Suite):
                 f"mv -f {shlex.quote(self.workspace())}/*.json "
                 f"{shlex.quote(self.output_dir())}/ 2>/dev/null; "
                 f"cat {shlex.quote(log)}; exit $rc",
-                node=node.name, timeout=self.test_timeout,
+                user=plan.db_user, node=node.name, timeout=self.test_timeout,
             )
             text = (output or "").strip()
             mismatch = MISMATCH.search(text)
             if ok and not mismatch:
                 verdict = "ok"
+                passed += 1
+            elif not ok and not mismatch and NOTHING_TO_COMPARE.search(text):
+                verdict = "ok — nothing to compare"
                 passed += 1
             else:
                 reason = (mismatch.group(0) if mismatch
