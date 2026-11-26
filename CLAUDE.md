@@ -125,7 +125,10 @@ load it.
 **Patroni's live config.** `bootstrap.dcs` is read once, when a scope is
 created. Anything afterwards — permanent slots, synchronous settings — goes
 through `patronictl edit-config`. Changes to survivors of a removal use
-`reload`, never `restart`: the cluster stays up throughout.
+`reload`, never `restart`: the cluster stays up throughout. The block also
+carries `ignore_slots` for `spock_output` slots: Patroni drops unknown,
+inactive slots on a leader, and a `spk_*` slot is exactly that for the few
+seconds after a crash restart or promotion before its peer retries.
 
 **Version strings.** The minor and the pre-release are independent: `19`,
 `19.0`, `19beta3` and `19.0beta3` are all real. Patterns that treat them as

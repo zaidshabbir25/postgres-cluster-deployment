@@ -33,7 +33,18 @@ SINGULAR = {"columns": "column", "indexes": "index",
             "constraints": "constraint"}
 # Cap the rows pulled back when drilling into a mismatching bucket, so a table
 # that has diverged wholesale reports a bounded sample rather than hanging.
+# A bucket that hits the cap is reported as such: a silent sample once hid
+# 67 of 100 diverged rows in a million-row table.
 MAX_ROWS_PER_BUCKET = 5000
+
+# The alias every row query uses for the table. `t` was the alias once, and
+# `md5(t::text)` on a table with a column named t hashed that one column
+# instead of the row: three real divergences were reported as "OK". Nothing
+# sensible names a column this.
+ROW = "_pgcd_row"
+
+# How many primary keys one merge statement carries to the target.
+MERGE_CHUNK = 500
 
 
 def _lit(value):
@@ -213,10 +224,15 @@ def _schema_fingerprint(executor, plan, node, schema):
         f"WHERE connamespace = {_lit(schema)}::regnamespace ORDER BY 1;",
         ["object", "definition"], dbname=plan.db_name, node=node.name,
     )
+    if columns is None or indexes is None or constraints is None:
+        # A node that cannot be asked is not a node with an empty schema:
+        # reporting every object as "missing on n2" sent an operator looking
+        # for DDL drift during an outage.
+        return None
     return {
-        "columns": {r["object"]: r["definition"] for r in (columns or [])},
-        "indexes": {r["object"]: r["definition"] for r in (indexes or [])},
-        "constraints": {r["object"]: r["definition"] for r in (constraints or [])},
+        "columns": {r["object"]: r["definition"] for r in columns},
+        "indexes": {r["object"]: r["definition"] for r in indexes},
+        "constraints": {r["object"]: r["definition"] for r in constraints},
     }
 
 
@@ -230,15 +246,22 @@ def schema_diff(executor_for, plan, schema="public"):
     fingerprints, problems = {}, []
 
     for node in plan.spock_nodes:
-        fingerprints[node.name] = _schema_fingerprint(
-            executor_for(node), plan, node, schema
-        )
+        fingerprint = _schema_fingerprint(executor_for(node), plan, node, schema)
+        if fingerprint is None:
+            problems.append(f"{node.name}: cannot read the schema — "
+                            f"not compared")
+            continue
+        fingerprints[node.name] = fingerprint
 
-    if len(fingerprints) < 2:
+    if len(plan.spock_nodes) < 2:
         return True, {"schema": schema, "problems": [],
                       "note": "only one Spock node — nothing to compare"}
+    if len(fingerprints) < 2:
+        return False, {"schema": schema, "problems": problems,
+                       "reference": None, "differences": {}}
 
-    reference_name = plan.spock_nodes[0].name
+    reference_name = next(n.name for n in plan.spock_nodes
+                          if n.name in fingerprints)
     reference = fingerprints[reference_name]
     differences = {}
 
@@ -306,21 +329,29 @@ def primary_key_columns(executor, plan, node, table):
     return [r[0] for r in (result or [])]
 
 
+def _pk_render(pk_columns):
+    """The primary key as one text value, the same on every node."""
+    return " || '|' || ".join(f"{ROW}.{c}::text" for c in pk_columns)
+
+
+def _key_expr(pk_columns):
+    key = pk_columns[0] if len(pk_columns) == 1 else \
+        "(" + " || '|' || ".join(f"{ROW}.{c}::text" for c in pk_columns) + ")"
+    return f"{ROW}.{key}::text" if len(pk_columns) == 1 else key
+
+
 def _bucket_checksums(executor, plan, node, table, pk_columns, buckets,
                       where=None):
     """Per-bucket row count and digest for one node."""
-    key = pk_columns[0] if len(pk_columns) == 1 else \
-        "(" + " || '|' || ".join(f"t.{c}::text" for c in pk_columns) + ")"
-    key_expr = f"t.{key}::text" if len(pk_columns) == 1 else key
-    bucket = _bucket_expr(key_expr, buckets)
-    order = ", ".join(f"t.{c}" for c in pk_columns)
+    bucket = _bucket_expr(_key_expr(pk_columns), buckets)
+    order = ", ".join(f"{ROW}.{c}" for c in pk_columns)
     filter_clause = f"WHERE {where} " if where else ""
 
     return pg.dict_rows(
         executor, node.bin_dir, node.pg_port, plan.db_user,
         f"SELECT {bucket} AS bucket, count(*)::text, "
-        f"  md5(string_agg(md5(t::text), '' ORDER BY {order})) "
-        f"FROM {table} t {filter_clause}"
+        f"  md5(string_agg(md5({ROW}::text), '' ORDER BY {order})) "
+        f"FROM {table} {ROW} {filter_clause}"
         f"GROUP BY 1 ORDER BY 1;",
         ["bucket", "rows", "digest"],
         dbname=plan.db_name, node=node.name,
@@ -329,39 +360,42 @@ def _bucket_checksums(executor, plan, node, table, pk_columns, buckets,
 
 def _bucket_rows(executor, plan, node, table, pk_columns, buckets, bucket,
                  where=None):
-    """Per-row digests inside one bucket, for locating exact divergence."""
-    key = pk_columns[0] if len(pk_columns) == 1 else \
-        "(" + " || '|' || ".join(f"t.{c}::text" for c in pk_columns) + ")"
-    key_expr = f"t.{key}::text" if len(pk_columns) == 1 else key
-    bucket_expr = _bucket_expr(key_expr, buckets)
-    pk_render = " || '|' || ".join(f"t.{c}::text" for c in pk_columns)
-    order = ", ".join(f"t.{c}" for c in pk_columns)
+    """Per-row digests inside one bucket, for locating exact divergence.
+
+    Returns ({pk: digest}, capped): capped is True when the bucket held more
+    rows than MAX_ROWS_PER_BUCKET and the map is only the first slice.
+    """
+    bucket_expr = _bucket_expr(_key_expr(pk_columns), buckets)
+    order = ", ".join(f"{ROW}.{c}" for c in pk_columns)
     filter_clause = f"AND {where} " if where else ""
 
     result = pg.dict_rows(
         executor, node.bin_dir, node.pg_port, plan.db_user,
-        f"SELECT {pk_render}, md5(t::text) FROM {table} t "
+        f"SELECT {_pk_render(pk_columns)}, md5({ROW}::text) FROM {table} {ROW} "
         f"WHERE {bucket_expr} = {bucket} {filter_clause}"
-        f"ORDER BY {order} LIMIT {MAX_ROWS_PER_BUCKET};",
+        f"ORDER BY {order} LIMIT {MAX_ROWS_PER_BUCKET + 1};",
         ["pk", "digest"], dbname=plan.db_name, node=node.name,
     )
-    return {r["pk"]: r["digest"] for r in (result or [])}
+    result = result or []
+    capped = len(result) > MAX_ROWS_PER_BUCKET
+    return {r["pk"]: r["digest"] for r in result[:MAX_ROWS_PER_BUCKET]}, capped
 
 
 def table_diff(executor_for, plan, table, buckets=DEFAULT_BUCKETS, where=None,
-               drill_down=True, run_logger=None):
+               drill_down=True, run_logger=None, reference=None):
     """Compare a table's data across every Spock node.
 
     Returns (ok, report). The report names the buckets that disagree and, when
     drill_down is on, the individual primary keys that differ — enough to hand
-    to table_repair or to fix by hand.
+    to table_repair or to fix by hand. `reference` names the node the others
+    are compared against; default the first Spock node.
     """
     nodes = plan.spock_nodes
     if len(nodes) < 2:
         return True, {"table": table, "problems": [],
                       "note": "only one Spock node — nothing to compare"}
 
-    reference = nodes[0]
+    reference = plan.node(reference) if reference else nodes[0]
     pk_columns = primary_key_columns(executor_for(reference), plan, reference, table)
     if not pk_columns:
         return False, {
@@ -424,15 +458,18 @@ def table_diff(executor_for, plan, table, buckets=DEFAULT_BUCKETS, where=None,
         if drill_down:
             differing_keys = {"only_on_reference": [], "only_on_node": [],
                               "different_values": []}
+            capped = []
             for bucket in differing:
-                ref_map = _bucket_rows(
+                ref_map, ref_capped = _bucket_rows(
                     executor_for(reference), plan, reference, table,
                     pk_columns, buckets, bucket, where,
                 )
-                node_map = _bucket_rows(
+                node_map, node_capped = _bucket_rows(
                     executor_for(plan.node(name)), plan, plan.node(name), table,
                     pk_columns, buckets, bucket, where,
                 )
+                if ref_capped or node_capped:
+                    capped.append(bucket)
                 differing_keys["only_on_reference"] += sorted(
                     set(ref_map) - set(node_map)
                 )
@@ -451,6 +488,14 @@ def table_diff(executor_for, plan, table, buckets=DEFAULT_BUCKETS, where=None,
                 f"{counts['only_on_node']}, same key but different values: "
                 f"{counts['different_values']}"
             )
+            if capped:
+                mismatches[name]["capped_buckets"] = capped
+                problems.append(
+                    f"{name}: {len(capped)} differing bucket(s) hold more than "
+                    f"{MAX_ROWS_PER_BUCKET} rows, so the key list above is "
+                    f"incomplete — rerun with --buckets "
+                    f"{buckets * 16} or narrow with --where"
+                )
 
     return (not mismatches and not problems), {
         "table": table,
@@ -466,14 +511,83 @@ def table_diff(executor_for, plan, table, buckets=DEFAULT_BUCKETS, where=None,
     }
 
 
+def _table_columns(executor, plan, node, table):
+    """[(name, type, identity, generated)] in attnum order, or None."""
+    schema, name = _split_table(table)
+    return pg.rows(
+        executor, node.bin_dir, node.pg_port, plan.db_user,
+        f"SELECT a.attname, format_type(a.atttypid, a.atttypmod), "
+        f"  a.attidentity, a.attgenerated "
+        f"FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+        f"JOIN pg_namespace n ON n.oid = c.relnamespace "
+        f"WHERE n.nspname = {_lit(schema)} AND c.relname = {_lit(name)} "
+        f"AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum;",
+        dbname=plan.db_name, node=node.name,
+    )
+
+
+def _merge_rows(executor, plan, source, target, table, pk_columns, keys,
+                run_logger=None):
+    """Upsert the rows behind `keys` from the source into the target.
+
+    Spock's sub_resync_table can only COPY, and a COPY into a table that
+    already holds the row fails on the primary key, so a merge has to move
+    the rows itself: each chunk is read from the source over dblink and
+    written with ON CONFLICT DO UPDATE, inside repair mode so the write stays
+    on the target instead of replicating back round the mesh. Rows the target
+    has and the source lacks are left alone — that is what a merge is for.
+    """
+    columns = _table_columns(executor, plan, target, table)
+    if not columns:
+        return False, f"cannot read the columns of {table} on {target.name}"
+    writable = [(n, t) for n, t, _, generated in columns if not generated]
+    names = ", ".join(n for n, _ in writable)
+    definition = ", ".join(f"{n} {t}" for n, t in writable)
+    overriding = ("OVERRIDING SYSTEM VALUE "
+                  if any(identity == "a" for _, _, identity, _ in columns)
+                  else "")
+    updatable = [n for n, _ in writable if n not in pk_columns]
+    conflict = (f"ON CONFLICT ({', '.join(pk_columns)}) DO UPDATE SET "
+                + ", ".join(f"{n} = EXCLUDED.{n}" for n in updatable)
+                if updatable else "ON CONFLICT DO NOTHING")
+    dsn = source.dsn(plan.db_name, plan.db_user, plan.db_password)
+
+    merged = 0
+    for start in range(0, len(keys), MERGE_CHUNK):
+        chunk = keys[start:start + MERGE_CHUNK]
+        remote = (f"SELECT {names} FROM {table} {ROW} "
+                  f"WHERE ({_pk_render(pk_columns)}) IN "
+                  f"({', '.join(_lit(k) for k in chunk)})")
+        sql = (f"SELECT spock.repair_mode(true); "
+               f"INSERT INTO {table} ({names}) {overriding}"
+               f"SELECT {names} FROM dblink({_lit(dsn)}, {_lit(remote)}) "
+               f"AS {ROW}({definition}) {conflict};")
+        code, output = pg.psql(
+            executor, target.bin_dir, target.pg_port, plan.db_user, sql,
+            dbname=plan.db_name, node=target.name, check=False, timeout=3600,
+        )
+        if code != 0:
+            return False, (f"merge stopped after {merged} row(s) — "
+                           f"{output.strip()[:300]}")
+        merged += len(chunk)
+        if run_logger:
+            run_logger.info(f"    {target.name}: {merged}/{len(keys)} rows "
+                            f"merged from {source.name}")
+    return True, f"{merged} row(s) merged"
+
+
 def table_repair(executor_for, plan, table, source_node_name, target_node_names=None,
                  truncate=True, run_logger=None):
     """Re-sync a diverged table on the target nodes from a chosen source.
 
-    Uses Spock's own sub_resync_table, so the copy goes through the existing
-    subscription rather than a side channel. `truncate` empties the target's
-    copy first, which is what makes the result an exact copy of the source
-    rather than a merge.
+    With `truncate`, Spock's own sub_resync_table empties the target's copy
+    and refills it through the existing subscription: an exact copy of the
+    source. Without it the target is *merged*: a diff finds the rows that
+    are missing or different on the target and only those are written, from
+    the source, over dblink; rows the target alone holds survive. (Spock's
+    resync without truncate is not that — it COPYs into the non-empty table
+    and fails on the first duplicate key — which is why the merge is done
+    here.)
 
     This overwrites data on the target nodes. The caller is responsible for
     confirming that with whoever owns the data.
@@ -500,6 +614,10 @@ def table_repair(executor_for, plan, table, source_node_name, target_node_names=
         return False, {"problems": ["no target nodes selected"]}
 
     results, problems = [], []
+    if not truncate:
+        return _merge_repair(executor_for, plan, table, source, targets,
+                             run_logger)
+
     for target in targets:
         executor = executor_for(target)
         # zodan names subscriptions sub_<provider>_<subscriber>.
@@ -511,7 +629,7 @@ def table_repair(executor_for, plan, table, source_node_name, target_node_names=
                 f"via {subscription}"
             )
         ok, output = spock_operations.sub_resync_table(
-            executor, plan, target, subscription, table, truncate=truncate
+            executor, plan, target, subscription, table, truncate=True
         )
         results.append({"node": target.name, "subscription": subscription,
                         "ok": ok, "output": output[:1000]})
@@ -528,6 +646,47 @@ def table_repair(executor_for, plan, table, source_node_name, target_node_names=
                 f"synchronising — {message[:300]}"
             )
 
+    return (not problems), {
+        "table": table, "source": source.name,
+        "targets": [t.name for t in targets],
+        "results": results, "problems": problems,
+    }
+
+
+def _merge_repair(executor_for, plan, table, source, targets, run_logger=None):
+    """The merge half of table_repair: diff first, then move only the rows
+    the diff named. A target that already agrees is reported as such and
+    left untouched."""
+    ok, report = table_diff(executor_for, plan, table, reference=source.name,
+                            run_logger=run_logger)
+    if report.get("problems") and not report.get("mismatches"):
+        return False, {"table": table, "source": source.name,
+                       "targets": [t.name for t in targets], "results": [],
+                       "problems": report["problems"]}
+    pk_columns = report["primary_key"]
+    results, problems = [], []
+    for target in targets:
+        mismatch = report["mismatches"].get(target.name)
+        if not mismatch:
+            results.append({"node": target.name, "ok": True,
+                            "output": "already in agreement — nothing merged"})
+            continue
+        if mismatch.get("capped_buckets"):
+            problems.append(
+                f"{target.name}: the diff could not list every differing row "
+                f"(buckets over {MAX_ROWS_PER_BUCKET} rows); merge refused — "
+                f"rerun with more --buckets, or repair with truncate")
+            continue
+        keys = sorted(set(mismatch["keys"]["only_on_reference"])
+                      | set(mismatch["keys"]["different_values"]))
+        kept = len(mismatch["keys"]["only_on_node"])
+        ok, message = _merge_rows(executor_for(target), plan, source, target,
+                                  table, pk_columns, keys, run_logger)
+        if kept:
+            message += f"; {kept} row(s) only on {target.name} kept"
+        results.append({"node": target.name, "ok": ok, "output": message})
+        if not ok:
+            problems.append(f"{target.name}: {message}")
     return (not problems), {
         "table": table, "source": source.name,
         "targets": [t.name for t in targets],
